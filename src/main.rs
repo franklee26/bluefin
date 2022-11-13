@@ -10,7 +10,8 @@ const ICMP_PROTO: u8 = 0x01;
 const UDP_PROTO: u8 = 0x11;
 const TCP_PROTO: u8 = 0x06;
 
-pub fn main() {
+#[tokio::main]
+async fn main() {
     let iface = Iface::new("frank_tun", Mode::Tun).expect("Failed to create a TUN device");
     let _name = iface.name();
 

@@ -31,11 +31,18 @@ pub fn bluefin_handshake_handle(
 ) -> Result<(), BluefinHandshakeError> {
     if context.host_type == BluefinHost::Server {
         return bluefin_server_handshake_handler(packet);
+    } else {
+        return bluefin_client_handshake_handler(packet);
     }
-    Ok(())
 }
 
 fn bluefin_server_handshake_handler(packet: &[u8]) -> Result<(), BluefinHandshakeError> {
+    let deserialised = BluefinHeader::deserialise(packet);
+    eprintln!("Found header: {:?}", deserialised);
+    Ok(())
+}
+
+fn bluefin_client_handshake_handler(packet: &[u8]) -> Result<(), BluefinHandshakeError> {
     let deserialised = BluefinHeader::deserialise(packet);
     eprintln!("Found header: {:?}", deserialised);
     Ok(())

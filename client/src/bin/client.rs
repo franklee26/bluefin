@@ -11,7 +11,7 @@ fn main() -> std::io::Result<()> {
         .connect("192.168.0.3:31416")
         .expect("connect function failed");
 
-    let type_fields = BluefinTypeFields::new(PacketType::Handshake, 0x0);
+    let type_fields = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0x0);
     let security_fields = BluefinSecurityFields::new(true, 0b000_1111);
 
     let mut header = BluefinHeader::new(*b"abcd", *b"efgh", type_fields, security_fields);

@@ -1,8 +1,8 @@
-use super::serialisable::Serialisable;
+use super::serialisable::{Serialisable, DeserialiseError};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PacketType {
-    Handshake = 0x00,
+    UnencryptedHandshake = 0x00,
     Data = 0x01,
     Error = 0x02,
     Warning = 0x03,
@@ -11,7 +11,7 @@ pub enum PacketType {
 impl PacketType {
     fn from_u8(value: u8) -> Self {
         match value {
-            0x00 => Self::Handshake,
+            0x00 => Self::UnencryptedHandshake,
             0x01 => Self::Data,
             0x02 => Self::Error,
             0x03 => Self::Warning,
@@ -49,6 +49,7 @@ impl BluefinTypeFields {
 }
 
 impl Serialisable for BluefinTypeFields {
+    #[inline]
     fn serialise(&self) -> Vec<u8> {
         let mut two_bytes: u16 = 0x0;
         two_bytes |= self.packet_type as u16;
@@ -60,14 +61,18 @@ impl Serialisable for BluefinTypeFields {
         ]
     }
 
-    fn deserialise(bytes: &[u8]) -> Self {
+    #[inline]
+    fn deserialise(bytes: &[u8]) -> Result<Self, DeserialiseError> {
+        if bytes.len() < 2 {
+            return Err(DeserialiseError::new("Bluefin type fields are two bytes"));
+        }
         // Two bytes. First 4 bits is the packet_type then the remaining 12 bits are the type-specific payload
         let packet_type = (bytes[0] & 0xf0) >> 4;
         let type_specific_payload: u16 = (((bytes[0] & 0x0f) as u16) << 8) | (bytes[1] as u16);
-        Self {
+        Ok(Self {
             packet_type: PacketType::from_u8(packet_type),
             type_specific_payload,
-        }
+        })
     }
 }
 
@@ -102,15 +107,17 @@ impl Serialisable for BluefinSecurityFields {
         vec![byte]
     }
 
-    fn deserialise(bytes: &[u8]) -> Self {
+    fn deserialise(bytes: &[u8]) -> Result<Self, DeserialiseError> {
+        if bytes.len() < 1 {
+            return Err(DeserialiseError::new("Bluefin security fields are one byte"));
+        }
         let byte = bytes[0];
         let header_encrypted: bool = ((byte & 0x80) >> 7) != 0;
         let header_protection_mask: u8 = byte & 0x7f;
-
-        Self {
+        Ok(Self {
             header_encrypted,
             header_protection_mask,
-        }
+        })
     }
 }
 
@@ -179,11 +186,16 @@ impl Serialisable for BluefinHeader {
         .concat()
     }
 
-    fn deserialise(bytes: &[u8]) -> Self {
-        Self {
+    fn deserialise(bytes: &[u8]) -> Result<Self, DeserialiseError> {
+        if bytes.len() < 20 {
+            return Err(DeserialiseError::new("Bluefin header is 20 bytes"));
+        }
+        let type_and_type_specific_payload = BluefinTypeFields::deserialise(&bytes[1..3])?;
+        let security_fields = BluefinSecurityFields::deserialise(&[bytes[3]])?;
+        Ok(Self {
             version: bytes[0].try_into().expect("version is 1 byte"),
-            type_and_type_specific_payload: BluefinTypeFields::deserialise(&bytes[1..3]),
-            security_fields: BluefinSecurityFields::deserialise(&[bytes[3]]),
+            type_and_type_specific_payload,
+            security_fields,
             source_connection_id: bytes[4..8]
                 .try_into()
                 .expect("source connection id should be 4 bytes"),
@@ -193,7 +205,7 @@ impl Serialisable for BluefinHeader {
             packet_number: bytes[12..20]
                 .try_into()
                 .expect("packet number should be 8 bytes"),
-        }
+        })
     }
 }
 
@@ -208,8 +220,8 @@ mod tests {
 
     #[test]
     fn type_and_type_specific_payload_should_serialise_and_deserialise_correctly() {
-        let fields = BluefinTypeFields::new(PacketType::Handshake, 0b0001_0011_0111);
-        assert_eq!(fields.packet_type, PacketType::Handshake);
+        let fields = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0b0001_0011_0111);
+        assert_eq!(fields.packet_type, PacketType::UnencryptedHandshake);
         assert_eq!(fields.type_specific_payload, 0b0001_0011_0111);
         let serialised = fields.serialise();
         // The byte stream would look like (in network order) 0b0000 0001 0011 0111
@@ -218,13 +230,16 @@ mod tests {
         assert_eq!(serialised[1], 0b0011_0111);
 
         let deserialised = BluefinTypeFields::deserialise(&serialised);
-        assert_eq!(deserialised, fields);
+        match deserialised {
+            Ok(d_field) => assert_eq!(d_field, fields),
+            Err(_) => assert!(false)
+        }
     }
 
     #[test]
     #[should_panic(expected = "type_specific_payload field cannot be longer than 12 bits")]
     fn type_and_type_specific_payload_should_panic_if_payload_is_out_of_bounds() {
-        let _ = BluefinTypeFields::new(PacketType::Handshake, 0b1_0000_0000_0000);
+        let _ = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0b1_0000_0000_0000);
     }
 
     #[test]
@@ -244,6 +259,9 @@ mod tests {
         assert_eq!(serialised.len(), 20);
 
         let deserialised = BluefinHeader::deserialise(&serialised);
-        assert_eq!(deserialised, header);
+        match deserialised {
+            Ok(d_field) => assert_eq!(d_field, header),
+            Err(_) => assert!(false)
+        }
     }
 }

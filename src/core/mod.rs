@@ -1,3 +1,4 @@
+pub mod connection;
 pub mod context;
 pub mod header;
 pub mod packet;

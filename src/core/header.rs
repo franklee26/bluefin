@@ -1,6 +1,6 @@
-use super::serialisable::{Serialisable, DeserialiseError};
+use super::serialisable::{DeserialiseError, Serialisable};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketType {
     UnencryptedHandshake = 0x00,
     Data = 0x01,
@@ -109,7 +109,9 @@ impl Serialisable for BluefinSecurityFields {
 
     fn deserialise(bytes: &[u8]) -> Result<Self, DeserialiseError> {
         if bytes.len() < 1 {
-            return Err(DeserialiseError::new("Bluefin security fields are one byte"));
+            return Err(DeserialiseError::new(
+                "Bluefin security fields are one byte",
+            ));
         }
         let byte = bytes[0];
         let header_encrypted: bool = ((byte & 0x80) >> 7) != 0;
@@ -232,7 +234,7 @@ mod tests {
         let deserialised = BluefinTypeFields::deserialise(&serialised);
         match deserialised {
             Ok(d_field) => assert_eq!(d_field, fields),
-            Err(_) => assert!(false)
+            Err(_) => assert!(false),
         }
     }
 
@@ -261,7 +263,7 @@ mod tests {
         let deserialised = BluefinHeader::deserialise(&serialised);
         match deserialised {
             Ok(d_field) => assert_eq!(d_field, header),
-            Err(_) => assert!(false)
+            Err(_) => assert!(false),
         }
     }
 }

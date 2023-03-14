@@ -1,8 +1,9 @@
 /// The endpoint host type
 #[derive(Debug, PartialEq, Eq)]
 pub enum BluefinHost {
+    PackLeader,
+    PackFollower,
     Client,
-    Server,
 }
 
 /// The state at which the connection is at

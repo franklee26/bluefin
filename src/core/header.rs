@@ -6,6 +6,7 @@ pub enum PacketType {
     Data = 0x01,
     Error = 0x02,
     Warning = 0x03,
+    DiscoveryProbe = 0x04,
 }
 
 impl PacketType {
@@ -15,6 +16,7 @@ impl PacketType {
             0x01 => Self::Data,
             0x02 => Self::Error,
             0x03 => Self::Warning,
+            0x04 => Self::DiscoveryProbe,
             _ => panic!("Unknown packet type {}", value),
         }
     }

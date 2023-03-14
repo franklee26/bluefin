@@ -1,6 +1,6 @@
 use std::net::Ipv4Addr;
 
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::IntoRawFd;
 use std::process::Command;
 use tun::platform::Device;
 use tun_tap::Iface;

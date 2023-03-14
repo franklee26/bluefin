@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{self, ErrorKind, Read},
+    net::Ipv4Addr,
     os::fd::FromRawFd,
 };
 
@@ -12,15 +13,24 @@ pub struct BluefinPackLeader {
     source_id: [u8; 4],
     num_connections: usize,
     raw_file: File,
+    name: String,
 }
 
 pub struct BluefinPackLeaderBuilder {
     source_id: Option<[u8; 4]>,
+    name: Option<String>,
+    bind_address: Option<String>,
+    netmask: Option<String>,
 }
 
 impl BluefinPackLeaderBuilder {
     pub fn builder() -> Self {
-        Self { source_id: None }
+        Self {
+            source_id: None,
+            name: None,
+            bind_address: None,
+            netmask: None,
+        }
     }
 
     pub fn source_id(mut self, source_id: [u8; 4]) -> Self {
@@ -28,11 +38,25 @@ impl BluefinPackLeaderBuilder {
         self
     }
 
+    pub fn name(mut self, name: String) -> Self {
+        self.name = Some(name);
+        self
+    }
+
+    pub fn bind_address(mut self, bind_address: String) -> Self {
+        self.bind_address = Some(bind_address);
+        self
+    }
+
+    pub fn netmask(mut self, netmask: String) -> Self {
+        self.netmask = Some(netmask);
+        self
+    }
+
     pub fn build(&self) -> BluefinPackLeader {
-        // TODO: change hardcode
-        let name = "utun3";
-        let address = "192.168.55.2";
-        let netmask = "255.255.255.0";
+        let name = self.name.clone().unwrap_or("utun3".to_string());
+        let address = self.bind_address.clone().unwrap();
+        let netmask = self.netmask.clone().unwrap();
 
         let device = BluefinDevice::builder()
             .name(name.to_string())
@@ -47,6 +71,7 @@ impl BluefinPackLeaderBuilder {
             source_id: self.source_id.unwrap(),
             num_connections: 0,
             raw_file,
+            name,
         }
     }
 }
@@ -54,8 +79,6 @@ impl BluefinPackLeaderBuilder {
 impl BluefinPackLeader {
     // Returns a Connection as a handle
     pub async fn accept(&mut self, buf: &mut [u8]) -> Result<Connection, ()> {
-        // let _ = self.device.read(buf).unwrap();
-
         let _ = self.raw_file.read(buf);
         eprintln!("BUF STATE: {:?}", buf);
 

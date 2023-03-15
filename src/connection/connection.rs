@@ -5,6 +5,7 @@ use std::{
 
 use etherparse::PacketBuilder;
 
+/// A Bluefin `Connection`
 pub struct Connection {
     pub id: String,
     need_ip_udp_headers: bool,

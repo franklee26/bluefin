@@ -1,11 +1,10 @@
 use std::{
     fs::File,
     io::{self, ErrorKind, Read},
-    net::Ipv4Addr,
     os::fd::FromRawFd,
 };
 
-use crate::{core::connection::Connection, tun::device::BluefinDevice};
+use crate::{connection::connection::Connection, tun::device::BluefinDevice};
 use etherparse::{Ipv4Header, PacketHeaders};
 use rand::distributions::{Alphanumeric, DistString};
 
@@ -16,6 +15,17 @@ pub struct BluefinPackLeader {
     name: String,
 }
 
+impl BluefinPackLeader {
+    pub fn builder() -> BluefinPackLeaderBuilder {
+        BluefinPackLeaderBuilder {
+            source_id: None,
+            name: None,
+            bind_address: None,
+            netmask: None,
+        }
+    }
+}
+
 pub struct BluefinPackLeaderBuilder {
     source_id: Option<[u8; 4]>,
     name: Option<String>,
@@ -24,15 +34,6 @@ pub struct BluefinPackLeaderBuilder {
 }
 
 impl BluefinPackLeaderBuilder {
-    pub fn builder() -> Self {
-        Self {
-            source_id: None,
-            name: None,
-            bind_address: None,
-            netmask: None,
-        }
-    }
-
     pub fn source_id(mut self, source_id: [u8; 4]) -> Self {
         self.source_id = Some(source_id);
         self

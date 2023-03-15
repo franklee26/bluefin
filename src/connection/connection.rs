@@ -7,6 +7,7 @@ use etherparse::PacketBuilder;
 
 pub struct Connection {
     pub id: String,
+    need_ip_udp_headers: bool,
     pub connection_id: [u8; 4],
     raw_file: File,
     pub bytes_in: Option<Vec<u8>>,
@@ -23,6 +24,7 @@ impl Connection {
             id,
             connection_id,
             raw_file,
+            need_ip_udp_headers: true,
             bytes_in: None,
             bytes_out: None,
             source_ip: None,
@@ -38,6 +40,10 @@ impl Connection {
 
     pub fn set_bytes_out(&mut self, bytes_out: Vec<u8>) {
         self.bytes_out = Some(bytes_out);
+    }
+
+    pub fn need_ip_udp_headers(&mut self, need_ip_udp_headers: bool) {
+        self.need_ip_udp_headers = need_ip_udp_headers;
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -57,6 +63,11 @@ impl Connection {
         }
 
         let bytes_out = self.bytes_out.as_ref().unwrap();
+
+        // No need to pre-build; just flush buffer
+        if !self.need_ip_udp_headers {
+            return self.raw_file.write(bytes_out);
+        }
 
         let packet_builder =
             PacketBuilder::ipv4(self.destination_ip.unwrap(), self.source_ip.unwrap(), 20)

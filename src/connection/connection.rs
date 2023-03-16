@@ -5,6 +5,8 @@ use std::{
 
 use etherparse::PacketBuilder;
 
+use crate::core::context::{BluefinHost, Context, State};
+
 /// A Bluefin `Connection`
 pub struct Connection {
     pub id: String,
@@ -17,10 +19,11 @@ pub struct Connection {
     pub destination_ip: Option<[u8; 4]>,
     pub source_port: Option<u16>,
     pub destination_port: Option<u16>,
+    pub context: Context,
 }
 
 impl Connection {
-    pub fn new(id: String, connection_id: [u8; 4], raw_file: File) -> Self {
+    pub fn new(id: String, connection_id: [u8; 4], raw_file: File, host_type: BluefinHost) -> Self {
         Connection {
             id,
             connection_id,
@@ -32,6 +35,10 @@ impl Connection {
             source_port: None,
             destination_ip: None,
             destination_port: None,
+            context: Context {
+                host_type,
+                state: State::Handshake,
+            },
         }
     }
 

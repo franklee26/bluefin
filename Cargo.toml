@@ -13,6 +13,7 @@ bincode = "1.3.3"
 etherparse = "0.13.0"
 rand = "0.8.5"
 serde = { version = "1.0.147", features = ["derive"]}
+thiserror = "1.0.39"
 tokio = { version = "1", features = ["full"] }
 tun-tap = "0.1.3"
 tun = "0.5"

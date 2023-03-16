@@ -4,7 +4,12 @@ use std::{
     os::fd::FromRawFd,
 };
 
-use crate::{connection::connection::Connection, tun::device::BluefinDevice};
+use crate::{
+    connection::connection::Connection,
+    core::context::{BluefinHost, State},
+    handshake::handshake::bluefin_handshake_handle,
+    tun::device::BluefinDevice,
+};
 use etherparse::{Ipv4Header, PacketHeaders};
 use rand::distributions::{Alphanumeric, DistString};
 
@@ -79,21 +84,23 @@ impl BluefinPackLeaderBuilder {
 
 impl BluefinPackLeader {
     // Returns a Connection as a handle
-    pub async fn accept(&mut self, buf: &mut [u8]) -> Result<Connection, ()> {
-        let _ = self.raw_file.read(buf);
-        eprintln!("BUF STATE: {:?}", buf);
+    pub async fn accept(&mut self, buf: &mut [u8]) -> io::Result<Connection> {
+        let num_bytes_read = self.raw_file.read(buf)?;
+        eprintln!("BUF STATE: {:?}", &buf[..num_bytes_read]);
 
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
 
         // Build new connection handle
-        let mut connection =
-            Connection::new(id, self.source_id, self.raw_file.try_clone().unwrap());
-        connection.set_bytes_in(buf.into());
+        let mut connection = Connection::new(
+            id,
+            self.source_id,
+            self.raw_file.try_clone().unwrap(),
+            BluefinHost::PackLeader,
+        );
+        connection.set_bytes_in(buf[..num_bytes_read].into());
 
         // Could not parse connection; fail here.
-        if let Err(_) = self.parse_and_set_header_info(buf, &mut connection) {
-            return Err(());
-        }
+        self.parse_and_set_header_info(&mut connection)?;
 
         // Update connection count
         self.num_connections += 1;
@@ -101,17 +108,14 @@ impl BluefinPackLeader {
         Ok(connection)
     }
 
-    fn parse_and_set_header_info(
-        &mut self,
-        buf: &mut [u8],
-        conn: &mut Connection,
-    ) -> io::Result<()> {
-        match PacketHeaders::from_ip_slice(&buf[4..]) {
+    fn parse_and_set_header_info(&mut self, conn: &mut Connection) -> io::Result<()> {
+        let bytes = conn.bytes_in.as_ref().unwrap();
+        match PacketHeaders::from_ip_slice(&bytes[4..]) {
             // TODO: Is this the right error?
             Err(_) => Err(io::Error::from(ErrorKind::Unsupported)),
             Ok(value) => {
                 let ip_header_len = value.ip.unwrap().header_len();
-                let (ip_header, _) = Ipv4Header::from_slice(&buf[4..ip_header_len + 4]).unwrap();
+                let (ip_header, _) = Ipv4Header::from_slice(&bytes[4..ip_header_len + 4]).unwrap();
 
                 // Not udp. Pass.
                 if ip_header.protocol != 0x11 {
@@ -125,11 +129,24 @@ impl BluefinPackLeader {
                 }
 
                 let udp_header = value.transport.unwrap().udp().unwrap();
+                let udp_header_len = udp_header.header_len();
 
                 conn.source_ip = Some(ip_header.source);
                 conn.destination_ip = Some(ip_header.destination);
                 conn.source_port = Some(udp_header.source_port);
                 conn.destination_port = Some(udp_header.destination_port);
+
+                // Throw away the header
+                conn.set_bytes_in(bytes[ip_header_len + 4 + udp_header_len..].into());
+
+                // Now confirm that this is a bluefin packet
+                if let Err(bluefin_err) = bluefin_handshake_handle(conn) {
+                    conn.context.state = State::Error;
+                    return Err(io::Error::new(
+                        ErrorKind::Unsupported,
+                        format!("Invalid packet. Aborting connection. {:?}", bluefin_err),
+                    ));
+                }
 
                 Ok(())
             }

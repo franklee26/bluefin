@@ -1,4 +1,4 @@
-use super::serialisable::{DeserialiseError, Serialisable};
+use super::{error::BluefinError, serialisable::Serialisable};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PacketType {
@@ -64,9 +64,11 @@ impl Serialisable for BluefinTypeFields {
     }
 
     #[inline]
-    fn deserialise(bytes: &[u8]) -> Result<Self, DeserialiseError> {
+    fn deserialise(bytes: &[u8]) -> Result<Self, BluefinError> {
         if bytes.len() < 2 {
-            return Err(DeserialiseError::new("Bluefin type fields are two bytes"));
+            return Err(BluefinError::DeserialiseError(
+                "Bluefin type fields are two bytes".to_string(),
+            ));
         }
         // Two bytes. First 4 bits is the packet_type then the remaining 12 bits are the type-specific payload
         let packet_type = (bytes[0] & 0xf0) >> 4;
@@ -109,10 +111,10 @@ impl Serialisable for BluefinSecurityFields {
         vec![byte]
     }
 
-    fn deserialise(bytes: &[u8]) -> Result<Self, DeserialiseError> {
+    fn deserialise(bytes: &[u8]) -> Result<Self, BluefinError> {
         if bytes.len() < 1 {
-            return Err(DeserialiseError::new(
-                "Bluefin security fields are one byte",
+            return Err(BluefinError::DeserialiseError(
+                "Bluefin security fields are one byte".to_string(),
             ));
         }
         let byte = bytes[0];
@@ -190,9 +192,11 @@ impl Serialisable for BluefinHeader {
         .concat()
     }
 
-    fn deserialise(bytes: &[u8]) -> Result<Self, DeserialiseError> {
+    fn deserialise(bytes: &[u8]) -> Result<Self, BluefinError> {
         if bytes.len() < 20 {
-            return Err(DeserialiseError::new("Bluefin header is 20 bytes"));
+            return Err(BluefinError::DeserialiseError(
+                "Bluefin header must be exactly 20 bytes".to_string(),
+            ));
         }
         let type_and_type_specific_payload = BluefinTypeFields::deserialise(&bytes[1..3])?;
         let security_fields = BluefinSecurityFields::deserialise(&[bytes[3]])?;

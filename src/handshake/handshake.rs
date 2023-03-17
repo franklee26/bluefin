@@ -56,13 +56,23 @@ fn handle_pack_leader_response(conn: &mut Connection) -> Result<(), BluefinError
     // Just get the header; as usual, we don't care about the payload during this part of the handshake
     let header = packet.header;
 
-    // Verify that the connection id is correct (the packet's dst conn id should be our src id):w
+    // Verify that the connection id is correct (the packet's dst conn id should be our src id)
     if header.destination_connection_id != conn.source_id {
         return Err(BluefinError::InvalidHeaderError(format!(
             "Pack-leader's dst conn id ({}) != client's id ({})",
             header.destination_connection_id, conn.source_id
         )));
     }
+
+    // Verify that the packet number is as expected
+    if header.packet_number != conn.context.packet_number + 1 {
+        return Err(BluefinError::InvalidHeaderError(format!(
+            "Pack-leader has incorrect packet number {:#016x}, was expecting {:#016x}",
+            header.packet_number, conn.context.packet_number
+        )));
+    }
+
+    conn.context.packet_number += 1;
 
     // The source (pack-leader) is our destination. Conenction id's can never be zero.
     let dest_id = header.source_connection_id;
@@ -90,6 +100,7 @@ async fn bluefin_client_handshake_handler(conn: &mut Connection) -> Result<(), B
     let mut header = BluefinHeader::new(client_conn_id, 0x0, type_fields, security_fields);
     let packet_number: i64 = rand::thread_rng().gen_range(0..=i64::MAX);
     header.with_packet_number(packet_number);
+    conn.context.packet_number = packet_number;
 
     // Build and send packet
     let packet = BluefinPacket::builder().header(header).build();

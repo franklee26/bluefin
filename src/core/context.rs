@@ -7,6 +7,7 @@ pub enum BluefinHost {
 }
 
 /// The state at which the connection is at
+#[derive(Debug)]
 pub enum State {
     Handshake,
     DataStream,
@@ -14,7 +15,9 @@ pub enum State {
     Error,
 }
 
+#[derive(Debug)]
 pub struct Context {
     pub host_type: BluefinHost,
     pub state: State,
+    pub packet_number: [u8; 8],
 }

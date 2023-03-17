@@ -14,7 +14,7 @@ use bluefin::hosts::pack_leader::BluefinPackLeaderBuilder;
 #[tokio::main]
 async fn main() {
     // Bind and construct a pack-leader over an TUN device
-    let mut pack_leader = BluefinPackLeaderBuilder::builder()
+    let mut pack_leader = BluefinPackLeader::builder()
         .name("utun3".to_string())
         .bind_address("192.168.55.2".to_string())
         .netmask("255.255.255.0".to_string())

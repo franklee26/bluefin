@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     fs::File,
     io::{self, ErrorKind, Read, Write},
 };
@@ -7,11 +8,17 @@ use etherparse::PacketBuilder;
 
 use crate::core::context::{BluefinHost, Context, State};
 
-/// A Bluefin `Connection`
+/// A Bluefin `Connection`. This struct represents an established Bluefin connection
+/// and keeps track of the state of the connection, input/output buffers and other
+/// misc. Bluefin connection contexts.
+///
+/// Each `Connection` is unique and is identified by the `id` field.
+#[derive(Debug)]
 pub struct Connection {
     pub id: String,
     need_ip_udp_headers: bool,
-    pub connection_id: [u8; 4],
+    pub source_id: [u8; 4],
+    pub dest_id: [u8; 4],
     raw_file: File,
     pub bytes_in: Option<Vec<u8>>,
     pub bytes_out: Option<Vec<u8>>,
@@ -22,11 +29,22 @@ pub struct Connection {
     pub context: Context,
 }
 
+impl fmt::Display for Connection {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            fmt,
+            "BluefinConnection<{}>\nsrc_id: {:?}\ndst_id: {:?}",
+            self.id, self.source_id, self.dest_id
+        )
+    }
+}
+
 impl Connection {
-    pub fn new(id: String, connection_id: [u8; 4], raw_file: File, host_type: BluefinHost) -> Self {
+    pub fn new(id: String, source_id: [u8; 4], raw_file: File, host_type: BluefinHost) -> Self {
         Connection {
             id,
-            connection_id,
+            source_id,
+            dest_id: [0, 0, 0, 0],
             raw_file,
             need_ip_udp_headers: true,
             bytes_in: None,
@@ -38,6 +56,7 @@ impl Connection {
             context: Context {
                 host_type,
                 state: State::Handshake,
+                packet_number: [0; 8],
             },
         }
     }

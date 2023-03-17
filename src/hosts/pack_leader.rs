@@ -6,7 +6,12 @@ use std::{
 
 use crate::{
     connection::connection::Connection,
-    core::context::{BluefinHost, State},
+    core::{
+        context::{BluefinHost, State},
+        error::BluefinError,
+        packet::BluefinPacket,
+        serialisable::Serialisable,
+    },
     handshake::handshake::bluefin_handshake_handle,
     tun::device::BluefinDevice,
 };
@@ -83,10 +88,40 @@ impl BluefinPackLeaderBuilder {
 }
 
 impl BluefinPackLeader {
-    // Returns a Connection as a handle
+    /*
+     * Trying to validate an incoming client-hello request. Try to parse and deserialise the request
+     * and validate its contents. If everything looks good then proceed with handshake, else return
+     * err.
+     */
+    fn validate_client_request(&self, conn: &mut Connection) -> Result<(), BluefinError> {
+        let client_packet_bytes = conn.bytes_in.as_ref().unwrap();
+        let packet = BluefinPacket::deserialise(client_packet_bytes)?;
+        // Just get the header; don't really care if there is a payload or not
+        let header = packet.header;
+
+        // The source (client) is our destination. Connection id's can never be zero.
+        let dest_id = header.source_connection_id;
+        if dest_id == [0, 0, 0, 0] {
+            return Err(BluefinError::InvalidHeaderError(
+                "Cannot have connection-id of zero".to_string(),
+            ));
+        }
+        conn.dest_id = dest_id;
+
+        // Set packet_number for context
+        conn.context.packet_number = header.packet_number;
+        Ok(())
+    }
+
+    /// Pack-leader accepts a bluefin connection request. This function reads in the client
+    /// request then parses and validates the packet contents. If the packet is correctly
+    /// constructed then the pack-leader responds with a pack-leader-hello handshake response
+    /// and continues the handshake.
+    ///
+    /// Once the handshake is completed is a Connection struct returned. This process is
+    /// asynchronous.
     pub async fn accept(&mut self, buf: &mut [u8]) -> io::Result<Connection> {
         let num_bytes_read = self.raw_file.read(buf)?;
-        eprintln!("BUF STATE: {:?}", &buf[..num_bytes_read]);
 
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
 
@@ -97,18 +132,20 @@ impl BluefinPackLeader {
             self.raw_file.try_clone().unwrap(),
             BluefinHost::PackLeader,
         );
-        connection.set_bytes_in(buf[..num_bytes_read].into());
 
-        // Could not parse connection; fail here.
-        self.parse_and_set_header_info(&mut connection)?;
+        // Parse and validate ip, udp and finally bluefin packets. Proceed with handshake.
+        connection.set_bytes_in(buf[..num_bytes_read].into());
+        self.parse_and_set_header_info(&mut connection).await?;
 
         // Update connection count
         self.num_connections += 1;
 
+        eprintln!("{}", connection);
+
         Ok(connection)
     }
 
-    fn parse_and_set_header_info(&mut self, conn: &mut Connection) -> io::Result<()> {
+    async fn parse_and_set_header_info(&mut self, conn: &mut Connection) -> io::Result<()> {
         let bytes = conn.bytes_in.as_ref().unwrap();
         match PacketHeaders::from_ip_slice(&bytes[4..]) {
             // TODO: Is this the right error?
@@ -136,11 +173,19 @@ impl BluefinPackLeader {
                 conn.source_port = Some(udp_header.source_port);
                 conn.destination_port = Some(udp_header.destination_port);
 
-                // Throw away the header
+                // Throw away the header leaving only a bluefin packet
                 conn.set_bytes_in(bytes[ip_header_len + 4 + udp_header_len..].into());
 
-                // Now confirm that this is a bluefin packet
-                if let Err(bluefin_err) = bluefin_handshake_handle(conn) {
+                // Validate bluefin packet
+                if let Err(validation_error) = self.validate_client_request(conn) {
+                    // TODO: Send error response.
+                    conn.context.state = State::Error;
+                    return Err(io::Error::new(ErrorKind::InvalidData, validation_error));
+                }
+
+                // Proceed with handshake
+                if let Err(bluefin_err) = bluefin_handshake_handle(conn).await {
+                    // TODO: Send error response.
                     conn.context.state = State::Error;
                     return Err(io::Error::new(
                         ErrorKind::Unsupported,

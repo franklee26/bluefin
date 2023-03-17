@@ -10,6 +10,9 @@ pub enum BluefinError {
     #[error("`{0}`")]
     DeserialiseError(String),
 
-    #[error("Unable to complete handshake")]
-    HandshakeError,
+    #[error("Unable to complete handshake: `{0}`")]
+    HandshakeError(String),
+
+    #[error("`{0}`")]
+    InvalidHeaderError(String),
 }

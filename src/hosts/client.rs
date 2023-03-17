@@ -7,7 +7,10 @@ use std::{
 
 use rand::distributions::{Alphanumeric, DistString};
 
-use crate::{connection::connection::Connection, core::context::BluefinHost};
+use crate::{
+    connection::connection::Connection, core::context::BluefinHost,
+    handshake::handshake::bluefin_handshake_handle,
+};
 
 pub struct BluefinClient {
     source_id: [u8; 4],
@@ -28,12 +31,18 @@ impl BluefinClient {
         }
     }
 
+    /// Creates and binds a UDP socket to `address:port`
     pub fn bind(&mut self, address: &str, port: i32) -> io::Result<()> {
         let socket = UdpSocket::bind(format!("{}:{}", address, port))?;
         self.raw_fd = Some(socket.into_raw_fd());
         Ok(())
     }
 
+    /// Request a bluefin connection to `address:port`.
+    ///
+    /// This function builds a Bluefin handshake packet and asynchronously begins
+    /// the handshake with the pack-leader. If the handshake completes successfully
+    /// then an `Connection` struct is returned.
     pub async fn connect(&mut self, address: &str, port: i32) -> io::Result<Connection> {
         if self.raw_fd.is_none() {
             return Err(io::Error::new(
@@ -51,10 +60,13 @@ impl BluefinClient {
 
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
 
-        let mut connection = Connection::new(id, self.source_id, raw_file, BluefinHost::Client);
-        connection.need_ip_udp_headers(false);
+        let mut conn = Connection::new(id, self.source_id, raw_file, BluefinHost::Client);
+        conn.need_ip_udp_headers(false);
 
-        Ok(connection)
+        // Finally, send the hello-client handshake
+        bluefin_handshake_handle(&mut conn).await;
+
+        Ok(conn)
     }
 }
 

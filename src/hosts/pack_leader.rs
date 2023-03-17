@@ -19,7 +19,7 @@ use etherparse::{Ipv4Header, PacketHeaders};
 use rand::distributions::{Alphanumeric, DistString};
 
 pub struct BluefinPackLeader {
-    source_id: [u8; 4],
+    source_id: i32,
     num_connections: usize,
     raw_file: File,
     name: String,
@@ -37,14 +37,14 @@ impl BluefinPackLeader {
 }
 
 pub struct BluefinPackLeaderBuilder {
-    source_id: Option<[u8; 4]>,
+    source_id: Option<i32>,
     name: Option<String>,
     bind_address: Option<String>,
     netmask: Option<String>,
 }
 
 impl BluefinPackLeaderBuilder {
-    pub fn source_id(mut self, source_id: [u8; 4]) -> Self {
+    pub fn source_id(mut self, source_id: i32) -> Self {
         self.source_id = Some(source_id);
         self
     }
@@ -99,7 +99,7 @@ impl BluefinPackLeader {
 
         // The source (client) is our destination. Connection id's can never be zero.
         let dest_id = header.source_connection_id;
-        if dest_id == [0, 0, 0, 0] {
+        if dest_id == 0x0 {
             return Err(BluefinError::InvalidHeaderError(
                 "Cannot have connection-id of zero".to_string(),
             ));

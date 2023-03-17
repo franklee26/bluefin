@@ -13,13 +13,13 @@ use crate::{
 };
 
 pub struct BluefinClient {
-    source_id: [u8; 4],
+    source_id: i32,
     name: String,
     raw_fd: Option<i32>,
 }
 
 pub struct BluefinClientBuilder {
-    source_id: Option<[u8; 4]>,
+    source_id: Option<i32>,
     name: Option<String>,
 }
 
@@ -64,14 +64,22 @@ impl BluefinClient {
         conn.need_ip_udp_headers(false);
 
         // Finally, send the hello-client handshake
-        bluefin_handshake_handle(&mut conn).await;
+        if let Err(handshake_err) = bluefin_handshake_handle(&mut conn).await {
+            return Err(io::Error::new(
+                ErrorKind::NotConnected,
+                format!(
+                    "Failed to complete handshake with pack-leader: {}",
+                    handshake_err
+                ),
+            ));
+        }
 
         Ok(conn)
     }
 }
 
 impl BluefinClientBuilder {
-    pub fn source_id(mut self, source_id: [u8; 4]) -> Self {
+    pub fn source_id(mut self, source_id: i32) -> Self {
         self.source_id = Some(source_id);
         self
     }

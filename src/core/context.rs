@@ -19,5 +19,5 @@ pub enum State {
 pub struct Context {
     pub host_type: BluefinHost,
     pub state: State,
-    pub packet_number: [u8; 8],
+    pub packet_number: i64,
 }

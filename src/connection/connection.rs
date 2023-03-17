@@ -17,8 +17,8 @@ use crate::core::context::{BluefinHost, Context, State};
 pub struct Connection {
     pub id: String,
     need_ip_udp_headers: bool,
-    pub source_id: [u8; 4],
-    pub dest_id: [u8; 4],
+    pub source_id: i32,
+    pub dest_id: i32,
     raw_file: File,
     pub bytes_in: Option<Vec<u8>>,
     pub bytes_out: Option<Vec<u8>>,
@@ -33,18 +33,18 @@ impl fmt::Display for Connection {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(
             fmt,
-            "BluefinConnection<{}>\nsrc_id: {:?}\ndst_id: {:?}",
+            "BluefinConnection<{}>\nsrc_id: {:#08x}\ndst_id: {:#08x}",
             self.id, self.source_id, self.dest_id
         )
     }
 }
 
 impl Connection {
-    pub fn new(id: String, source_id: [u8; 4], raw_file: File, host_type: BluefinHost) -> Self {
+    pub fn new(id: String, source_id: i32, raw_file: File, host_type: BluefinHost) -> Self {
         Connection {
             id,
             source_id,
-            dest_id: [0, 0, 0, 0],
+            dest_id: 0x0,
             raw_file,
             need_ip_udp_headers: true,
             bytes_in: None,
@@ -56,7 +56,7 @@ impl Connection {
             context: Context {
                 host_type,
                 state: State::Handshake,
-                packet_number: [0; 8],
+                packet_number: 0x0,
             },
         }
     }
@@ -74,11 +74,11 @@ impl Connection {
     }
 
     pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let size = self.raw_file.read(buf);
+        let size = self.raw_file.read(buf)?;
 
-        self.set_bytes_in(buf.into());
+        self.set_bytes_in(buf[..size].into());
 
-        size
+        Ok(size)
     }
 
     pub async fn write(&mut self) -> io::Result<usize> {

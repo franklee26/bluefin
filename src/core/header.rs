@@ -27,9 +27,9 @@ impl PacketType {
 #[derive(Debug, PartialEq, Eq)]
 pub struct BluefinTypeFields {
     /// The packet type is 4 bits
-    packet_type: PacketType,
+    pub packet_type: PacketType,
     /// Packet-type specific payload is 12 bits
-    type_specific_payload: u16,
+    pub type_specific_payload: u16,
 }
 
 impl BluefinTypeFields {
@@ -150,17 +150,17 @@ pub struct BluefinHeader {
     /// encryption and mask field total is 8 bits
     pub security_fields: BluefinSecurityFields,
     /// source_connection_id is 32 bits
-    pub source_connection_id: [u8; 4],
+    pub source_connection_id: i32,
     /// desination_connection_id is 32 bits
-    pub destination_connection_id: [u8; 4],
+    pub destination_connection_id: i32,
     /// packet_number is 64 bits
-    pub packet_number: [u8; 8],
+    pub packet_number: i64,
 }
 
 impl BluefinHeader {
     pub fn new(
-        source_connection_id: [u8; 4],
-        destination_connection_id: [u8; 4],
+        source_connection_id: i32,
+        destination_connection_id: i32,
         type_and_type_specific_payload: BluefinTypeFields,
         security_fields: BluefinSecurityFields,
     ) -> Self {
@@ -170,11 +170,11 @@ impl BluefinHeader {
             security_fields,
             source_connection_id,
             destination_connection_id,
-            packet_number: [0x00; 8],
+            packet_number: 0x0,
         }
     }
 
-    pub fn with_packet_number(&mut self, packet_number: [u8; 8]) {
+    pub fn with_packet_number(&mut self, packet_number: i64) {
         self.packet_number = packet_number;
     }
 }
@@ -185,9 +185,9 @@ impl Serialisable for BluefinHeader {
             [self.version].as_slice(),
             self.type_and_type_specific_payload.serialise().as_slice(),
             self.security_fields.serialise().as_slice(),
-            self.source_connection_id.as_slice(),
-            self.destination_connection_id.as_slice(),
-            self.packet_number.as_slice(),
+            &self.source_connection_id.to_be_bytes(),
+            &self.destination_connection_id.to_be_bytes(),
+            &self.packet_number.to_be_bytes(),
         ]
         .concat()
     }
@@ -204,15 +204,21 @@ impl Serialisable for BluefinHeader {
             version: bytes[0].try_into().expect("version is 1 byte"),
             type_and_type_specific_payload,
             security_fields,
-            source_connection_id: bytes[4..8]
-                .try_into()
-                .expect("source connection id should be 4 bytes"),
-            destination_connection_id: bytes[8..12]
-                .try_into()
-                .expect("destination connection id should be 4 bytes"),
-            packet_number: bytes[12..20]
-                .try_into()
-                .expect("packet number should be 8 bytes"),
+            source_connection_id: i32::from_be_bytes(
+                bytes[4..8]
+                    .try_into()
+                    .expect("source connection id should be 4 bytes"),
+            ),
+            destination_connection_id: i32::from_be_bytes(
+                bytes[8..12]
+                    .try_into()
+                    .expect("destination connection id should be 4 bytes"),
+            ),
+            packet_number: i64::from_be_bytes(
+                bytes[12..20]
+                    .try_into()
+                    .expect("packet number should be 8 bytes"),
+            ),
         })
     }
 }
@@ -254,12 +260,7 @@ mod tests {
     fn bluefine_header_should_serialise_and_deserialise_properly() {
         let types = BluefinTypeFields::new(PacketType::Error, 0b0011_0111_1111);
         let security_fields = BluefinSecurityFields::new(true, 0b001_1111);
-        let header = BluefinHeader::new(
-            [0x01, 0x02, 0x03, 0x04],
-            [0x04, 0x03, 0x02, 0x01],
-            types,
-            security_fields,
-        );
+        let header = BluefinHeader::new(0x01020304, 0x04030201, types, security_fields);
         assert_eq!(header.version, 0x0);
 
         let serialised = header.serialise();

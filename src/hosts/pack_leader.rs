@@ -88,11 +88,9 @@ impl BluefinPackLeaderBuilder {
 }
 
 impl BluefinPackLeader {
-    /*
-     * Trying to validate an incoming client-hello request. Try to parse and deserialise the request
-     * and validate its contents. If everything looks good then proceed with handshake, else return
-     * err.
-     */
+    /// Trying to validate an incoming client-hello request. Try to parse and deserialise the request
+    /// and validate its contents. If everything looks good then proceed with handshake, else return
+    /// err.
     fn validate_client_request(&self, conn: &mut Connection) -> Result<(), BluefinError> {
         let client_packet_bytes = conn.bytes_in.as_ref().unwrap();
         let packet = BluefinPacket::deserialise(client_packet_bytes)?;

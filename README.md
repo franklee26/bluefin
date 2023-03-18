@@ -18,7 +18,7 @@ async fn main() {
         .name("utun3".to_string())
         .bind_address("192.168.55.2".to_string())
         .netmask("255.255.255.0".to_string())
-        .source_id([1, 3, 1, 8])
+        .source_id(0x01030108)
         .build();
 
     loop {
@@ -40,7 +40,7 @@ async fn main() {
 async fn main() -> std::io::Result<()> {
     let mut client = BluefinClient::builder()
         .name("test_client".to_string())
-        .source_id([1, 2, 3, 4])
+        .source_id(0x01020304)
         .build();
 
     let port = rand::thread_rng().gen_range(10000..50000);

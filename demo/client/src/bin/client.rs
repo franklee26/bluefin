@@ -18,6 +18,8 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to host");
 
+    eprintln!("{conn}");
+
     let mut buf = vec![0; 1504];
     let size = conn.read(&mut buf).await?;
     eprintln!("{:?}", &buf[..size]);

@@ -33,8 +33,8 @@ impl fmt::Display for Connection {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(
             fmt,
-            "BluefinConnection<{}>\nsrc_id: {:#08x}\ndst_id: {:#08x}",
-            self.id, self.source_id, self.dest_id
+            "BluefinConnection<{}> ({:?})\nsrc_id: {:#08x}\ndst_id: {:#08x}",
+            self.id, self.context.state, self.source_id, self.dest_id
         )
     }
 }

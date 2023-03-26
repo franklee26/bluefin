@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::IntoRawFd;
 use std::process::Command;
 use tun::platform::Device;
-use tun_tap::Iface;
+use tun_tap::{Iface, Mode};
 
 // This only exists because it's a pain to work with tun/tap devices
 // on Mac OS
@@ -54,7 +54,7 @@ impl BluefinDeviceBuilder {
     #[cfg(target_os = "linux")]
     fn get_linux_device(self) -> Option<Iface> {
         let name = self.name.clone().unwrap();
-        let iface = Iface::new(name, Mode::Tun).expect("Failed to create a TUN device");
+        let iface = Iface::new(&name, Mode::Tun).expect("Failed to create a TUN device");
         Some(iface)
     }
 
@@ -106,15 +106,10 @@ impl BluefinDeviceBuilder {
         let device = {
             BluefinDevice {
                 name: self.name.to_owned(),
-                address: self.address,
-                netmask: self.netmask,
+                address: self.address.clone(),
+                netmask: self.netmask.clone(),
                 mac_device: None,
                 linux_device: self.get_linux_device(),
-                source_ip: None,
-                destination_ip: None,
-                source_port: None,
-                destination_port: None,
-                fd: None,
             }
         };
 

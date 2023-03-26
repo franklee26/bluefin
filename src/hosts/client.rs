@@ -1,11 +1,11 @@
 use std::{
-    fs::File,
     io::{self, ErrorKind},
     net::UdpSocket,
     os::fd::{FromRawFd, IntoRawFd},
 };
 
 use rand::distributions::{Alphanumeric, DistString};
+use tokio::fs::File;
 
 use crate::{
     connection::connection::Connection, core::context::BluefinHost,

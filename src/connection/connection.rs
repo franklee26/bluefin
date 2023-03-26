@@ -1,12 +1,22 @@
 use std::{
     fmt,
-    fs::File,
-    io::{self, ErrorKind, Read, Write},
+    io::{self, ErrorKind},
+    time::Duration,
 };
 
-use etherparse::PacketBuilder;
+use etherparse::{PacketBuilder, PacketHeaders};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncWriteExt},
+    time::timeout,
+};
 
-use crate::core::context::{BluefinHost, Context, State};
+use crate::core::{
+    context::{BluefinHost, Context, State},
+    header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
+    packet::BluefinPacket,
+    serialisable::Serialisable,
+};
 
 /// A Bluefin `Connection`. This struct represents an established Bluefin connection
 /// and keeps track of the state of the connection, input/output buffers and other
@@ -20,7 +30,6 @@ pub struct Connection {
     pub source_id: i32,
     pub dest_id: i32,
     raw_file: File,
-    pub bytes_in: Option<Vec<u8>>,
     pub bytes_out: Option<Vec<u8>>,
     pub source_ip: Option<[u8; 4]>,
     pub destination_ip: Option<[u8; 4]>,
@@ -47,7 +56,6 @@ impl Connection {
             dest_id: 0x0,
             raw_file,
             need_ip_udp_headers: true,
-            bytes_in: None,
             bytes_out: None,
             source_ip: None,
             source_port: None,
@@ -61,10 +69,6 @@ impl Connection {
         }
     }
 
-    pub fn set_bytes_in(&mut self, bytes_in: Vec<u8>) {
-        self.bytes_in = Some(bytes_in);
-    }
-
     pub fn set_bytes_out(&mut self, bytes_out: Vec<u8>) {
         self.bytes_out = Some(bytes_out);
     }
@@ -73,15 +77,51 @@ impl Connection {
         self.need_ip_udp_headers = need_ip_udp_headers;
     }
 
-    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let size = self.raw_file.read(buf)?;
+    /// Asynchronously reads in bytes from connection into buf. Notice that this
+    /// read has a built in timeout of 10 sec. If the future does not yield a
+    /// result in thie timeout period, then this function returns an error.
+    /// Otherwise, the exact read contents are stored in the conn.bytes_in.
+    ///
+    /// Returns an offset and size pair
+    pub async fn read(&mut self, buf: &mut [u8]) -> io::Result<(usize, usize)> {
+        let mut size = timeout(Duration::from_secs(10), self.raw_file.read(buf)).await??;
 
-        self.set_bytes_in(buf[..size].into());
+        // If I don't need to worry about ip/udp headers then I'm using a UDP socket. This means
+        // that I'm just getting the Bluefin packet. Easy.
+        if !self.need_ip_udp_headers {
+            return Ok((0, size));
+        }
+
+        // Else, I need to worry about the additional ip + udp headers. Let's strip them and
+        // return.
+        let ip_packet = PacketHeaders::from_ip_slice(&buf[4..]).unwrap();
+        let ip_header_len = ip_packet.ip.unwrap().header_len();
+        let udp_header_len = ip_packet.transport.unwrap().udp().unwrap().header_len();
+
+        let offset = 4 + ip_header_len + udp_header_len;
+        size -= offset;
+
+        Ok((offset, size))
+    }
+
+    /// Asynchronously reads in bytes from connection into buf. This func is the same
+    /// as `read` but does not have a timeout.
+    pub async fn read_without_timeout(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let size = self.raw_file.read(buf).await?;
 
         Ok(size)
     }
 
-    pub async fn write(&mut self) -> io::Result<usize> {
+    pub async fn write_error_message(&mut self, err_msg: &[u8]) -> io::Result<()> {
+        let mut packet = self.get_packet(Some(err_msg.into()));
+        packet.header.type_and_type_specific_payload.packet_type = PacketType::Error;
+        self.context.state = State::Error;
+
+        self.raw_file.write_all(&packet.serialise()).await?;
+        Ok(())
+    }
+
+    pub async fn write(&mut self) -> io::Result<()> {
         if self.bytes_out.is_none() {
             return Err(io::Error::new(
                 ErrorKind::InvalidData,
@@ -93,7 +133,7 @@ impl Connection {
 
         // No need to pre-build; just flush buffer
         if !self.need_ip_udp_headers {
-            return self.raw_file.write(bytes_out);
+            return self.raw_file.write_all(bytes_out).await;
         }
 
         let packet_builder =
@@ -105,7 +145,34 @@ impl Connection {
         let _ = packet_builder.write(&mut writer, &bytes_out);
         tun_tap_bytes.append(&mut writer);
 
-        self.raw_file.write(&tun_tap_bytes)
+        self.bytes_out = None;
+        self.raw_file.write_all(&tun_tap_bytes).await
+    }
+
+    pub fn get_packet(&self, payload: Option<Vec<u8>>) -> BluefinPacket {
+        let packet_type = match self.context.state {
+            State::Handshake => PacketType::UnencryptedHandshake,
+            State::Error => PacketType::Error,
+            State::DataStream => PacketType::Data,
+            // We should never try to build an empty packet if the connection is closed
+            State::Closed => unreachable!(),
+        };
+        // TODO: additional type specific fields?
+        let type_fields = BluefinTypeFields::new(packet_type, 0x0);
+        // TODO: tls encryption + mask?
+        let security_fields = BluefinSecurityFields::new(false, 0x0);
+        let mut header =
+            BluefinHeader::new(self.source_id, self.dest_id, type_fields, security_fields);
+        header.with_packet_number(self.context.packet_number);
+        if payload.is_some() {
+            let packet = BluefinPacket::builder()
+                .header(header)
+                .payload(payload.unwrap())
+                .build();
+            return packet;
+        }
+        let packet = BluefinPacket::builder().header(header).build();
+        packet
     }
 
     pub async fn process(&mut self) {
@@ -117,7 +184,8 @@ impl Connection {
         );
         // Try writing something using raw socket fd
         let response = vec![1, 3, 1, 8, 2, 6];
-        self.bytes_out = Some(response);
+        let packet = self.get_packet(Some(response));
+        self.bytes_out = Some(packet.serialise());
 
         self.write().await;
     }

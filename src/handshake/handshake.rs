@@ -1,5 +1,3 @@
-use std::io;
-
 use rand::Rng;
 
 use crate::{
@@ -42,17 +40,57 @@ async fn bluefin_packleader_handshake_handler(conn: &mut Connection) -> Result<(
         )));
     }
 
+    // Read and validate client-ack
+    let mut buf = vec![0; 1504];
+    let conn_read_result = conn.read(&mut buf).await;
+    if let Err(timeout_err) = conn_read_result {
+        return Err(BluefinError::HandshakeError(format!(
+            "Waiting for client-ack timed out: {}",
+            timeout_err,
+        )));
+    }
+
+    match conn_read_result {
+        Ok((offset, size)) => {
+            if size < 20 {
+                return Err(BluefinError::HandshakeError(format!(
+                    "Encountered unexpected client ack packet size of {} bytes",
+                    size
+                )));
+            }
+            let client_ack_packet = BluefinPacket::deserialise(&buf[offset..offset + size])?;
+            client_ack_packet.validate(conn)?;
+            conn.write_error_message("I just feel like it!".to_string().as_bytes())
+                .await;
+        }
+        Err(err) => {
+            return Err(BluefinError::HandshakeError(format!(
+                "Failed to read client-ack {:?}",
+                err
+            )));
+        }
+    }
+
     Ok(())
 }
 
 async fn bluefin_packfollower_handshake_handler(conn: &mut Connection) -> Result<(), BluefinError> {
-    let deserialised = BluefinHeader::deserialise(&conn.bytes_in.as_ref().unwrap())?;
-    eprintln!("Found header: {:?}", deserialised);
-    Ok(())
+    todo!();
 }
 
-fn handle_pack_leader_response(conn: &mut Connection) -> Result<(), BluefinError> {
-    let packet = BluefinPacket::deserialise(conn.bytes_in.as_ref().unwrap())?;
+/// Pre-condition:
+///     * Client has sent client-hello
+///     * Pack-leader has sent it's response back to client
+///
+/// This function parses the incoming pack-leader-hello and performs validation. This is
+/// almost identical to the `validate` function in `Packet.rs` except we need to set
+/// connection's destination id (we did not know this value yet until the pack-leader has
+/// responded back with it's pack-leader-hello).
+async fn handle_pack_leader_response(
+    conn: &mut Connection,
+    bytes: &[u8],
+) -> Result<(), BluefinError> {
+    let packet = BluefinPacket::deserialise(bytes)?;
     // Just get the header; as usual, we don't care about the payload during this part of the handshake
     let header = packet.header;
 
@@ -72,7 +110,7 @@ fn handle_pack_leader_response(conn: &mut Connection) -> Result<(), BluefinError
         )));
     }
 
-    conn.context.packet_number += 1;
+    conn.context.packet_number += 2;
 
     // The source (pack-leader) is our destination. Conenction id's can never be zero.
     let dest_id = header.source_connection_id;
@@ -82,7 +120,14 @@ fn handle_pack_leader_response(conn: &mut Connection) -> Result<(), BluefinError
         ));
     }
     conn.dest_id = dest_id;
-
+    // Validated the pack-leader's response. Ack-back.
+    let ack_packet = conn.get_packet(None).serialise();
+    conn.set_bytes_out(ack_packet);
+    if let Err(_) = conn.write().await {
+        return Err(BluefinError::HandshakeError(
+            "Could not sent pack-leader the client-ack.".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -113,17 +158,25 @@ async fn bluefin_client_handshake_handler(conn: &mut Connection) -> Result<(), B
         )));
     };
 
-    // Wait for pack-leader response (20 bytes)
-    let mut buf = vec![0; 20];
-    match conn.read(&mut buf).await {
-        Ok(size) => {
+    // Wait for pack-leader response (20 bytes) w/ timeout
+    let mut buf = vec![0; 1504];
+    let conn_read_result = conn.read(&mut buf).await;
+    if let Err(timeout_err) = conn_read_result {
+        return Err(BluefinError::HandshakeError(format!(
+            "Waiting for pack-leader response timed out: {}",
+            timeout_err,
+        )));
+    }
+
+    match conn_read_result {
+        Ok((offset, size)) => {
             if size < 20 {
                 return Err(BluefinError::HandshakeError(format!(
                     "Pack-leader responded with unexpected packet size of {} bytes",
                     size
                 )));
             }
-            handle_pack_leader_response(conn)?;
+            handle_pack_leader_response(conn, &buf[offset..offset + size]).await?;
         }
         Err(err) => {
             return Err(BluefinError::HandshakeError(format!(

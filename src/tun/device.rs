@@ -134,38 +134,9 @@ impl BluefinDevice {
     pub fn get_raw_fd(self) -> i32 {
         #[cfg(target_os = "macos")]
         let raw_fd = {
-            let netmask = self.netmask;
-            let address = self.address.unwrap();
-            let name = self.name.clone().unwrap();
             let mac_device = self.mac_device.unwrap();
-            let raw_fd = mac_device.into_raw_fd();
 
-            let up_eth_str: String = format!("ifconfig {} {:?} {:?} up ", name, address, address);
-            let route_add_str: String = format!(
-                "sudo route -n add -net {:?} -netmask {:?} {:?}",
-                address,
-                netmask.unwrap(),
-                address
-            );
-            let up_eth_out = Command::new("sh")
-                .arg("-c")
-                .arg(up_eth_str)
-                .output()
-                .expect("sh exec error!");
-            if !up_eth_out.status.success() {
-                eprintln!("Failed first command!!!");
-            }
-
-            let if_config_out = Command::new("sh")
-                .arg("-c")
-                .arg(route_add_str)
-                .output()
-                .expect("sh exec error!");
-            if !if_config_out.status.success() {
-                eprintln!("Failed second command!!!");
-            }
-
-            raw_fd
+            mac_device.into_raw_fd()
         };
 
         #[cfg(target_os = "linux")]

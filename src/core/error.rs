@@ -15,4 +15,7 @@ pub enum BluefinError {
 
     #[error("`{0}`")]
     InvalidHeaderError(String),
+
+    #[error("`Payload size of {0} bytes is too large`")]
+    LargePayloadError(String),
 }

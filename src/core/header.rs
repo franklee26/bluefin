@@ -24,7 +24,7 @@ impl PacketType {
 
 /// This struct contains both the packet type and type-specific fields. Together, these
 /// two fields are 2 one byte.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BluefinTypeFields {
     /// The packet type is 4 bits
     pub packet_type: PacketType,
@@ -81,7 +81,7 @@ impl Serialisable for BluefinTypeFields {
 }
 
 /// This struct contains the encryption flag and header-protection fields for a total of 8 bits
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BluefinSecurityFields {
     /// header_encrypted is one bit and signals whether the header contains encrypted fields
     header_encrypted: bool,
@@ -141,7 +141,7 @@ impl Serialisable for BluefinSecurityFields {
  * |                                                               |
  * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
  */
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BluefinHeader {
     // The version is 8 bits
     pub version: u8,

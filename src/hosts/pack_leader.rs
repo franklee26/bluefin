@@ -1,5 +1,4 @@
 use std::{
-    fs::File,
     io::{self, ErrorKind, Read},
     os::fd::FromRawFd,
 };
@@ -17,6 +16,7 @@ use crate::{
 };
 use etherparse::{Ipv4Header, PacketHeaders};
 use rand::distributions::{Alphanumeric, DistString};
+use tokio::{fs::File, io::AsyncReadExt};
 
 pub struct BluefinPackLeader {
     source_id: i32,
@@ -91,9 +91,12 @@ impl BluefinPackLeader {
     /// Trying to validate an incoming client-hello request. Try to parse and deserialise the request
     /// and validate its contents. If everything looks good then proceed with handshake, else return
     /// err.
-    fn validate_client_request(&self, conn: &mut Connection) -> Result<(), BluefinError> {
-        let client_packet_bytes = conn.bytes_in.as_ref().unwrap();
-        let packet = BluefinPacket::deserialise(client_packet_bytes)?;
+    fn validate_client_request(
+        &self,
+        conn: &mut Connection,
+        bytes: &[u8],
+    ) -> Result<(), BluefinError> {
+        let packet = BluefinPacket::deserialise(bytes)?;
         // Just get the header; don't really care if there is a payload or not
         let header = packet.header;
 
@@ -119,7 +122,8 @@ impl BluefinPackLeader {
     /// Once the handshake is completed is a Connection struct returned. This process is
     /// asynchronous.
     pub async fn accept(&mut self, buf: &mut [u8]) -> io::Result<Connection> {
-        let num_bytes_read = self.raw_file.read(buf)?;
+        // Notice that this `read` does not timeout... we keep waiting until we receive a request
+        let num_bytes_read = self.raw_file.read(buf).await?;
 
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
 
@@ -127,13 +131,13 @@ impl BluefinPackLeader {
         let mut connection = Connection::new(
             id,
             self.source_id,
-            self.raw_file.try_clone().unwrap(),
+            self.raw_file.try_clone().await.unwrap(),
             BluefinHost::PackLeader,
         );
 
         // Parse and validate ip, udp and finally bluefin packets. Proceed with handshake.
-        connection.set_bytes_in(buf[..num_bytes_read].into());
-        self.parse_and_set_header_info(&mut connection).await?;
+        self.parse_and_set_header_info(&mut connection, &buf[..num_bytes_read])
+            .await?;
 
         // Update connection count
         self.num_connections += 1;
@@ -143,8 +147,11 @@ impl BluefinPackLeader {
         Ok(connection)
     }
 
-    async fn parse_and_set_header_info(&mut self, conn: &mut Connection) -> io::Result<()> {
-        let bytes = conn.bytes_in.as_ref().unwrap();
+    async fn parse_and_set_header_info(
+        &mut self,
+        conn: &mut Connection,
+        bytes: &[u8],
+    ) -> io::Result<()> {
         match PacketHeaders::from_ip_slice(&bytes[4..]) {
             // TODO: Is this the right error?
             Err(_) => Err(io::Error::from(ErrorKind::Unsupported)),
@@ -171,11 +178,14 @@ impl BluefinPackLeader {
                 conn.source_port = Some(udp_header.source_port);
                 conn.destination_port = Some(udp_header.destination_port);
 
-                // Throw away the header leaving only a bluefin packet
-                conn.set_bytes_in(bytes[ip_header_len + 4 + udp_header_len..].into());
-
                 // Validate bluefin packet
-                if let Err(validation_error) = self.validate_client_request(conn) {
+                if let Err(validation_error) =
+                    // Throw away the header leaving only a bluefin packet
+                    self.validate_client_request(
+                        conn,
+                        &bytes[4 + ip_header_len + udp_header_len..],
+                    )
+                {
                     // TODO: Send error response.
                     conn.context.state = State::Error;
                     return Err(io::Error::new(ErrorKind::InvalidData, validation_error));

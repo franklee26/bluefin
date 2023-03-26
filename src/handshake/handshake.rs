@@ -41,35 +41,8 @@ async fn bluefin_packleader_handshake_handler(conn: &mut Connection) -> Result<(
     }
 
     // Read and validate client-ack
-    let mut buf = vec![0; 1504];
-    let conn_read_result = conn.read(&mut buf).await;
-    if let Err(timeout_err) = conn_read_result {
-        return Err(BluefinError::HandshakeError(format!(
-            "Waiting for client-ack timed out: {}",
-            timeout_err,
-        )));
-    }
-
-    match conn_read_result {
-        Ok((offset, size)) => {
-            if size < 20 {
-                return Err(BluefinError::HandshakeError(format!(
-                    "Encountered unexpected client ack packet size of {} bytes",
-                    size
-                )));
-            }
-            let client_ack_packet = BluefinPacket::deserialise(&buf[offset..offset + size])?;
-            client_ack_packet.validate(conn)?;
-            conn.write_error_message("I just feel like it!".to_string().as_bytes())
-                .await;
-        }
-        Err(err) => {
-            return Err(BluefinError::HandshakeError(format!(
-                "Failed to read client-ack {:?}",
-                err
-            )));
-        }
-    }
+    let conn_read_result = conn.bluefin_read_packet().await?;
+    conn_read_result.packet.validate(conn)?;
 
     Ok(())
 }
@@ -88,9 +61,8 @@ async fn bluefin_packfollower_handshake_handler(conn: &mut Connection) -> Result
 /// responded back with it's pack-leader-hello).
 async fn handle_pack_leader_response(
     conn: &mut Connection,
-    bytes: &[u8],
+    packet: BluefinPacket,
 ) -> Result<(), BluefinError> {
-    let packet = BluefinPacket::deserialise(bytes)?;
     // Just get the header; as usual, we don't care about the payload during this part of the handshake
     let header = packet.header;
 
@@ -158,33 +130,9 @@ async fn bluefin_client_handshake_handler(conn: &mut Connection) -> Result<(), B
         )));
     };
 
-    // Wait for pack-leader response (20 bytes) w/ timeout
-    let mut buf = vec![0; 1504];
-    let conn_read_result = conn.read(&mut buf).await;
-    if let Err(timeout_err) = conn_read_result {
-        return Err(BluefinError::HandshakeError(format!(
-            "Waiting for pack-leader response timed out: {}",
-            timeout_err,
-        )));
-    }
-
-    match conn_read_result {
-        Ok((offset, size)) => {
-            if size < 20 {
-                return Err(BluefinError::HandshakeError(format!(
-                    "Pack-leader responded with unexpected packet size of {} bytes",
-                    size
-                )));
-            }
-            handle_pack_leader_response(conn, &buf[offset..offset + size]).await?;
-        }
-        Err(err) => {
-            return Err(BluefinError::HandshakeError(format!(
-                "Failed to read server-hello response {:?}",
-                err
-            )));
-        }
-    };
+    // Wait for pack-leader response
+    let conn_read_result = conn.bluefin_read_packet().await?;
+    handle_pack_leader_response(conn, conn_read_result.packet).await?;
 
     Ok(())
 }

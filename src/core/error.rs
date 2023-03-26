@@ -18,4 +18,7 @@ pub enum BluefinError {
 
     #[error("`Payload size of {0} bytes is too large`")]
     LargePayloadError(String),
+
+    #[error("Encountered error while reading from socket: `{0}`")]
+    ReadError(String),
 }

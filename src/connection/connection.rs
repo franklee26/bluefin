@@ -13,6 +13,7 @@ use tokio::{
 
 use crate::core::{
     context::{BluefinHost, Context, State},
+    error::BluefinError,
     header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
     packet::BluefinPacket,
     serialisable::Serialisable,
@@ -36,6 +37,14 @@ pub struct Connection {
     pub source_port: Option<u16>,
     pub destination_port: Option<u16>,
     pub context: Context,
+}
+
+/// Read result contains the read bluefin packet along with additional metadata
+/// such as the size of the read bytestream and any offset.
+pub struct BluefinReadResult {
+    pub size: usize,
+    pub offset: usize,
+    pub packet: BluefinPacket,
 }
 
 impl fmt::Display for Connection {
@@ -77,7 +86,29 @@ impl Connection {
         self.need_ip_udp_headers = need_ip_udp_headers;
     }
 
-    /// Asynchronously reads in bytes from connection into buf. Notice that this
+    /// This function is similar to `read` except:
+    ///     1. Return value is wrapped with a `Result<BluefinReadResult, BluefinError>` instead of
+    ///        io::Result<>. This makes it easier to deal with bluefin-specific errors.
+    ///     2. This function is expecting the input to be a bluefin packet and not arbitrary bytes. If
+    ///        the incoming bytes can not be deserialised into a bluefin packet then this errors.
+    ///     3. No need to provide a buffer; we internally malloc 1504 byte buffer. This means the invoker
+    ///        does not necessarily need to work with buffer ptr arithmetic.
+    pub async fn bluefin_read_packet(&mut self) -> Result<BluefinReadResult, BluefinError> {
+        let mut buf = vec![0; 1504];
+
+        match self.read(&mut buf).await {
+            Ok((offset, size)) => {
+                let packet = BluefinPacket::deserialise(&buf[offset..offset + size])?;
+                Ok(BluefinReadResult {
+                    size,
+                    offset,
+                    packet,
+                })
+            }
+            Err(err) => Err(BluefinError::ReadError(err.to_string())),
+        }
+    }
+
     /// read has a built in timeout of 10 sec. If the future does not yield a
     /// result in thie timeout period, then this function returns an error.
     /// Otherwise, the exact read contents are stored in the conn.bytes_in.

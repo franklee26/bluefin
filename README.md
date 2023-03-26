@@ -4,6 +4,7 @@
 
 [![Latest Version]][crates.io] 
 [![Documentation]][docs.rs]
+![Github Workflow](https://github.com/franklee26/bluefin/actions/workflows/bluefin.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ### Example

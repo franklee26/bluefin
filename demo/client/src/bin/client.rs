@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use rand::Rng;
 
 use bluefin::hosts::client::BluefinClient;
@@ -6,6 +8,7 @@ use bluefin::hosts::client::BluefinClient;
 async fn main() -> std::io::Result<()> {
     let mut client = BluefinClient::builder()
         .name("test_client".to_string())
+        .timeout(Duration::from_secs(30))
         .source_id(0x01020304)
         .build();
 
@@ -18,11 +21,20 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to host");
 
-    eprintln!("{conn}");
+    for _ in 0..5 {
+        let stream = conn.request_stream().await.unwrap();
+        tokio::spawn(async move {
+            eprintln!("Opened stream: {}", stream.id);
+        });
+    }
 
-    let mut buf = vec![0; 1504];
-    let (_, size) = conn.read(&mut buf).await?;
-    eprintln!("{:?}", &buf[..size]);
+    let packet = conn.bluefin_read_packet().await.unwrap().packet;
+    eprintln!(
+        "<{:?}> Received payload: {}",
+        packet.header.type_and_type_specific_payload.packet_type,
+        std::str::from_utf8(&packet.payload).unwrap()
+    );
+    eprintln!("{conn}");
 
     Ok(())
 }

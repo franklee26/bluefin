@@ -1,10 +1,10 @@
 use std::{
     io::{self, ErrorKind, Read},
     os::fd::FromRawFd,
+    time::Duration,
 };
 
 use crate::{
-    connection::connection::Connection,
     core::{
         context::{BluefinHost, State},
         error::BluefinError,
@@ -12,6 +12,8 @@ use crate::{
         serialisable::Serialisable,
     },
     handshake::handshake::bluefin_handshake_handle,
+    io::manager::ConnectionManager,
+    network::connection::Connection,
     tun::device::BluefinDevice,
 };
 use etherparse::{Ipv4Header, PacketHeaders};
@@ -23,6 +25,7 @@ pub struct BluefinPackLeader {
     num_connections: usize,
     raw_file: File,
     name: String,
+    manager: ConnectionManager,
 }
 
 impl BluefinPackLeader {
@@ -78,10 +81,13 @@ impl BluefinPackLeaderBuilder {
         let raw_fd = device.get_raw_fd();
         let raw_file = unsafe { File::from_raw_fd(raw_fd) };
 
+        let manager = ConnectionManager::new();
+
         BluefinPackLeader {
             source_id: self.source_id.unwrap(),
             num_connections: 0,
             raw_file,
+            manager,
             name,
         }
     }
@@ -129,10 +135,11 @@ impl BluefinPackLeader {
 
         // Build new connection handle
         let mut connection = Connection::new(
-            id,
+            id.clone(),
             self.source_id,
             self.raw_file.try_clone().await.unwrap(),
             BluefinHost::PackLeader,
+            Duration::from_secs(10),
         );
 
         // Parse and validate ip, udp and finally bluefin packets. Proceed with handshake.
@@ -141,8 +148,7 @@ impl BluefinPackLeader {
 
         // Update connection count
         self.num_connections += 1;
-
-        eprintln!("{}", connection);
+        connection.context.state = State::Ready;
 
         Ok(connection)
     }
@@ -193,11 +199,11 @@ impl BluefinPackLeader {
 
                 // Proceed with handshake
                 if let Err(bluefin_err) = bluefin_handshake_handle(conn).await {
-                    // TODO: Send error response.
-                    conn.context.state = State::Error;
+                    conn.write_error_message(bluefin_err.to_string().as_bytes())
+                        .await?;
                     return Err(io::Error::new(
                         ErrorKind::Unsupported,
-                        format!("Invalid packet. Aborting connection. {:?}", bluefin_err),
+                        format!("Aborting connection. {:?}", bluefin_err),
                     ));
                 }
 

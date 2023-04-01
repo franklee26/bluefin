@@ -7,12 +7,13 @@ pub enum BluefinHost {
 }
 
 /// The state at which the connection is at
-#[derive(Debug)]
+#[derive(PartialEq, Debug)]
 pub enum State {
     Handshake,
     DataStream,
     Closed,
     Error,
+    Ready,
 }
 
 #[derive(Debug)]

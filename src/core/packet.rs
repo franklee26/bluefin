@@ -1,6 +1,19 @@
-use crate::{connection::connection::Connection, core::header::BluefinHeader};
+use crate::{core::header::BluefinHeader, network::connection::Connection};
 
-use super::{error::BluefinError, serialisable::Serialisable};
+use super::{error::BluefinError, header::BluefinStreamHeader, serialisable::Serialisable};
+
+pub struct BluefinStreamPacket {
+    pub header: BluefinHeader,
+    pub stream_header: BluefinStreamHeader,
+    pub payload: Vec<u8>,
+}
+
+pub struct BluefinStreamPacketBuilder {
+    header: Option<BluefinHeader>,
+    stream_header: Option<BluefinStreamHeader>,
+    payload: Option<Vec<u8>>,
+}
+
 pub struct BluefinPacket {
     pub header: BluefinHeader,
     pub payload: Vec<u8>,
@@ -9,6 +22,68 @@ pub struct BluefinPacket {
 pub struct BluefinPacketBuilder {
     header: Option<BluefinHeader>,
     payload: Option<Vec<u8>>,
+}
+
+impl BluefinStreamPacket {
+    pub(crate) fn builder() -> BluefinStreamPacketBuilder {
+        BluefinStreamPacketBuilder {
+            header: None,
+            stream_header: None,
+            payload: None,
+        }
+    }
+}
+
+impl BluefinStreamPacketBuilder {
+    pub(crate) fn header(mut self, header: BluefinHeader) -> Self {
+        self.header = Some(header);
+        self
+    }
+
+    pub(crate) fn stream_header(mut self, stream_header: BluefinStreamHeader) -> Self {
+        self.stream_header = Some(stream_header);
+        self
+    }
+
+    pub fn payload(mut self, payload: Vec<u8>) -> Self {
+        self.payload = Some(payload);
+        self
+    }
+
+    pub fn build(self) -> BluefinStreamPacket {
+        BluefinStreamPacket {
+            header: self.header.unwrap(),
+            stream_header: self.stream_header.unwrap(),
+            payload: self.payload.unwrap_or(vec![]),
+        }
+    }
+}
+
+impl Serialisable for BluefinStreamPacket {
+    fn serialise(&self) -> Vec<u8> {
+        let mut header_bytes = self.header.serialise();
+        let mut stream_header_bytes = self.stream_header.serialise();
+        header_bytes.append(&mut stream_header_bytes);
+        header_bytes.append(&mut self.payload.clone());
+
+        header_bytes
+    }
+
+    fn deserialise(bytes: &[u8]) -> Result<Self, BluefinError>
+    where
+        Self: Sized,
+    {
+        // Header is 20 bytes
+        let header = BluefinHeader::deserialise(&bytes[..20])?;
+        // Stream header is 4 bytes
+        let stream_header = BluefinStreamHeader::deserialise(&bytes[20..24])?;
+        let payload = bytes[24..].to_vec();
+        Ok(Self {
+            header,
+            stream_header,
+            payload,
+        })
+    }
 }
 
 impl Serialisable for BluefinPacket {

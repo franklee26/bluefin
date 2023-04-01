@@ -21,4 +21,16 @@ pub enum BluefinError {
 
     #[error("Encountered error while reading from socket: `{0}`")]
     ReadError(String),
+
+    #[error("Encountered error while writing to socket: `{0}`")]
+    WriteError(String),
+
+    #[error("Cannot currently open stream for given connection")]
+    CannotOpenStreamError,
+
+    #[error("Cannot currently accept new connection due to too many connections opened")]
+    TooManyOpenConnectionsError,
+
+    #[error("No such connection found")]
+    NoSuchConnectionError,
 }

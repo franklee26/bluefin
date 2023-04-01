@@ -1,7 +1,6 @@
 use rand::Rng;
 
 use crate::{
-    connection::connection::Connection,
     core::{
         context::BluefinHost,
         error::BluefinError,
@@ -9,6 +8,7 @@ use crate::{
         packet::BluefinPacket,
         serialisable::Serialisable,
     },
+    network::connection::Connection,
 };
 
 pub async fn bluefin_handshake_handle(conn: &mut Connection) -> Result<(), BluefinError> {
@@ -39,7 +39,6 @@ async fn bluefin_packleader_handshake_handler(conn: &mut Connection) -> Result<(
             respond_err
         )));
     }
-
     // Read and validate client-ack
     let conn_read_result = conn.bluefin_read_packet().await?;
     conn_read_result.packet.validate(conn)?;

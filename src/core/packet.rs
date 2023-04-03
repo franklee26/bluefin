@@ -14,6 +14,7 @@ pub struct BluefinStreamPacketBuilder {
     payload: Option<Vec<u8>>,
 }
 
+#[derive(Debug)]
 pub struct BluefinPacket {
     pub header: BluefinHeader,
     pub payload: Vec<u8>,

@@ -10,6 +10,15 @@ pub enum BluefinError {
     #[error("`{0}`")]
     DeserialiseError(String),
 
+    #[error("Current buffer is full.")]
+    BufferFullError,
+
+    #[error("Current buffer is empty.")]
+    BufferEmptyError,
+
+    #[error("Unable to accept new connection: `{0}`")]
+    CouldNotAcceptConnectionError(String),
+
     #[error("Unable to complete handshake: `{0}`")]
     HandshakeError(String),
 
@@ -33,4 +42,10 @@ pub enum BluefinError {
 
     #[error("No such connection found")]
     NoSuchConnectionError,
+
+    #[error("Connection already exists. Nothing done.")]
+    ConnectionAlreadyExists,
+
+    #[error("No such waker.")]
+    NoSuchWakerError,
 }

@@ -23,7 +23,7 @@ use crate::core::{
     serialisable::Serialisable,
 };
 
-use super::stream::Stream;
+use super::{socket::BluefinSocket, stream::Stream};
 
 const MAX_NUM_OPEN_STREAMS: usize = 10;
 

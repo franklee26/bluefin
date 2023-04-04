@@ -6,7 +6,6 @@ use std::{
 };
 
 use rand::distributions::{Alphanumeric, DistString};
-use tokio::fs::File;
 
 use crate::{
     core::context::{BluefinHost, State},
@@ -19,6 +18,8 @@ pub struct BluefinClient {
     name: String,
     timeout: Duration,
     raw_fd: Option<i32>,
+    src_ip: Option<String>,
+    src_port: Option<i32>,
 }
 
 pub struct BluefinClientBuilder {
@@ -40,6 +41,8 @@ impl BluefinClient {
     pub fn bind(&mut self, address: &str, port: i32) -> io::Result<()> {
         let socket = UdpSocket::bind(format!("{}:{}", address, port))?;
         self.raw_fd = Some(socket.into_raw_fd());
+        self.src_ip = Some(address.to_string());
+        self.src_port = Some(port);
         Ok(())
     }
 
@@ -61,17 +64,21 @@ impl BluefinClient {
             .connect(format!("{}:{}", address, port))
             .expect("Could not connect to address/port");
         self.raw_fd = Some(socket.into_raw_fd());
-        let raw_file = unsafe { File::from_raw_fd(self.raw_fd.unwrap()) };
 
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
 
-        let mut conn = Connection::new(
-            id,
-            self.source_id,
-            raw_file,
+        let conn = Connection::new(
+            0x0,
+            0x0,
+            self.src_ip.unwrap(),
+            self.src_port.unwrap(),
+            address,
+            port,
             BluefinHost::Client,
-            self.timeout,
+            false,
+            self.raw_fd,
         );
+
         conn.need_ip_udp_headers(false);
 
         // Finally, send the hello-client handshake
@@ -113,6 +120,8 @@ impl BluefinClientBuilder {
             name: self.name.clone().unwrap(),
             timeout: self.timeout.unwrap_or(Duration::from_secs(10)),
             raw_fd: None,
+            src_ip: None,
+            src_port: None,
         }
     }
 }

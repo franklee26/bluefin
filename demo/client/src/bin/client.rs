@@ -21,12 +21,12 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to host");
 
-    for _ in 0..5 {
-        let stream = conn.request_stream().await.unwrap();
-        tokio::spawn(async move {
-            eprintln!("Opened stream: {}", stream.id);
-        });
-    }
+    // for _ in 0..5 {
+    //     let stream = conn.request_stream().await.unwrap();
+    //     tokio::spawn(async move {
+    //         eprintln!("Opened stream: {}", stream.id);
+    //     });
+    // }
 
     let packet = conn.bluefin_read_packet().await.unwrap().packet;
     eprintln!(

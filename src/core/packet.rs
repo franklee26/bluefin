@@ -14,7 +14,7 @@ pub struct BluefinStreamPacketBuilder {
     payload: Option<Vec<u8>>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct BluefinPacket {
     pub header: BluefinHeader,
     pub payload: Vec<u8>,
@@ -23,6 +23,17 @@ pub struct BluefinPacket {
 pub struct BluefinPacketBuilder {
     header: Option<BluefinHeader>,
     payload: Option<Vec<u8>>,
+}
+
+/// Entire packet representation, including the ip + udp metadata
+/// and the deserialised bluefin packet
+#[derive(Clone, Debug)]
+pub(crate) struct Packet {
+    pub(crate) src_ip: [u8; 4],
+    pub(crate) dst_ip: [u8; 4],
+    pub(crate) src_port: u16,
+    pub(crate) dst_port: u16,
+    pub(crate) payload: BluefinPacket,
 }
 
 impl BluefinStreamPacket {

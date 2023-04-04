@@ -21,18 +21,15 @@ use super::connection::Connection;
 #[derive(Debug)]
 pub(crate) struct BluefinSocket {
     pub(crate) fd: i32,
-    pub(crate) file: File,
     pub(crate) need_ip_and_udp_headers: bool,
     pub(crate) manager: ConnectionManager,
 }
 
 impl BluefinSocket {
     pub fn new(fd: i32, need_ip_and_udp_headers: bool) -> Self {
-        let file = unsafe { File::from_raw_fd(fd) };
         let manager = ConnectionManager::new();
         Self {
             fd,
-            file,
             manager,
             need_ip_and_udp_headers,
         }
@@ -40,8 +37,7 @@ impl BluefinSocket {
 
     /// Accepts an incoming client/pack-follower's handshake request.
     pub async fn accept(&mut self) -> Result<Accept> {
-        let file = self.file.try_clone().await.unwrap();
-        let mut accept = Accept::new(file, &mut self.manager, self.need_ip_and_udp_headers);
+        let mut accept = Accept::new(self.fd, &mut self.manager, self.need_ip_and_udp_headers);
 
         let pinned_accept = Pin::new(&mut accept);
 

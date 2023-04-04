@@ -12,7 +12,7 @@ use crate::{
         serialisable::Serialisable,
     },
     handshake::handshake::bluefin_handshake_handle,
-    io::manager::ConnectionManager,
+    io::{manager::ConnectionManager, read::Accept},
     network::connection::Connection,
     tun::device::BluefinDevice,
 };
@@ -24,6 +24,7 @@ pub struct BluefinPackLeader {
     source_id: i32,
     num_connections: usize,
     raw_file: File,
+    fd: i32,
     name: String,
     manager: ConnectionManager,
 }
@@ -78,14 +79,15 @@ impl BluefinPackLeaderBuilder {
             .netmask(netmask.parse().unwrap())
             .build();
 
-        let raw_fd = device.get_raw_fd();
-        let raw_file = unsafe { File::from_raw_fd(raw_fd) };
+        let fd = device.get_raw_fd();
+        let raw_file = unsafe { File::from_raw_fd(fd) };
 
         let manager = ConnectionManager::new();
 
         BluefinPackLeader {
             source_id: self.source_id.unwrap(),
             num_connections: 0,
+            fd,
             raw_file,
             manager,
             name,
@@ -127,6 +129,7 @@ impl BluefinPackLeader {
     ///
     /// Once the handshake is completed is a Connection struct returned. This process is
     /// asynchronous.
+    /*
     pub async fn accept(&mut self, buf: &mut [u8]) -> io::Result<Connection> {
         // Notice that this `read` does not timeout... we keep waiting until we receive a request
         let num_bytes_read = self.raw_file.read(buf).await?;
@@ -137,7 +140,7 @@ impl BluefinPackLeader {
         let mut connection = Connection::new(
             id.clone(),
             self.source_id,
-            self.raw_file.try_clone().await.unwrap(),
+            self.fd,
             BluefinHost::PackLeader,
             Duration::from_secs(10),
         );
@@ -151,6 +154,14 @@ impl BluefinPackLeader {
         connection.context.state = State::Ready;
 
         Ok(connection)
+    }
+    */
+
+    /// Pack-leader accepts a bluefin connection request. This function return an `Accept` future
+    /// which asynchronously reads incoming bytes. Upon a valid bluefin handshake request packet,
+    /// and successful handshake completion, the future registers and creates a `Connection` instance.
+    pub fn accept(&mut self) -> Accept {
+        Accept::new(self.fd, &mut self.manager, true)
     }
 
     async fn parse_and_set_header_info(

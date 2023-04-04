@@ -1,26 +1,33 @@
 use std::{
     fmt,
     io::{self, ErrorKind},
+    os::fd::FromRawFd,
     time::Duration,
 };
 
 use etherparse::{PacketBuilder, PacketHeaders};
-use rand::Rng;
+use rand::{
+    distributions::{Alphanumeric, DistString},
+    Rng,
+};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncWriteExt},
     time::timeout,
 };
 
-use crate::core::{
-    context::{BluefinHost, Context, State},
-    error::BluefinError,
-    header::{
-        BluefinHeader, BluefinSecurityFields, BluefinStreamHeader, BluefinTypeFields, PacketType,
-        StreamPacketType,
+use crate::{
+    core::{
+        context::{BluefinHost, Context, State},
+        error::BluefinError,
+        header::{
+            BluefinHeader, BluefinSecurityFields, BluefinStreamHeader, BluefinTypeFields,
+            PacketType, StreamPacketType,
+        },
+        packet::{BluefinPacket, BluefinStreamPacket},
+        serialisable::Serialisable,
     },
-    packet::{BluefinPacket, BluefinStreamPacket},
-    serialisable::Serialisable,
+    io::manager::Result,
 };
 
 use super::{socket::BluefinSocket, stream::Stream};
@@ -36,10 +43,10 @@ const MAX_NUM_OPEN_STREAMS: usize = 10;
 pub struct Connection {
     pub id: String,
     need_ip_udp_headers: bool,
+    fd: i32,
     pub source_id: i32,
     pub dest_id: i32,
     pub num_streams: usize,
-    raw_file: File,
     timeout: Duration,
     pub(crate) bytes_out: Option<Vec<u8>>,
     pub(crate) source_ip: Option<[u8; 4]>,
@@ -68,34 +75,43 @@ impl fmt::Display for Connection {
 }
 
 impl Connection {
-    pub fn new(
-        id: String,
-        source_id: i32,
-        raw_file: File,
+    /// Returns a new connection instance.
+    /// TODO: we might need to be stricter with this and return a Result<> instead
+    pub(crate) fn new(
+        dest_id: i32,
+        packet_number: i64,
+        source_ip: [u8; 4],
+        source_port: u16,
+        destination_ip: [u8; 4],
+        destination_port: u16,
         host_type: BluefinHost,
-        timeout: Duration,
-    ) -> Self {
+        need_ip_udp_headers: bool,
+        fd: i32,
+    ) -> Connection {
+        let source_id: i32 = rand::thread_rng().gen();
+        let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         Connection {
             id,
+            need_ip_udp_headers,
+            fd,
             source_id,
-            dest_id: 0x0,
-            raw_file,
-            need_ip_udp_headers: true,
-            bytes_out: None,
-            source_ip: None,
-            source_port: None,
-            destination_ip: None,
-            destination_port: None,
+            dest_id,
             num_streams: 0,
-            timeout,
+            timeout: Duration::from_secs(10),
+            bytes_out: None,
+            source_ip: Some(source_ip),
+            destination_ip: Some(destination_ip),
+            source_port: Some(source_port),
+            destination_port: Some(destination_port),
             context: Context {
                 host_type,
                 state: State::Handshake,
-                packet_number: 0x0,
+                packet_number,
             },
         }
     }
 
+    /*
     pub async fn request_stream(&mut self) -> Result<Stream, BluefinError> {
         // Can't request a stream if the connection is not ready
         if self.context.state != State::Ready {
@@ -133,7 +149,6 @@ impl Connection {
 
         Ok(stream)
     }
-
     pub async fn accept_stream(&mut self) -> Result<Stream, BluefinError> {
         if self.context.state != State::Ready {
             return Err(BluefinError::CannotOpenStreamError);
@@ -159,6 +174,7 @@ impl Connection {
         self.num_streams += 1;
         Ok(stream)
     }
+    */
 
     pub(crate) fn set_bytes_out(&mut self, bytes_out: Vec<u8>) {
         self.bytes_out = Some(bytes_out);
@@ -175,7 +191,7 @@ impl Connection {
     ///        the incoming bytes can not be deserialised into a bluefin packet then this errors.
     ///     3. No need to provide a buffer; we internally malloc 1504 byte buffer. This means the invoker
     ///        does not necessarily need to work with buffer ptr arithmetic.
-    pub async fn bluefin_read_packet(&mut self) -> Result<BluefinReadResult, BluefinError> {
+    pub async fn bluefin_read_packet(&mut self) -> Result<BluefinReadResult> {
         let mut buf = vec![0; 1504];
 
         match self.read(&mut buf).await {
@@ -197,7 +213,8 @@ impl Connection {
     ///
     /// Returns an offset and size pair
     pub(crate) async fn read(&mut self, buf: &mut [u8]) -> io::Result<(usize, usize)> {
-        let mut size = timeout(self.timeout, self.raw_file.read(buf)).await??;
+        let mut raw_file = unsafe { File::from_raw_fd(self.fd) };
+        let mut size = timeout(self.timeout, raw_file.read(buf)).await??;
 
         // If I don't need to worry about ip/udp headers then I'm using a UDP socket. This means
         // that I'm just getting the Bluefin packet. Easy.
@@ -220,7 +237,6 @@ impl Connection {
     pub(crate) async fn write_error_message(&mut self, err_msg: &[u8]) -> io::Result<()> {
         // TODO: I don't know why I need to try_clone. Without this, the write() invocations
         // is blocked and never completes.
-        self.raw_file = self.raw_file.try_clone().await?;
         let mut packet = self.get_packet(Some(err_msg.into()));
         packet.header.type_and_type_specific_payload.packet_type = PacketType::Error;
         self.context.state = State::Error;
@@ -240,10 +256,11 @@ impl Connection {
         }
 
         let bytes_out = self.bytes_out.as_ref().unwrap();
+        let mut raw_file = unsafe { File::from_raw_fd(self.fd) };
 
         // No need to pre-build; just flush buffer
         if !self.need_ip_udp_headers {
-            return self.raw_file.write_all(bytes_out).await;
+            return raw_file.write_all(bytes_out).await;
         }
 
         let packet_builder =
@@ -256,7 +273,7 @@ impl Connection {
         tun_tap_bytes.append(&mut writer);
 
         self.bytes_out = None;
-        self.raw_file.write_all(&tun_tap_bytes).await
+        raw_file.write_all(&tun_tap_bytes).await
     }
 
     pub(crate) fn get_packet(&self, payload: Option<Vec<u8>>) -> BluefinPacket {

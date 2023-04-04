@@ -1,5 +1,5 @@
 use crate::core::error::BluefinError;
-use crate::core::packet::BluefinPacket;
+use crate::core::packet::{BluefinPacket, Packet};
 use std::result;
 use std::{collections::HashMap, task::Waker};
 
@@ -7,19 +7,31 @@ use std::{collections::HashMap, task::Waker};
 pub type Result<T> = result::Result<T, BluefinError>;
 
 /// Represents the buffered bytes for a connection.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct ConnectionBuffer {
-    packet: Option<BluefinPacket>,
+    pub(crate) packet: Option<Packet>,
+    pub(crate) waker: Option<Waker>,
 }
 
 impl ConnectionBuffer {
     pub(crate) fn new() -> Self {
-        Self { packet: None }
+        Self {
+            packet: None,
+            waker: None,
+        }
     }
 
-    /// Adds `packet` to the connection's buffer. If the buffer is full then
-    /// an error is returned.
-    pub(crate) fn add_to_buffer(&mut self, packet: BluefinPacket) -> Result<()> {
+    /// Create a new buffer with just a waker.
+    pub(crate) fn new_with_waker(waker: Waker) -> Self {
+        Self {
+            packet: None,
+            waker: Some(waker),
+        }
+    }
+
+    /// Adds just the `packet` to the connection's buffer. If the buffer is
+    /// full then an error is returned.
+    pub(crate) fn add_to_buffer(&mut self, packet: Packet) -> Result<()> {
         if self.packet.is_some() {
             return Err(BluefinError::BufferFullError);
         }
@@ -28,10 +40,22 @@ impl ConnectionBuffer {
         Ok(())
     }
 
+    /// Adds `packet` and its associated waker to the connection's buffer.
+    /// If the buffer is full then an error is returned.
+    pub(crate) fn add_to_buffer_with_waker(&mut self, packet: Packet, waker: Waker) -> Result<()> {
+        if self.packet.is_some() {
+            return Err(BluefinError::BufferFullError);
+        }
+
+        self.packet = Some(packet);
+        self.waker = Some(waker);
+        Ok(())
+    }
+
     /// Consumes the buffer. If there is nothing in the buffer then an error
     /// is returned. Otherwise the packet is yielded and the packet is dropped
     /// from the buffer.
-    pub(crate) fn consume(&mut self) -> Result<BluefinPacket> {
+    pub(crate) fn consume(&mut self) -> Result<Packet> {
         if self.packet.is_none() {
             return Err(BluefinError::BufferEmptyError);
         }
@@ -43,113 +67,71 @@ impl ConnectionBuffer {
 #[derive(Debug)]
 pub(crate) struct ConnectionManager {
     /// A connection is identified by the key `<other_id>_<mine_id>`. For example if a client
-    /// with id `abc` connected to the current host with conn id `def` then the host would
+    /// with key `abc` connected to the current host with conn id `def` then the host would
     /// look for `abc_def`. In the case that a client is requesting a new connection then
-    /// then the host would expect the `dst_id` to be `0x0` (see handshake protocol).
+    /// then the host would expect the `dst_id` to be `0x0` (see handshake protocol). This means
+    /// the key for a new connection request from client `abc` would be `abc_0`.
     connection_map: HashMap<String, ConnectionBuffer>,
 
-    /// Maps a given connection id to it's associated waker.
-    waker_map: HashMap<String, Waker>,
-
-    /// A vector of wakers awaiting a new connection
-    pending_new_connection_wakers: Vec<Waker>,
+    /// A map tracking new connection `Accept`'s. Because a new connection does not have a defined
+    /// id, we use the `Accept`'s unique id to track each waker.
+    new_connection_req_map: HashMap<String, ConnectionBuffer>,
 }
 
 impl ConnectionManager {
     pub(crate) fn new() -> Self {
         Self {
             connection_map: HashMap::new(),
-            waker_map: HashMap::new(),
-            pending_new_connection_wakers: vec![],
+            new_connection_req_map: HashMap::new(),
         }
     }
 
-    /// Inserts a new buffer into the manager map. If the connection already exists then
-    /// this function returns an error. Otherwise, we add the new entry into the map and
-    /// signal the waker to wake such that any read processes can continue.
-    pub(crate) fn add_new_connection(
+    /// Register an `Accept`'s new connection request. If we have already registered a buffer
+    /// for this `Accept` request then this function errors.
+    pub(crate) fn register_new_connection_request(
         &mut self,
-        dst_id: u32,
-        src_id: u32,
+        accept_id: String,
         waker: Waker,
     ) -> Result<()> {
-        let key = format!("{}_{}", dst_id, src_id);
-
-        // This connection already exists...
-        if self.conn_exists(&key) {
-            return Err(BluefinError::ConnectionAlreadyExists);
+        if self.new_connection_req_map.contains_key(&accept_id) {
+            return Err(BluefinError::BufferFullError);
         }
 
-        // Generate new buffer and add
-        let conn_buf = ConnectionBuffer::new();
-        self.connection_map.insert(key, conn_buf);
+        let conn_buf = ConnectionBuffer::new_with_waker(waker);
 
-        // Signal to executor there was a change in the connection map
-        waker.wake();
-        Ok(())
-    }
-
-    /// Pushes a new connection waker. These wakers are for requests for `Accept`
-    /// futures and are different from normal read futures
-    pub(crate) fn add_new_connection_waker(&mut self, waker: Waker) {
-        self.pending_new_connection_wakers.push(waker);
-    }
-
-    /// Pops the top of stack waker and wakes. The order here doesn't matter since
-    /// we are just requesting a new connection and there is no state yet.
-    pub(crate) fn wake_new_connection(&mut self) -> Result<()> {
-        if self.pending_new_connection_wakers.is_empty() {
-            return Err(BluefinError::NoSuchWakerError);
-        }
-
-        let waker = self.pending_new_connection_wakers.pop().unwrap();
-        waker.wake();
-
+        self.new_connection_req_map.insert(accept_id, conn_buf);
         Ok(())
     }
 
     /// Adds a packet to an existing connection. If the connection does not exist
     /// then this function returns an error.
-    pub(crate) fn add_buffer_to_connection(
+    pub(crate) fn buffer_to_existing_connection(
         &mut self,
         key: &str,
-        packet: BluefinPacket,
+        packet: Packet,
     ) -> Result<()> {
         if !self.conn_exists(&key) {
             return Err(BluefinError::NoSuchConnectionError);
         }
 
-        self.connection_map
-            .get_mut(key)
-            .unwrap()
-            .add_to_buffer(packet)?;
+        let conn_buf = self.connection_map.get_mut(key).unwrap();
 
-        // Signal to executor there was a change in the connection map
-        self.wake(key)?;
-        Ok(())
-    }
+        // Add the packet to buffer
+        conn_buf.add_to_buffer(packet)?;
 
-    pub(crate) fn add_waker(&mut self, key: &str, waker: Waker) -> Result<()> {
-        if self.waker_map.contains_key(key) {
-            return Err(BluefinError::ConnectionAlreadyExists);
-        }
-
-        self.waker_map.insert(key.to_string(), waker);
+        // wake up future
+        conn_buf.waker.as_ref().unwrap().wake_by_ref();
 
         Ok(())
     }
 
-    /// Wakes the associated connection's waker and removes the waker from the map
-    pub(crate) fn wake(&mut self, key: &str) -> Result<()> {
-        if !self.waker_map.contains_key(key) {
+    pub(crate) fn remove_new_conn_req(&mut self, key: String) -> Result<()> {
+        if !self.new_connection_req_map.contains_key(&key) {
+            // TODO: fix error
             return Err(BluefinError::NoSuchConnectionError);
         }
 
-        // Wake the waker
-        self.waker_map.get(key).unwrap().wake_by_ref();
-
-        // Remove from map
-        self.waker_map.remove_entry(key);
+        let _ = self.new_connection_req_map.remove(&key);
 
         Ok(())
     }
@@ -159,5 +141,15 @@ impl ConnectionManager {
     /// `src_id` refers to what the other host's id is.
     pub(crate) fn conn_exists(&self, key: &str) -> bool {
         self.connection_map.contains_key(key)
+    }
+
+    /// Checks whether there is already a registered buffer for a new connection request
+    /// with key `accept_id`. If there is no such entry then we return none.
+    pub(crate) fn search_new_conn_req_buffer(&self, accept_id: &str) -> Option<ConnectionBuffer> {
+        if !self.new_connection_req_map.contains_key(accept_id) {
+            return None;
+        }
+        let conn_buf = self.new_connection_req_map.get(accept_id).unwrap();
+        Some(conn_buf.clone())
     }
 }

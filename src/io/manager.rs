@@ -52,15 +52,17 @@ impl ConnectionBuffer {
         Ok(())
     }
 
-    /// Consumes the buffer. If there is nothing in the buffer then an error
-    /// is returned. Otherwise the packet is yielded and the packet is dropped
-    /// from the buffer.
-    pub(crate) fn consume(&mut self) -> Result<Packet> {
+    /// Consumes the buffer. If there is nothing in the buffer then nothing
+    /// is returned. Otherwise the packet is yielded and the packet + waker
+    /// are dropped from the buffer.
+    pub(crate) fn consume(&mut self) -> Option<Packet> {
+        self.waker = None;
+
         if self.packet.is_none() {
-            return Err(BluefinError::BufferEmptyError);
+            return None;
         }
 
-        Ok(self.packet.take().unwrap())
+        Some(self.packet.take().unwrap())
     }
 }
 
@@ -74,7 +76,9 @@ pub(crate) struct ConnectionManager {
     connection_map: HashMap<String, ConnectionBuffer>,
 
     /// A map tracking new connection `Accept`'s. Because a new connection does not have a defined
-    /// id, we use the `Accept`'s unique id to track each waker.
+    /// id, we use the `Accept`'s unique id to track each waker. We need a separate map because we
+    /// need to quickly identify if a buffer applies to a normal socket read or if the buffer was
+    /// buffering a new connection request.
     new_connection_req_map: HashMap<String, ConnectionBuffer>,
 }
 
@@ -103,6 +107,11 @@ impl ConnectionManager {
         Ok(())
     }
 
+    pub(crate) fn register_new_connection(&mut self, key: String) {
+        let conn_buf = ConnectionBuffer::new();
+        self.connection_map.insert(key, conn_buf);
+    }
+
     /// Adds a packet to an existing connection. If the connection does not exist
     /// then this function returns an error.
     pub(crate) fn buffer_to_existing_connection(
@@ -125,6 +134,25 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Adds a packet to any pending new connection request buffers. If there are no new connection
+    /// requests then we throw away the packet and nothing happens. Otherwise, we pick the first
+    /// pending request (FIFO), buffer the packet and signal the waker.
+    pub(crate) fn buffer_to_new_connection_request(&mut self, packet: Packet) {
+        for (accept_id, conn_buf) in &self.new_connection_req_map {
+            // I need a waker!
+            if conn_buf.waker.is_none() {
+                continue;
+            }
+
+            (*conn_buf).packet = Some(packet);
+            conn_buf.waker.unwrap().wake();
+
+            return;
+        }
+    }
+
+    /// Removes a new connection request with accept_id `key`. It's important to remove these requests
+    /// from the manager such that we don't re-awake an already woken new connection request poll.
     pub(crate) fn remove_new_conn_req(&mut self, key: String) -> Result<()> {
         if !self.new_connection_req_map.contains_key(&key) {
             // TODO: fix error
@@ -141,6 +169,31 @@ impl ConnectionManager {
     /// `src_id` refers to what the other host's id is.
     pub(crate) fn conn_exists(&self, key: &str) -> bool {
         self.connection_map.contains_key(key)
+    }
+
+    /// Fetches the connection buffer for a given connection `key` and resets the buffer content
+    /// and drops the waker (if they exist)
+    pub(crate) fn consume_conn_buf(&self, key: String) -> Option<Packet> {
+        if let Some(conn_buff) = self.connection_map.get(&key) {
+            return conn_buff.consume();
+        }
+
+        None
+    }
+
+    pub(crate) fn add_waker_to_existing_conn(&mut self, key: String, waker: Waker) {
+        if !self.conn_exists(&key) {
+            return;
+        }
+        let conn_buf = self.connection_map.get_mut(&key).unwrap();
+
+        // No need to re-register
+        if conn_buf.waker.is_some() {
+            return;
+        }
+
+        // Register waker
+        (*conn_buf).waker = Some(waker);
     }
 
     /// Checks whether there is already a registered buffer for a new connection request

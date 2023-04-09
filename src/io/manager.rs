@@ -1,5 +1,5 @@
 use crate::core::error::BluefinError;
-use crate::core::packet::{BluefinPacket, Packet};
+use crate::core::packet::Packet;
 use std::result;
 use std::{collections::HashMap, task::Waker};
 
@@ -107,6 +107,9 @@ impl ConnectionManager {
         Ok(())
     }
 
+    /// Registers a new connection. The key here may take the usual `<other>_<mine>` id form
+    /// OR it can just take the form `0_<mine>` when the client is initiating the handshake
+    /// and is waiting for the pack leader's response.
     pub(crate) fn register_new_connection(&mut self, key: String) {
         let conn_buf = ConnectionBuffer::new();
         self.connection_map.insert(key, conn_buf);
@@ -138,14 +141,14 @@ impl ConnectionManager {
     /// requests then we throw away the packet and nothing happens. Otherwise, we pick the first
     /// pending request (FIFO), buffer the packet and signal the waker.
     pub(crate) fn buffer_to_new_connection_request(&mut self, packet: Packet) {
-        for (accept_id, conn_buf) in &self.new_connection_req_map {
+        for (_, conn_buf) in &mut self.new_connection_req_map {
             // I need a waker!
             if conn_buf.waker.is_none() {
                 continue;
             }
 
             (*conn_buf).packet = Some(packet);
-            conn_buf.waker.unwrap().wake();
+            conn_buf.waker.as_ref().unwrap().wake_by_ref();
 
             return;
         }
@@ -173,8 +176,8 @@ impl ConnectionManager {
 
     /// Fetches the connection buffer for a given connection `key` and resets the buffer content
     /// and drops the waker (if they exist)
-    pub(crate) fn consume_conn_buf(&self, key: String) -> Option<Packet> {
-        if let Some(conn_buff) = self.connection_map.get(&key) {
+    pub(crate) fn consume_conn_buf(&mut self, key: String) -> Option<Packet> {
+        if let Some(conn_buff) = self.connection_map.get_mut(&key) {
             return conn_buff.consume();
         }
 
@@ -198,11 +201,10 @@ impl ConnectionManager {
 
     /// Checks whether there is already a registered buffer for a new connection request
     /// with key `accept_id`. If there is no such entry then we return none.
-    pub(crate) fn search_new_conn_req_buffer(&self, accept_id: &str) -> Option<ConnectionBuffer> {
-        if !self.new_connection_req_map.contains_key(accept_id) {
-            return None;
-        }
-        let conn_buf = self.new_connection_req_map.get(accept_id).unwrap();
-        Some(conn_buf.clone())
+    pub(crate) fn search_new_conn_req_buffer(
+        &self,
+        accept_id: String,
+    ) -> Option<&ConnectionBuffer> {
+        self.new_connection_req_map.get(&accept_id)
     }
 }

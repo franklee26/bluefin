@@ -1,7 +1,9 @@
 use std::{
+    cell::RefCell,
     fmt,
     io::{self, ErrorKind},
     os::fd::FromRawFd,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -27,7 +29,7 @@ use crate::{
         packet::{BluefinPacket, BluefinStreamPacket},
         serialisable::Serialisable,
     },
-    io::manager::Result,
+    io::manager::{ConnectionManager, Result},
 };
 
 use super::{socket::BluefinSocket, stream::Stream};
@@ -42,8 +44,8 @@ const MAX_NUM_OPEN_STREAMS: usize = 10;
 #[derive(Debug)]
 pub struct Connection {
     pub id: String,
-    need_ip_udp_headers: bool,
-    fd: i32,
+    pub(crate) need_ip_udp_headers: bool,
+    pub(crate) file: Arc<Mutex<File>>,
     pub source_id: i32,
     pub dest_id: i32,
     pub num_streams: usize,
@@ -54,6 +56,7 @@ pub struct Connection {
     pub(crate) source_port: Option<u16>,
     pub(crate) destination_port: Option<u16>,
     pub(crate) context: Context,
+    pub(crate) conn_manager: Arc<Mutex<ConnectionManager>>,
 }
 
 /// Read result contains the read bluefin packet along with additional metadata
@@ -68,7 +71,9 @@ impl fmt::Display for Connection {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(
             fmt,
-            "BluefinConnection<{}> ({:?})\nsrc_id: {:#08x}\ndst_id: {:#08x}",
+            "BluefinConnection<{}> ({:?})
+            src_id: {:#08x}
+            dst_id: {:#08x}",
             self.id, self.context.state, self.source_id, self.dest_id
         )
     }
@@ -86,14 +91,15 @@ impl Connection {
         destination_port: u16,
         host_type: BluefinHost,
         need_ip_udp_headers: bool,
-        fd: i32,
+        file: Arc<Mutex<File>>,
+        conn_manager: Arc<Mutex<ConnectionManager>>,
     ) -> Connection {
         let source_id: i32 = rand::thread_rng().gen();
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         Connection {
             id,
             need_ip_udp_headers,
-            fd,
+            file,
             source_id,
             dest_id,
             num_streams: 0,
@@ -103,6 +109,7 @@ impl Connection {
             destination_ip: Some(destination_ip),
             source_port: Some(source_port),
             destination_port: Some(destination_port),
+            conn_manager,
             context: Context {
                 host_type,
                 state: State::Handshake,
@@ -213,8 +220,9 @@ impl Connection {
     ///
     /// Returns an offset and size pair
     pub(crate) async fn read(&mut self, buf: &mut [u8]) -> io::Result<(usize, usize)> {
-        let mut raw_file = unsafe { File::from_raw_fd(self.fd) };
-        let mut size = timeout(self.timeout, raw_file.read(buf)).await??;
+        let mut file = (*self.file).lock().unwrap();
+        let mut size = timeout(self.timeout, file.read(buf)).await??;
+        drop(file);
 
         // If I don't need to worry about ip/udp headers then I'm using a UDP socket. This means
         // that I'm just getting the Bluefin packet. Easy.
@@ -256,11 +264,13 @@ impl Connection {
         }
 
         let bytes_out = self.bytes_out.as_ref().unwrap();
-        let mut raw_file = unsafe { File::from_raw_fd(self.fd) };
+
+        let mut file = (*self.file).lock().unwrap();
 
         // No need to pre-build; just flush buffer
         if !self.need_ip_udp_headers {
-            return raw_file.write_all(bytes_out).await;
+            let ans = file.write_all(bytes_out).await;
+            return ans;
         }
 
         let packet_builder =
@@ -273,7 +283,8 @@ impl Connection {
         tun_tap_bytes.append(&mut writer);
 
         self.bytes_out = None;
-        raw_file.write_all(&tun_tap_bytes).await
+        eprintln!("Wrote: {:?}", &tun_tap_bytes);
+        file.write_all(&tun_tap_bytes).await
     }
 
     pub(crate) fn get_packet(&self, payload: Option<Vec<u8>>) -> BluefinPacket {

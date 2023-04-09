@@ -28,7 +28,7 @@ pub struct BluefinPacketBuilder {
 /// Entire packet representation, including the ip + udp metadata
 /// and the deserialised bluefin packet
 #[derive(Clone, Debug)]
-pub(crate) struct Packet {
+pub struct Packet {
     pub(crate) src_ip: [u8; 4],
     pub(crate) dst_ip: [u8; 4],
     pub(crate) src_port: u16,

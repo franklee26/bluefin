@@ -1,7 +1,7 @@
 use std::{
     future::Future,
-    os::fd::FromRawFd,
     pin::Pin,
+    sync::{Arc, Mutex},
     task::{Context, Poll},
 };
 
@@ -25,14 +25,13 @@ use crate::{
 use super::manager::ConnectionManager;
 
 /// Bluefin reader for reading and parsing incoming wire bytes
-struct Reader {
-    file: File,
+pub(crate) struct Reader {
+    file: Arc<Mutex<File>>,
     need_ip_and_udp_headers: bool,
 }
 
 impl Reader {
-    fn new(fd: i32, need_ip_and_udp_headers: bool) -> Self {
-        let file = unsafe { File::from_raw_fd(fd) };
+    fn new(file: Arc<Mutex<File>>, need_ip_and_udp_headers: bool) -> Self {
         Self {
             file,
             need_ip_and_udp_headers,
@@ -41,14 +40,21 @@ impl Reader {
 
     /// Reads in from the wire an incoming stream of bytes. We try to deserialise the bytes
     /// into an bluefin packet but we also keep the ip + udp layers.
-    fn poll_read_packet(&self, cx: &mut Context) -> Poll<Packet> {
-        let pinned_file = Pin::new(&mut self.file);
+    fn poll_read_packet(&mut self, cx: &mut Context) -> Poll<Packet> {
+        let mut file = (*self.file).lock().unwrap();
+        let pinned_file = Pin::new(&mut *file);
         let mut temp_buf = vec![0; 1504];
         let mut buf = ReadBuf::new(&mut temp_buf);
         match pinned_file.poll_read(cx, &mut buf) {
             Poll::Ready(Ok(())) => {
                 let read_buf = buf.filled();
                 let mut offset = 0;
+                let mut ip_header_len = 0;
+                let mut udp_header_len = 0;
+                let mut src_ip = [0; 4];
+                let mut dst_ip = [0; 4];
+                let mut src_port = 0;
+                let mut dst_port = 0;
 
                 // If I need to worry about ip and udp headers then I need to also worry about tun/tap bytes.
                 // Offset the tun/tap header, which is 4 bytes
@@ -57,7 +63,7 @@ impl Reader {
                 }
 
                 if let Ok(packet_headers) = PacketHeaders::from_ip_slice(&read_buf[offset..]) {
-                    let ip_header_len = packet_headers.ip.unwrap().header_len();
+                    ip_header_len = packet_headers.ip.unwrap().header_len();
                     let (ip_header, _) =
                         Ipv4Header::from_slice(&read_buf[offset..ip_header_len + offset]).unwrap();
 
@@ -67,32 +73,36 @@ impl Reader {
                     }
 
                     let udp_header = packet_headers.transport.unwrap().udp().unwrap();
-                    let udp_header_len = udp_header.header_len();
+                    udp_header_len = udp_header.header_len();
 
-                    let src_ip = ip_header.source;
-                    let dst_ip = ip_header.destination;
-                    let src_port = udp_header.source_port;
-                    let dst_port = udp_header.destination_port;
-
-                    let wrapped_bluefin_packet = BluefinPacket::deserialise(
-                        &read_buf[offset + ip_header_len + udp_header_len..],
-                    );
-
-                    // Not a bluefin packet; drop.
-                    if let Err(_) = wrapped_bluefin_packet {
-                        return Poll::Pending;
-                    }
-
-                    let payload = wrapped_bluefin_packet.unwrap();
-                    let packet = Packet {
-                        src_ip,
-                        dst_ip,
-                        src_port,
-                        dst_port,
-                        payload,
-                    };
-                    return Poll::Ready(packet);
+                    src_ip = ip_header.source;
+                    dst_ip = ip_header.destination;
+                    src_port = udp_header.source_port;
+                    dst_port = udp_header.destination_port;
                 }
+                let wrapped_bluefin_packet = BluefinPacket::deserialise(
+                    &read_buf[offset + ip_header_len + udp_header_len..],
+                );
+
+                // Not a bluefin packet; drop.
+                if let Err(_) = wrapped_bluefin_packet {
+                    return Poll::Pending;
+                }
+
+                let payload = wrapped_bluefin_packet.unwrap();
+                let packet = Packet {
+                    src_ip,
+                    dst_ip,
+                    src_port,
+                    dst_port,
+                    payload,
+                };
+
+                return Poll::Ready(packet);
+            }
+            // TODO: Handle this error better...
+            Poll::Ready(Err(e)) => {
+                eprintln!("{e}");
                 Poll::Pending
             }
             _ => Poll::Pending,
@@ -100,7 +110,7 @@ impl Reader {
     }
 
     /// The same as `poll_read_packet()` except strip away the ip + udp layer.
-    fn poll_read_bluefin_packet(&self, cx: &mut Context) -> Poll<BluefinPacket> {
+    fn poll_read_bluefin_packet(&mut self, cx: &mut Context) -> Poll<BluefinPacket> {
         match self.poll_read_packet(cx) {
             Poll::Ready(packet) => Poll::Ready(packet.payload),
             Poll::Pending => Poll::Pending,
@@ -110,49 +120,51 @@ impl Reader {
 
 /// Future representing a new bluefin connection request. This is essentially the same as `Read<'a>` except
 /// that it handles the special case of accepting a new connection
-pub struct Accept<'device> {
+pub struct Accept {
     /// Unique id representing one Accept request. This is required such that we only register at most
     /// one waker per accept request.
     pub id: String,
-    pub(crate) fd: i32,
     pub(crate) reader: Reader,
+    pub(crate) file: Arc<Mutex<File>>,
     /// Connection manager is shared across all connections for a device.
-    pub(crate) conn_manager: &'device mut ConnectionManager,
+    pub(crate) conn_manager: Arc<Mutex<ConnectionManager>>,
     pub(crate) need_ip_and_udp_headers: bool,
 }
 
 /// Future for a general read over the network for an existing connection
-pub struct Read<'device> {
+pub struct Read {
     /// The id takes the form `<other_id>_<this_id>`. Because a `Read` can only be awaited
     /// on existing connection, then the `other_id` is already defined and must exist in our
     /// manager.
     pub id: String,
-    pub(crate) fd: i32,
     pub(crate) reader: Reader,
+    pub(crate) file: Arc<Mutex<File>>,
     /// Connection manager is shared across all connections for a device.
-    pub(crate) conn_manager: &'device mut ConnectionManager,
+    pub(crate) conn_manager: Arc<Mutex<ConnectionManager>>,
     pub(crate) need_ip_and_udp_headers: bool,
+    pub(crate) is_client_first_read: bool,
 }
 
-impl<'a> Accept<'a> {
+impl Accept {
     pub(crate) fn new(
-        fd: i32,
-        conn_manager: &'a mut ConnectionManager,
+        file: Arc<Mutex<File>>,
+        conn_manager: &Arc<Mutex<ConnectionManager>>,
         need_ip_and_udp_headers: bool,
     ) -> Self {
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-        let reader = Reader::new(fd, need_ip_and_udp_headers);
+        let reader = Reader::new(Arc::clone(&file), need_ip_and_udp_headers);
         Self {
             id,
-            fd,
+            file,
             reader,
-            conn_manager,
+            conn_manager: Arc::clone(conn_manager),
             need_ip_and_udp_headers,
         }
     }
 }
 
-impl Future for Accept<'_> {
+impl Future for Accept {
+    // TODO: This doesn't really yield a connection, but more of a potential connection.
     type Output = Connection;
 
     fn poll(
@@ -160,11 +172,13 @@ impl Future for Accept<'_> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let _self = self.get_mut();
-        let conn_manager = _self.conn_manager;
+        eprintln!("\nACCEPT START: {}", _self.id);
+        let mut conn_manager = (*_self.conn_manager).lock().unwrap();
 
         // First check if we managed to buffer the new connection request
-        if let Some(conn_buf) = conn_manager.search_new_conn_req_buffer(&_self.id) {
-            if let Some(packet) = conn_buf.packet {
+        if let Some(conn_buf) = conn_manager.search_new_conn_req_buffer(_self.id.clone()) {
+            eprintln!("Hit buffer!");
+            if let Some(packet) = &conn_buf.packet {
                 let conn = Connection::new(
                     // The destination id must be whatever the src is calling its src id
                     packet.payload.header.source_connection_id,
@@ -173,9 +187,10 @@ impl Future for Accept<'_> {
                     packet.src_port,
                     packet.dst_ip,
                     packet.dst_port,
-                    BluefinHost::PackFollower,
+                    BluefinHost::PackLeader,
                     _self.need_ip_and_udp_headers,
-                    _self.fd,
+                    Arc::clone(&_self.file),
+                    Arc::clone(&_self.conn_manager),
                 );
 
                 // Remove request (it must exist)
@@ -186,24 +201,37 @@ impl Future for Accept<'_> {
                 // Register in map
                 conn_manager.register_new_connection(key);
 
+                eprintln!("Read from buffer! Done!\n");
                 return Poll::Ready(conn);
             }
         }
 
+        eprintln!("Waiting on poll_read...");
         // Didn't find anything in our buffer yet... anything sitting in the socket?
         match _self.reader.poll_read_packet(cx) {
             // Yes! We have a bluefin packet
             Poll::Ready(packet) => {
-                let bluefin_packet = packet.payload;
+                eprintln!("poll_ready");
+                let bluefin_packet = packet.payload.clone();
                 let other_id = bluefin_packet.header.source_connection_id;
                 let this_id = bluefin_packet.header.destination_connection_id;
 
                 let key = format!("{}_{}", other_id, this_id);
+                let first_read_key = format!("0_{}", this_id);
 
                 // This already exists... let's redirect it to the correct buffer and wait...
-                if _self.conn_manager.conn_exists(&key) {
+                if conn_manager.conn_exists(&key) {
                     // Add to existing conn's buffer.
                     let _ = conn_manager.buffer_to_existing_connection(&key, packet);
+                    // Register this future's waker
+                    let _ = conn_manager
+                        .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
+                    return Poll::Pending;
+                }
+
+                // This is a first read packet.
+                if conn_manager.conn_exists(&first_read_key) {
+                    let _ = conn_manager.buffer_to_existing_connection(&first_read_key, packet);
                     // Register this future's waker
                     let _ = conn_manager
                         .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
@@ -233,18 +261,20 @@ impl Future for Accept<'_> {
                 }
 
                 // Finally... this is indeed a valid handshake request. Let's create the connection.
-                let conn = Connection::new(
+                let mut conn = Connection::new(
                     // The destination id must be whatever the src is calling its src id
-                    packet.payload.header.source_connection_id,
-                    packet.payload.header.packet_number,
+                    bluefin_packet.header.source_connection_id,
+                    bluefin_packet.header.packet_number,
                     packet.src_ip,
                     packet.src_port,
                     packet.dst_ip,
                     packet.dst_port,
-                    BluefinHost::PackFollower,
+                    BluefinHost::PackLeader,
                     _self.need_ip_and_udp_headers,
-                    _self.fd,
+                    Arc::clone(&_self.file),
+                    Arc::clone(&_self.conn_manager),
                 );
+                conn.source_id = 0x0;
 
                 // Remove request (if it exists)
                 let _ = conn_manager.remove_new_conn_req(key);
@@ -254,12 +284,14 @@ impl Future for Accept<'_> {
                 // Register in map
                 conn_manager.register_new_connection(key);
 
+                eprintln!("Returning conn...");
                 Poll::Ready(conn)
             }
             // Nope, nothing yet... let's put this on pause
             Poll::Pending => {
                 // Register this future's waker. It's best to register this since it's possible that
                 // another read request would encounter a new-connection request.
+                eprintln!("Poll::Pending\n");
                 let _ = conn_manager
                     .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
                 Poll::Pending
@@ -268,37 +300,35 @@ impl Future for Accept<'_> {
     }
 }
 
-impl<'a> Read<'a> {
+impl Read {
     pub(crate) fn new(
         id: String,
-        fd: i32,
-        conn_manager: &'a mut ConnectionManager,
+        file: Arc<Mutex<File>>,
+        conn_manager: Arc<Mutex<ConnectionManager>>,
         need_ip_and_udp_headers: bool,
     ) -> Self {
-        // Can't have a read request when the connection isn't even registered
-        if !conn_manager.conn_exists(&id) {
-            panic!("")
-        }
-        let reader = Reader::new(fd, need_ip_and_udp_headers);
+        let reader = Reader::new(Arc::clone(&file), need_ip_and_udp_headers);
+        let is_client_first_read = id.split("_").nth(0).unwrap() == "0";
         Self {
             id,
-            fd,
             reader,
-            conn_manager,
+            file,
+            conn_manager: Arc::clone(&conn_manager),
             need_ip_and_udp_headers,
+            is_client_first_read,
         }
     }
 }
 
-impl Future for Read<'_> {
+impl Future for Read {
     type Output = Packet;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let _self = self.get_mut();
-        let conn_manager = _self.conn_manager;
+        let mut conn_manager = (*_self.conn_manager).lock().unwrap();
 
         // We found a buffered packet! Yay!
-        if let Some(packet) = conn_manager.consume_conn_buf(_self.id) {
+        if let Some(packet) = conn_manager.consume_conn_buf(_self.id.clone()) {
             return Poll::Ready(packet);
         }
 
@@ -310,13 +340,27 @@ impl Future for Read<'_> {
                     packet.payload.header.source_connection_id,
                     packet.payload.header.destination_connection_id
                 );
+                let potential_key =
+                    format!("0_{}", packet.payload.header.destination_connection_id);
 
-                // This is definitely not for me... we haven't even registered this connection yet.
-                // Could be an new conenction request that we buffered in.
                 if !conn_manager.conn_exists(&key_from_packet) {
+                    // It's possible that this packet is meant for a client first read
+                    if conn_manager.conn_exists(&potential_key) {
+                        // This is this read!
+                        if _self.id == potential_key {
+                            return Poll::Ready(packet);
+                        }
+                        // Nope, then this is another client first read packet, just not for us.
+                        let _ = conn_manager.buffer_to_existing_connection(&potential_key, packet);
+                        conn_manager
+                            .add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
+                        return Poll::Pending;
+                    }
+
                     // New connection requests should have the dst id to 0x0. Drop this packet.
                     if packet.payload.header.destination_connection_id != 0x0 {
-                        conn_manager.add_waker_to_existing_conn(_self.id, cx.waker().clone());
+                        conn_manager
+                            .add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
                         return Poll::Pending;
                     }
 
@@ -328,21 +372,22 @@ impl Future for Read<'_> {
                         .packet_type
                         != PacketType::UnencryptedHandshake
                     {
-                        conn_manager.add_waker_to_existing_conn(_self.id, cx.waker().clone());
+                        conn_manager
+                            .add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
                         return Poll::Pending;
                     }
 
                     // This is looking like a new connection request! Good for them but not for me...
                     conn_manager.buffer_to_new_connection_request(packet);
-                    conn_manager.add_waker_to_existing_conn(_self.id, cx.waker().clone());
+                    conn_manager.add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
                     return Poll::Pending;
                 }
 
                 // So this packet is indeed for an existing connection... just not this one. Buffer
                 // it and wake.
                 if key_from_packet != _self.id {
-                    conn_manager.buffer_to_existing_connection(&key_from_packet, packet);
-                    conn_manager.add_waker_to_existing_conn(_self.id, cx.waker().clone());
+                    let _ = conn_manager.buffer_to_existing_connection(&key_from_packet, packet);
+                    conn_manager.add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
                     return Poll::Pending;
                 }
 
@@ -352,7 +397,7 @@ impl Future for Read<'_> {
             }
             // Nothing yet... let's just register our waker and wait
             Poll::Pending => {
-                conn_manager.add_waker_to_existing_conn(_self.id, cx.waker().clone());
+                conn_manager.add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
                 Poll::Pending
             }
         }

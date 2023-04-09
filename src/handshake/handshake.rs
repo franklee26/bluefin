@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use rand::Rng;
 
 use crate::{
@@ -8,6 +10,7 @@ use crate::{
         packet::BluefinPacket,
         serialisable::Serialisable,
     },
+    io::read::Read,
     network::connection::Connection,
 };
 
@@ -39,9 +42,16 @@ async fn bluefin_packleader_handshake_handler(conn: &mut Connection) -> Result<(
             respond_err
         )));
     }
+    let read = Read::new(
+        format!("{}_{}", conn.dest_id, conn.source_id),
+        Arc::clone(&conn.file),
+        Arc::clone(&conn.conn_manager),
+        conn.need_ip_udp_headers,
+    );
     // Read and validate client-ack
-    let conn_read_result = conn.bluefin_read_packet().await?;
-    conn_read_result.packet.validate(conn)?;
+    let packet = read.await;
+    eprintln!("Recieved client-ack: {:?}", packet);
+    // conn_read_result.packet.validate(conn)?;
 
     Ok(())
 }
@@ -118,6 +128,12 @@ async fn bluefin_client_handshake_handler(conn: &mut Connection) -> Result<(), B
     header.with_packet_number(packet_number);
     conn.context.packet_number = packet_number;
 
+    // Register new connection
+    let first_read_key = format!("0_{}", client_conn_id);
+    let mut manager = (*conn.conn_manager).lock().unwrap();
+    manager.register_new_connection(first_read_key.clone());
+    drop(manager);
+
     // Build and send packet
     let packet = BluefinPacket::builder().header(header).build();
     conn.set_bytes_out(packet.serialise());
@@ -130,8 +146,14 @@ async fn bluefin_client_handshake_handler(conn: &mut Connection) -> Result<(), B
     };
 
     // Wait for pack-leader response
-    let conn_read_result = conn.bluefin_read_packet().await?;
-    handle_pack_leader_response(conn, conn_read_result.packet).await?;
+    let first_read = Read::new(
+        first_read_key,
+        Arc::clone(&conn.file),
+        Arc::clone(&conn.conn_manager),
+        conn.need_ip_udp_headers,
+    );
+    let conn_read_result = first_read.await;
+    // handle_pack_leader_response(conn, conn_read_result.packet).await?;
 
     Ok(())
 }

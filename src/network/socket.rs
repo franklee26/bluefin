@@ -34,13 +34,4 @@ impl BluefinSocket {
             need_ip_and_udp_headers,
         }
     }
-
-    /// Accepts an incoming client/pack-follower's handshake request.
-    pub async fn accept(&mut self) -> Result<Accept> {
-        let mut accept = Accept::new(self.fd, &mut self.manager, self.need_ip_and_udp_headers);
-
-        let pinned_accept = Pin::new(&mut accept);
-
-        Ok(accept)
-    }
 }

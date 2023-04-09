@@ -1,32 +1,31 @@
 use std::{
     io::{self, ErrorKind, Read},
     os::fd::FromRawFd,
-    time::Duration,
+    sync::{Arc, Mutex},
 };
 
 use crate::{
     core::{
-        context::{BluefinHost, State},
-        error::BluefinError,
-        packet::BluefinPacket,
-        serialisable::Serialisable,
+        context::State, error::BluefinError, packet::BluefinPacket, serialisable::Serialisable,
     },
     handshake::handshake::bluefin_handshake_handle,
-    io::{manager::ConnectionManager, read::Accept},
+    io::{
+        manager::{ConnectionManager, Result},
+        read::Accept,
+    },
     network::connection::Connection,
     tun::device::BluefinDevice,
 };
 use etherparse::{Ipv4Header, PacketHeaders};
-use rand::distributions::{Alphanumeric, DistString};
-use tokio::{fs::File, io::AsyncReadExt};
+use tokio::fs::File;
 
 pub struct BluefinPackLeader {
     source_id: i32,
     num_connections: usize,
-    raw_file: File,
+    file: Arc<Mutex<File>>,
     fd: i32,
     name: String,
-    manager: ConnectionManager,
+    manager: Arc<Mutex<ConnectionManager>>,
 }
 
 impl BluefinPackLeader {
@@ -81,6 +80,7 @@ impl BluefinPackLeaderBuilder {
 
         let fd = device.get_raw_fd();
         let raw_file = unsafe { File::from_raw_fd(fd) };
+        let file = Arc::new(Mutex::new(raw_file));
 
         let manager = ConnectionManager::new();
 
@@ -88,8 +88,8 @@ impl BluefinPackLeaderBuilder {
             source_id: self.source_id.unwrap(),
             num_connections: 0,
             fd,
-            raw_file,
-            manager,
+            file,
+            manager: Arc::new(Mutex::new(manager)),
             name,
         }
     }
@@ -99,11 +99,7 @@ impl BluefinPackLeader {
     /// Trying to validate an incoming client-hello request. Try to parse and deserialise the request
     /// and validate its contents. If everything looks good then proceed with handshake, else return
     /// err.
-    fn validate_client_request(
-        &self,
-        conn: &mut Connection,
-        bytes: &[u8],
-    ) -> Result<(), BluefinError> {
+    fn validate_client_request(&self, conn: &mut Connection, bytes: &[u8]) -> Result<()> {
         let packet = BluefinPacket::deserialise(bytes)?;
         // Just get the header; don't really care if there is a payload or not
         let header = packet.header;
@@ -160,8 +156,14 @@ impl BluefinPackLeader {
     /// Pack-leader accepts a bluefin connection request. This function return an `Accept` future
     /// which asynchronously reads incoming bytes. Upon a valid bluefin handshake request packet,
     /// and successful handshake completion, the future registers and creates a `Connection` instance.
-    pub fn accept(&mut self) -> Accept {
-        Accept::new(self.fd, &mut self.manager, true)
+    pub async fn accept(&mut self) -> Result<Connection> {
+        // Receive initial connection status
+        let mut conn = Accept::new(Arc::clone(&self.file), &mut self.manager, true).await;
+        conn.source_id = self.source_id;
+
+        bluefin_handshake_handle(&mut conn).await?;
+
+        Ok(conn)
     }
 
     async fn parse_and_set_header_info(

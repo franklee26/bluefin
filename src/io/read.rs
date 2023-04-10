@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll},
 };
 
@@ -22,9 +22,10 @@ use crate::{
     network::connection::Connection,
 };
 
-use super::manager::ConnectionManager;
+use super::manager::{ConnectionBuffer, ConnectionManager};
 
 /// Bluefin reader for reading and parsing incoming wire bytes
+#[derive(Clone)]
 pub(crate) struct Reader {
     file: Arc<Mutex<File>>,
     need_ip_and_udp_headers: bool,
@@ -124,6 +125,7 @@ pub struct Accept {
     /// Unique id representing one Accept request. This is required such that we only register at most
     /// one waker per accept request.
     pub id: String,
+    pub source_id: u32,
     pub(crate) reader: Reader,
     pub(crate) file: Arc<Mutex<File>>,
     /// Connection manager is shared across all connections for a device.
@@ -132,6 +134,7 @@ pub struct Accept {
 }
 
 /// Future for a general read over the network for an existing connection
+#[derive(Clone)]
 pub struct Read {
     /// The id takes the form `<other_id>_<this_id>`. Because a `Read` can only be awaited
     /// on existing connection, then the `other_id` is already defined and must exist in our
@@ -147,19 +150,43 @@ pub struct Read {
 
 impl Accept {
     pub(crate) fn new(
+        source_id: u32,
         file: Arc<Mutex<File>>,
-        conn_manager: &Arc<Mutex<ConnectionManager>>,
+        conn_manager: Arc<Mutex<ConnectionManager>>,
         need_ip_and_udp_headers: bool,
     ) -> Self {
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         let reader = Reader::new(Arc::clone(&file), need_ip_and_udp_headers);
         Self {
             id,
+            source_id,
             file,
             reader,
-            conn_manager: Arc::clone(conn_manager),
+            conn_manager,
             need_ip_and_udp_headers,
         }
+    }
+
+    fn build_connection_from_conn_buffer(&self, conn_buf: &ConnectionBuffer) -> Option<Connection> {
+        if let Some(packet) = &conn_buf.packet {
+            let mut conn = Connection::new(
+                // The destination id must be whatever the src is calling its src id
+                packet.payload.header.source_connection_id as u32,
+                packet.payload.header.packet_number,
+                packet.dst_ip,
+                packet.dst_port,
+                packet.src_ip,
+                packet.src_port,
+                BluefinHost::PackLeader,
+                self.need_ip_and_udp_headers,
+                Arc::clone(&self.file),
+                Arc::clone(&self.conn_manager),
+            );
+            conn.source_id = self.source_id;
+
+            return Some(conn);
+        }
+        None
     }
 }
 
@@ -172,27 +199,11 @@ impl Future for Accept {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let _self = self.get_mut();
-        eprintln!("\nACCEPT START: {}", _self.id);
         let mut conn_manager = (*_self.conn_manager).lock().unwrap();
 
         // First check if we managed to buffer the new connection request
         if let Some(conn_buf) = conn_manager.search_new_conn_req_buffer(_self.id.clone()) {
-            eprintln!("Hit buffer!");
-            if let Some(packet) = &conn_buf.packet {
-                let conn = Connection::new(
-                    // The destination id must be whatever the src is calling its src id
-                    packet.payload.header.source_connection_id,
-                    packet.payload.header.packet_number,
-                    packet.src_ip,
-                    packet.src_port,
-                    packet.dst_ip,
-                    packet.dst_port,
-                    BluefinHost::PackLeader,
-                    _self.need_ip_and_udp_headers,
-                    Arc::clone(&_self.file),
-                    Arc::clone(&_self.conn_manager),
-                );
-
+            if let Some(conn) = _self.build_connection_from_conn_buffer(conn_buf) {
                 // Remove request (it must exist)
                 let _ = conn_manager.remove_new_conn_req(_self.id.to_string());
 
@@ -201,17 +212,26 @@ impl Future for Accept {
                 // Register in map
                 conn_manager.register_new_connection(key);
 
-                eprintln!("Read from buffer! Done!\n");
                 return Poll::Ready(conn);
             }
         }
 
-        eprintln!("Waiting on poll_read...");
+        // Ok, maybe there is something left in the unhandled buffer.
+        if let Some(conn_buf) = conn_manager.consume_unhandled_new_connection_req() {
+            if let Some(conn) = _self.build_connection_from_conn_buffer(&conn_buf) {
+                // Generate new connection key
+                let key = format!("{}_{}", conn.dest_id, conn.source_id);
+                // Register in map
+                conn_manager.register_new_connection(key);
+
+                return Poll::Ready(conn);
+            }
+        }
+
         // Didn't find anything in our buffer yet... anything sitting in the socket?
         match _self.reader.poll_read_packet(cx) {
             // Yes! We have a bluefin packet
             Poll::Ready(packet) => {
-                eprintln!("poll_ready");
                 let bluefin_packet = packet.payload.clone();
                 let other_id = bluefin_packet.header.source_connection_id;
                 let this_id = bluefin_packet.header.destination_connection_id;
@@ -263,35 +283,33 @@ impl Future for Accept {
                 // Finally... this is indeed a valid handshake request. Let's create the connection.
                 let mut conn = Connection::new(
                     // The destination id must be whatever the src is calling its src id
-                    bluefin_packet.header.source_connection_id,
+                    bluefin_packet.header.source_connection_id as u32,
                     bluefin_packet.header.packet_number,
-                    packet.src_ip,
-                    packet.src_port,
                     packet.dst_ip,
                     packet.dst_port,
+                    packet.src_ip,
+                    packet.src_port,
                     BluefinHost::PackLeader,
                     _self.need_ip_and_udp_headers,
                     Arc::clone(&_self.file),
                     Arc::clone(&_self.conn_manager),
                 );
-                conn.source_id = 0x0;
+                conn.source_id = _self.source_id;
 
                 // Remove request (if it exists)
-                let _ = conn_manager.remove_new_conn_req(key);
+                let _ = conn_manager.remove_new_conn_req(_self.id.clone());
 
                 // Generate new connection key
                 let key = format!("{}_{}", conn.dest_id, conn.source_id);
                 // Register in map
                 conn_manager.register_new_connection(key);
 
-                eprintln!("Returning conn...");
                 Poll::Ready(conn)
             }
             // Nope, nothing yet... let's put this on pause
             Poll::Pending => {
                 // Register this future's waker. It's best to register this since it's possible that
                 // another read request would encounter a new-connection request.
-                eprintln!("Poll::Pending\n");
                 let _ = conn_manager
                     .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
                 Poll::Pending

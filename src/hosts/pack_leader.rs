@@ -17,10 +17,10 @@ use crate::{
     tun::device::BluefinDevice,
 };
 use etherparse::{Ipv4Header, PacketHeaders};
+use rand::Rng;
 use tokio::fs::File;
 
 pub struct BluefinPackLeader {
-    source_id: i32,
     num_connections: usize,
     file: Arc<Mutex<File>>,
     fd: i32,
@@ -31,7 +31,6 @@ pub struct BluefinPackLeader {
 impl BluefinPackLeader {
     pub fn builder() -> BluefinPackLeaderBuilder {
         BluefinPackLeaderBuilder {
-            source_id: None,
             name: None,
             bind_address: None,
             netmask: None,
@@ -40,18 +39,12 @@ impl BluefinPackLeader {
 }
 
 pub struct BluefinPackLeaderBuilder {
-    source_id: Option<i32>,
     name: Option<String>,
     bind_address: Option<String>,
     netmask: Option<String>,
 }
 
 impl BluefinPackLeaderBuilder {
-    pub fn source_id(mut self, source_id: i32) -> Self {
-        self.source_id = Some(source_id);
-        self
-    }
-
     pub fn name(mut self, name: String) -> Self {
         self.name = Some(name);
         self
@@ -85,7 +78,6 @@ impl BluefinPackLeaderBuilder {
         let manager = ConnectionManager::new();
 
         BluefinPackLeader {
-            source_id: self.source_id.unwrap(),
             num_connections: 0,
             fd,
             file,
@@ -105,7 +97,7 @@ impl BluefinPackLeader {
         let header = packet.header;
 
         // The source (client) is our destination. Connection id's can never be zero.
-        let dest_id = header.source_connection_id;
+        let dest_id = header.source_connection_id as u32;
         if dest_id == 0x0 {
             return Err(BluefinError::InvalidHeaderError(
                 "Cannot have connection-id of zero".to_string(),
@@ -158,8 +150,15 @@ impl BluefinPackLeader {
     /// and successful handshake completion, the future registers and creates a `Connection` instance.
     pub async fn accept(&mut self) -> Result<Connection> {
         // Receive initial connection status
-        let mut conn = Accept::new(Arc::clone(&self.file), &mut self.manager, true).await;
-        conn.source_id = self.source_id;
+        let source_id: u32 = rand::thread_rng().gen();
+        let mut conn = Accept::new(
+            source_id,
+            Arc::clone(&self.file),
+            Arc::clone(&self.manager),
+            true,
+        )
+        .await;
+        eprintln!("So far built: {conn}");
 
         bluefin_handshake_handle(&mut conn).await?;
 

@@ -66,6 +66,9 @@ impl ConnectionBuffer {
     }
 }
 
+/// Buffer at most 10 unhandled requests. Otherwise, we might get overburdended with
+/// these requests.
+const MAX_UNHANDLED_NEW_CONNECTION_REQ: usize = 10;
 #[derive(Debug)]
 pub(crate) struct ConnectionManager {
     /// A connection is identified by the key `<other_id>_<mine_id>`. For example if a client
@@ -80,6 +83,12 @@ pub(crate) struct ConnectionManager {
     /// need to quickly identify if a buffer applies to a normal socket read or if the buffer was
     /// buffering a new connection request.
     new_connection_req_map: HashMap<String, ConnectionBuffer>,
+
+    /// Sometimes, we might encounter a new connect request but we didn't register a pending `Accept`
+    /// request. For example, the current thread might be still processing another `Accept.await` and
+    /// we encounter a new connect request. In this case, we buffer as many of these unhandled requests
+    /// as we can.
+    unhandled_new_connection_req: Vec<ConnectionBuffer>,
 }
 
 impl ConnectionManager {
@@ -87,6 +96,7 @@ impl ConnectionManager {
         Self {
             connection_map: HashMap::new(),
             new_connection_req_map: HashMap::new(),
+            unhandled_new_connection_req: Vec::new(),
         }
     }
 
@@ -138,8 +148,8 @@ impl ConnectionManager {
     }
 
     /// Adds a packet to any pending new connection request buffers. If there are no new connection
-    /// requests then we throw away the packet and nothing happens. Otherwise, we pick the first
-    /// pending request (FIFO), buffer the packet and signal the waker.
+    /// requests then we try to buffer into a temporary buffer. Otherwise, we pick the first pending
+    /// request (FIFO), buffer the packet and signal the waker.
     pub(crate) fn buffer_to_new_connection_request(&mut self, packet: Packet) {
         for (_, conn_buf) in &mut self.new_connection_req_map {
             // I need a waker!
@@ -152,6 +162,20 @@ impl ConnectionManager {
 
             return;
         }
+
+        // Couldn't find a corresponding new conn request buffered. Let's store this for now.
+        self.buffer_unhandled_new_connection_req(packet);
+    }
+
+    /// Removes a connection from the connection map.
+    pub(crate) fn remove_conn(&mut self, key: String) -> Result<()> {
+        if !self.connection_map.contains_key(&key) {
+            return Err(BluefinError::NoSuchConnectionError);
+        }
+
+        let _ = self.connection_map.remove(&key);
+
+        Ok(())
     }
 
     /// Removes a new connection request with accept_id `key`. It's important to remove these requests
@@ -184,6 +208,7 @@ impl ConnectionManager {
         None
     }
 
+    /// Registers a waker to an existing connection.
     pub(crate) fn add_waker_to_existing_conn(&mut self, key: String, waker: Waker) {
         if !self.conn_exists(&key) {
             return;
@@ -206,5 +231,23 @@ impl ConnectionManager {
         accept_id: String,
     ) -> Option<&ConnectionBuffer> {
         self.new_connection_req_map.get(&accept_id)
+    }
+
+    /// Consumes a buffer from the unhandled new connection request buffer.
+    pub(crate) fn consume_unhandled_new_connection_req(&mut self) -> Option<ConnectionBuffer> {
+        self.unhandled_new_connection_req.pop()
+    }
+
+    /// Buffers an unhandled new connection request. This should only get called if we there
+    /// are no more `Accept` connection buffers available.
+    fn buffer_unhandled_new_connection_req(&mut self, packet: Packet) {
+        // Buffer size exceeded. Cannot buffer this packet. This means this packet may be lost.
+        if self.unhandled_new_connection_req.len() >= MAX_UNHANDLED_NEW_CONNECTION_REQ {
+            return;
+        }
+
+        let mut conn_buf = ConnectionBuffer::new();
+        let _ = conn_buf.add_to_buffer(packet);
+        self.unhandled_new_connection_req.push(conn_buf);
     }
 }

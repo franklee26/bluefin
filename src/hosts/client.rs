@@ -18,9 +18,9 @@ use crate::{
 
 #[derive(Debug)]
 pub struct BluefinClient {
-    source_id: i32,
     name: String,
     timeout: Duration,
+    socket: Option<UdpSocket>,
     raw_fd: Option<i32>,
     src_ip: Option<String>,
     src_port: Option<i32>,
@@ -29,7 +29,6 @@ pub struct BluefinClient {
 }
 
 pub struct BluefinClientBuilder {
-    source_id: Option<i32>,
     name: Option<String>,
     timeout: Option<Duration>,
 }
@@ -37,7 +36,6 @@ pub struct BluefinClientBuilder {
 impl BluefinClient {
     pub fn builder() -> BluefinClientBuilder {
         BluefinClientBuilder {
-            source_id: None,
             name: None,
             timeout: None,
         }
@@ -46,10 +44,9 @@ impl BluefinClient {
     /// Creates and binds a UDP socket to `address:port`
     pub fn bind(&mut self, address: &str, port: i32) -> io::Result<()> {
         let socket = UdpSocket::bind(format!("{}:{}", address, port))?;
-        self.raw_fd = Some(socket.into_raw_fd());
+        self.socket = Some(socket);
         self.src_ip = Some(address.to_string());
         self.src_port = Some(port);
-        eprintln!("Client: {:?}", self);
         Ok(())
     }
 
@@ -59,14 +56,14 @@ impl BluefinClient {
     /// the handshake with the pack-leader. If the handshake completes successfully
     /// then an `Connection` struct is returned.
     pub async fn connect(&mut self, address: &str, port: i32) -> io::Result<Connection> {
-        if self.raw_fd.is_none() {
+        if self.socket.is_none() {
             return Err(io::Error::new(
                 ErrorKind::Other,
                 "No socket found. Ensure that client is binded to address.",
             ));
         }
 
-        let socket = unsafe { UdpSocket::from_raw_fd(self.raw_fd.unwrap()) };
+        let socket = self.socket.as_ref().unwrap().try_clone().unwrap();
         socket
             .connect(format!("{}:{}", address, port))
             .expect("Could not connect to address/port");
@@ -103,7 +100,9 @@ impl BluefinClient {
             Arc::clone(&self.conn_manager),
         );
         conn.need_ip_udp_headers(false);
-        conn.source_id = self.source_id;
+        // Generate source_id
+        conn.source_id = rand::thread_rng().gen();
+        eprintln!("Working on: {:#08x}", conn.source_id);
 
         // Finally, send the hello-client handshake
         if let Err(handshake_err) = bluefin_handshake_handle(&mut conn).await {
@@ -123,11 +122,6 @@ impl BluefinClient {
 }
 
 impl BluefinClientBuilder {
-    pub fn source_id(mut self, source_id: i32) -> Self {
-        self.source_id = Some(source_id);
-        self
-    }
-
     pub fn name(mut self, name: String) -> Self {
         self.name = Some(name);
         self
@@ -139,15 +133,16 @@ impl BluefinClientBuilder {
     }
 
     pub fn build(&mut self) -> BluefinClient {
+        let manager = ConnectionManager::new();
         BluefinClient {
-            source_id: self.source_id.unwrap(),
             name: self.name.clone().unwrap(),
             timeout: self.timeout.unwrap_or(Duration::from_secs(10)),
             raw_fd: None,
             src_ip: None,
             src_port: None,
-            conn_manager: Arc::new(Mutex::new(ConnectionManager::new())),
+            conn_manager: Arc::new(Mutex::new(manager)),
             file: None,
+            socket: None,
         }
     }
 }

@@ -192,7 +192,6 @@ impl Serialisable for BluefinStreamHeader {
                 "Bluefin stream header must be exactly 4 bytes".to_string(),
             ));
         }
-        eprintln!("{:?}", bytes);
         Ok(Self {
             stream_type: bytes[3] & 0x0f,
             stream_id: (u32::from_be_bytes(bytes.try_into().expect("stream id should be 28 bits"))
@@ -226,17 +225,17 @@ pub struct BluefinHeader {
     /// encryption and mask field total is 8 bits
     pub security_fields: BluefinSecurityFields,
     /// source_connection_id is 32 bits
-    pub source_connection_id: i32,
+    pub source_connection_id: u32,
     /// desination_connection_id is 32 bits
-    pub destination_connection_id: i32,
+    pub destination_connection_id: u32,
     /// packet_number is 64 bits
     pub packet_number: i64,
 }
 
 impl BluefinHeader {
     pub fn new(
-        source_connection_id: i32,
-        destination_connection_id: i32,
+        source_connection_id: u32,
+        destination_connection_id: u32,
         type_and_type_specific_payload: BluefinTypeFields,
         security_fields: BluefinSecurityFields,
     ) -> Self {
@@ -280,12 +279,12 @@ impl Serialisable for BluefinHeader {
             version: bytes[0].try_into().expect("version is 1 byte"),
             type_and_type_specific_payload,
             security_fields,
-            source_connection_id: i32::from_be_bytes(
+            source_connection_id: u32::from_be_bytes(
                 bytes[4..8]
                     .try_into()
                     .expect("source connection id should be 4 bytes"),
             ),
-            destination_connection_id: i32::from_be_bytes(
+            destination_connection_id: u32::from_be_bytes(
                 bytes[8..12]
                     .try_into()
                     .expect("destination connection id should be 4 bytes"),

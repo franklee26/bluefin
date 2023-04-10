@@ -1,6 +1,7 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use rand::Rng;
+use tokio::time::timeout;
 
 use crate::{
     core::{
@@ -37,20 +38,16 @@ async fn bluefin_packleader_handshake_handler(conn: &mut Connection) -> Result<(
     let packet = BluefinPacket::builder().header(header).build();
     conn.set_bytes_out(packet.serialise());
     if let Err(respond_err) = conn.write().await {
+        eprintln!("Failed to write...");
         return Err(BluefinError::HandshakeError(format!(
             "Failed to send pack-leader response to client: {}",
             respond_err
         )));
     }
-    let read = Read::new(
-        format!("{}_{}", conn.dest_id, conn.source_id),
-        Arc::clone(&conn.file),
-        Arc::clone(&conn.conn_manager),
-        conn.need_ip_udp_headers,
-    );
+
+    eprintln!("Reading client ack...");
     // Read and validate client-ack
-    let packet = read.await;
-    eprintln!("Recieved client-ack: {:?}", packet);
+    let packet = conn.read_v2().await?;
     // conn_read_result.packet.validate(conn)?;
 
     Ok(())
@@ -94,7 +91,7 @@ async fn handle_pack_leader_response(
     conn.context.packet_number += 2;
 
     // The source (pack-leader) is our destination. Conenction id's can never be zero.
-    let dest_id = header.source_connection_id;
+    let dest_id = header.source_connection_id as u32;
     if dest_id == 0x0 {
         return Err(BluefinError::InvalidHeaderError(
             "Cannot have connection-id of zero".to_string(),
@@ -130,11 +127,14 @@ async fn bluefin_client_handshake_handler(conn: &mut Connection) -> Result<(), B
 
     // Register new connection
     let first_read_key = format!("0_{}", client_conn_id);
-    let mut manager = (*conn.conn_manager).lock().unwrap();
-    manager.register_new_connection(first_read_key.clone());
-    drop(manager);
+    // Lock acquired
+    {
+        let mut manager = (*conn.conn_manager).lock().unwrap();
+        manager.register_new_connection(first_read_key.clone());
+    }
+    // Lock released
 
-    // Build and send packet
+    // Build and send client-hello
     let packet = BluefinPacket::builder().header(header).build();
     conn.set_bytes_out(packet.serialise());
 
@@ -145,14 +145,26 @@ async fn bluefin_client_handshake_handler(conn: &mut Connection) -> Result<(), B
         )));
     };
 
-    // Wait for pack-leader response
-    let first_read = Read::new(
-        first_read_key,
-        Arc::clone(&conn.file),
-        Arc::clone(&conn.conn_manager),
-        conn.need_ip_udp_headers,
+    // Wait for pack-leader response. We should be more generous with the timeout here as the pack-leader
+    // might be busy.
+    let packet = conn
+        .read_with_id_and_timeout(first_read_key.clone(), Duration::from_secs(10))
+        .await?;
+    let key = format!(
+        "{}_{}",
+        packet.payload.header.source_connection_id, packet.payload.header.destination_connection_id
     );
-    let conn_read_result = first_read.await;
+    // Lock acquired.
+    {
+        let mut manager = (*conn.conn_manager).lock().unwrap();
+        // Remove temp key
+        let _ = manager.remove_conn(first_read_key.clone());
+        // Register new connection buffer
+        manager.register_new_connection(key);
+    }
+    // Lock released
+
+    eprintln!("Read: {:?}", packet);
     // handle_pack_leader_response(conn, conn_read_result.packet).await?;
 
     Ok(())

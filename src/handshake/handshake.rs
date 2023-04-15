@@ -1,7 +1,4 @@
-use std::{sync::Arc, time::Duration};
-
-use rand::Rng;
-use tokio::time::timeout;
+use std::time::Duration;
 
 use crate::{
     core::{
@@ -11,7 +8,6 @@ use crate::{
         packet::BluefinPacket,
         serialisable::Serialisable,
     },
-    io::read::Read,
     network::connection::Connection,
 };
 
@@ -37,17 +33,22 @@ async fn bluefin_packleader_handshake_handler(conn: &mut Connection) -> Result<(
     // Build and send packet
     let packet = BluefinPacket::builder().header(header).build();
     conn.set_bytes_out(packet.serialise());
+
     if let Err(respond_err) = conn.write().await {
-        eprintln!("Failed to write...");
         return Err(BluefinError::HandshakeError(format!(
             "Failed to send pack-leader response to client: {}",
             respond_err
         )));
     }
 
-    eprintln!("Reading client ack...");
-    // Read and validate client-ack
-    let packet = conn.read_v2().await?;
+    // Read and validate client-ack. Let's keep this short so that we don't keep blocking the `Accept` thread
+    match conn.read_with_timeout(Duration::from_millis(100)).await {
+        Ok(packet) => eprintln!("Read client ack packet: {:?}", packet),
+        Err(e) => {
+            eprintln!("Failed to read client ack.");
+            return Err(e);
+        }
+    }
     // conn_read_result.packet.validate(conn)?;
 
     Ok(())
@@ -114,58 +115,5 @@ async fn handle_pack_leader_response(
  * to the pack_leader (or whatever we think is the current pack_leader).
  */
 async fn bluefin_client_handshake_handler(conn: &mut Connection) -> Result<(), BluefinError> {
-    let type_fields = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0x0);
-    let security_fields = BluefinSecurityFields::new(true, 0b000_1111);
-
-    // Build handshake header
-    let client_conn_id = conn.source_id;
-    // Temporarily set dest id to zero
-    let mut header = BluefinHeader::new(client_conn_id, 0x0, type_fields, security_fields);
-    let packet_number: i64 = rand::thread_rng().gen_range(0..=i64::MAX);
-    header.with_packet_number(packet_number);
-    conn.context.packet_number = packet_number;
-
-    // Register new connection
-    let first_read_key = format!("0_{}", client_conn_id);
-    // Lock acquired
-    {
-        let mut manager = (*conn.conn_manager).lock().unwrap();
-        manager.register_new_connection(first_read_key.clone());
-    }
-    // Lock released
-
-    // Build and send client-hello
-    let packet = BluefinPacket::builder().header(header).build();
-    conn.set_bytes_out(packet.serialise());
-
-    if let Err(send_err) = conn.write().await {
-        return Err(BluefinError::HandshakeError(format!(
-            "Failed to send client-hello {:?}",
-            send_err
-        )));
-    };
-
-    // Wait for pack-leader response. We should be more generous with the timeout here as the pack-leader
-    // might be busy.
-    let packet = conn
-        .read_with_id_and_timeout(first_read_key.clone(), Duration::from_secs(10))
-        .await?;
-    let key = format!(
-        "{}_{}",
-        packet.payload.header.source_connection_id, packet.payload.header.destination_connection_id
-    );
-    // Lock acquired.
-    {
-        let mut manager = (*conn.conn_manager).lock().unwrap();
-        // Remove temp key
-        let _ = manager.remove_conn(first_read_key.clone());
-        // Register new connection buffer
-        manager.register_new_connection(key);
-    }
-    // Lock released
-
-    eprintln!("Read: {:?}", packet);
-    // handle_pack_leader_response(conn, conn_read_result.packet).await?;
-
     Ok(())
 }

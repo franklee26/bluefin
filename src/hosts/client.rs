@@ -1,8 +1,8 @@
 use std::{
     io::{self, ErrorKind},
     net::UdpSocket,
-    os::fd::{FromRawFd, IntoRawFd},
-    sync::{Arc, Mutex},
+    os::fd::{AsRawFd, FromRawFd},
+    sync::Arc,
     time::Duration,
 };
 
@@ -10,9 +10,16 @@ use rand::Rng;
 use tokio::fs::File;
 
 use crate::{
-    core::context::{BluefinHost, State},
-    handshake::handshake::bluefin_handshake_handle,
-    io::manager::ConnectionManager,
+    core::{
+        context::{BluefinHost, State},
+        header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
+        packet::BluefinPacket,
+        serialisable::Serialisable,
+    },
+    io::{
+        manager::{ConnectionBuffer, ConnectionManager},
+        read::ReadWorker,
+    },
     network::connection::Connection,
 };
 
@@ -21,11 +28,12 @@ pub struct BluefinClient {
     name: String,
     timeout: Duration,
     socket: Option<UdpSocket>,
-    raw_fd: Option<i32>,
     src_ip: Option<String>,
     src_port: Option<i32>,
-    conn_manager: Arc<Mutex<ConnectionManager>>,
-    file: Option<Arc<Mutex<File>>>,
+    manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    file: Option<File>,
+    established_udp_connection: bool,
+    spawned_read_threads: bool,
 }
 
 pub struct BluefinClientBuilder {
@@ -43,11 +51,22 @@ impl BluefinClient {
 
     /// Creates and binds a UDP socket to `address:port`
     pub fn bind(&mut self, address: &str, port: i32) -> io::Result<()> {
-        let socket = UdpSocket::bind(format!("{}:{}", address, port))?;
+        let socket = UdpSocket::bind(format!("{}:{}", address, port)).unwrap();
         self.socket = Some(socket);
         self.src_ip = Some(address.to_string());
         self.src_port = Some(port);
         Ok(())
+    }
+
+    fn get_client_hello_packet(&self, src_id: u32, packet_number: i64) -> BluefinPacket {
+        let type_fields = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0x0);
+        let security_fields = BluefinSecurityFields::new(true, 0b000_1111);
+
+        // Temporarily set dest id to zero
+        let mut header = BluefinHeader::new(src_id, 0x0, type_fields, security_fields);
+        header.with_packet_number(packet_number);
+
+        BluefinPacket::builder().header(header).build()
     }
 
     /// Request a bluefin connection to `address:port`.
@@ -63,12 +82,32 @@ impl BluefinClient {
             ));
         }
 
-        let socket = self.socket.as_ref().unwrap().try_clone().unwrap();
-        socket
-            .connect(format!("{}:{}", address, port))
-            .expect("Could not connect to address/port");
-        let fd = socket.into_raw_fd();
-        self.raw_fd = Some(fd);
+        if !self.established_udp_connection {
+            let socket = self.socket.as_ref().unwrap();
+            let _ = socket.connect(format!("{}:{}", address, port));
+            let fd = socket.as_raw_fd();
+            let file = unsafe { File::from_raw_fd(fd) };
+            self.file = Some(file);
+
+            self.established_udp_connection = true;
+        }
+
+        if !self.spawned_read_threads {
+            for _ in 0..2 {
+                let mut worker = ReadWorker::new(
+                    Arc::clone(&self.manager),
+                    self.file.as_ref().unwrap().try_clone().await.unwrap(),
+                    false,
+                    BluefinHost::Client,
+                );
+
+                tokio::spawn(async move {
+                    worker.run().await;
+                });
+            }
+
+            self.spawned_read_threads = true;
+        }
 
         let packet_number = rand::thread_rng().gen();
         let src_ip: Vec<u8> = self
@@ -84,9 +123,7 @@ impl BluefinClient {
             .map(|s| s.parse::<u8>().unwrap())
             .collect();
 
-        let file = unsafe { File::from_raw_fd(fd) };
-        self.file = Some(Arc::new(Mutex::new(file)));
-
+        let buffer = Arc::new(std::sync::Mutex::new(ConnectionBuffer::new()));
         let mut conn = Connection::new(
             0x0,
             packet_number,
@@ -96,24 +133,54 @@ impl BluefinClient {
             port as u16,
             BluefinHost::Client,
             false,
-            Arc::clone(self.file.as_ref().unwrap()),
-            Arc::clone(&self.conn_manager),
+            self.file.as_ref().unwrap().try_clone().await.unwrap(),
+            Arc::clone(&buffer),
         );
         conn.need_ip_udp_headers(false);
-        // Generate source_id
-        conn.source_id = rand::thread_rng().gen();
-        eprintln!("Working on: {:#08x}", conn.source_id);
+
+        let temp_key = format!("0_{}", conn.source_id);
+
+        // Lock acquired
+        {
+            let mut manager = self.manager.lock().await;
+            manager.register_new_connection(&temp_key, Arc::clone(&buffer));
+        }
+        // Lock released
+
+        // Generate and send client-hello
+        let client_hello = self.get_client_hello_packet(conn.source_id, packet_number);
+        conn.set_bytes_out(client_hello.serialise());
+        conn.write().await;
+
+        // Wait for pack-leader response. (This read will delete our first-read entry). Be generous with this read.
+        let packet = conn
+            .read_with_id_and_timeout(Duration::from_secs(10))
+            .await
+            .unwrap();
+        let key = format!(
+            "{}_{}",
+            packet.payload.header.source_connection_id,
+            packet.payload.header.destination_connection_id
+        );
+
+        // register our 'real' connection
+        // Lock acquired
+        {
+            let mut manager = self.manager.lock().await;
+            manager.register_new_connection(&key, Arc::clone(&buffer));
+        }
+        // Lock released
 
         // Finally, send the hello-client handshake
-        if let Err(handshake_err) = bluefin_handshake_handle(&mut conn).await {
-            return Err(io::Error::new(
-                ErrorKind::NotConnected,
-                format!(
-                    "Failed to complete handshake with pack-leader: {}",
-                    handshake_err
-                ),
-            ));
-        }
+        // if let Err(handshake_err) = bluefin_handshake_handle(&mut conn).await {
+        //     return Err(io::Error::new(
+        //         ErrorKind::NotConnected,
+        //         format!(
+        //             "Failed to complete handshake with pack-leader: {}",
+        //             handshake_err
+        //         ),
+        //     ));
+        // }
 
         conn.context.state = State::Ready;
 
@@ -137,12 +204,13 @@ impl BluefinClientBuilder {
         BluefinClient {
             name: self.name.clone().unwrap(),
             timeout: self.timeout.unwrap_or(Duration::from_secs(10)),
-            raw_fd: None,
             src_ip: None,
             src_port: None,
-            conn_manager: Arc::new(Mutex::new(manager)),
+            manager: Arc::new(tokio::sync::Mutex::new(manager)),
             file: None,
             socket: None,
+            established_udp_connection: false,
+            spawned_read_threads: false,
         }
     }
 }

@@ -1,423 +1,230 @@
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
-    task::{Context, Poll},
-};
+use std::{sync::Arc, time::Duration};
 
 use etherparse::{Ipv4Header, PacketHeaders};
 use rand::distributions::{Alphanumeric, DistString};
-use tokio::{
-    fs::File,
-    io::{AsyncRead, ReadBuf},
-};
+use tokio::{fs::File, io::AsyncReadExt, time::sleep};
 
-use crate::{
-    core::{
-        context::BluefinHost,
-        header::PacketType,
-        packet::{BluefinPacket, Packet},
-        serialisable::Serialisable,
-    },
-    network::connection::Connection,
-};
+use crate::core::context::BluefinHost;
+use crate::core::header::PacketType;
+use crate::core::serialisable::Serialisable;
+use crate::core::{error::BluefinError, packet::BluefinPacket, packet::Packet};
 
-use super::manager::{ConnectionBuffer, ConnectionManager};
+use super::manager::{ConnectionManager, Result};
 
-/// Bluefin reader for reading and parsing incoming wire bytes
-#[derive(Clone)]
-pub(crate) struct Reader {
-    file: Arc<Mutex<File>>,
+/// Essentially a read-worker thread. Each worker attempts to read in bytes from the wire. Then,
+/// the worker determiens if the packet is a valid bluefin packet. If so, the worker will attempt
+/// to buffer the packet in the appropriate buffer.
+pub(crate) struct ReadWorker {
+    id: String,
+    manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    file: File,
     need_ip_and_udp_headers: bool,
+    host_type: BluefinHost,
 }
 
-impl Reader {
-    fn new(file: Arc<Mutex<File>>, need_ip_and_udp_headers: bool) -> Self {
+/// Worker thread that occasionally wakes up and peeks into any possible matches between outstanding
+/// `Accept` requests and any outstanding buffered unhandled client hellos.
+pub(crate) struct AcceptWorker {
+    id: String,
+    manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    max_number_tries: usize,
+}
+
+impl AcceptWorker {
+    pub(crate) fn new(manager: Arc<tokio::sync::Mutex<ConnectionManager>>) -> Self {
+        let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+        // TODO: adjust the number more dynamically?
+        let max_number_tries = 10;
         Self {
-            file,
-            need_ip_and_udp_headers,
+            id,
+            manager,
+            max_number_tries,
         }
     }
 
-    /// Reads in from the wire an incoming stream of bytes. We try to deserialise the bytes
-    /// into an bluefin packet but we also keep the ip + udp layers.
-    fn poll_read_packet(&mut self, cx: &mut Context) -> Poll<Packet> {
-        let mut file = (*self.file).lock().unwrap();
-        let pinned_file = Pin::new(&mut *file);
-        let mut temp_buf = vec![0; 1504];
-        let mut buf = ReadBuf::new(&mut temp_buf);
-        match pinned_file.poll_read(cx, &mut buf) {
-            Poll::Ready(Ok(())) => {
-                let read_buf = buf.filled();
-                let mut offset = 0;
-                let mut ip_header_len = 0;
-                let mut udp_header_len = 0;
-                let mut src_ip = [0; 4];
-                let mut dst_ip = [0; 4];
-                let mut src_port = 0;
-                let mut dst_port = 0;
+    /// Runs `max_number_of_tries` times. Note that each accept invocation should correspond with one
+    /// worker cleaner runner in the background. In otherwords, why would we want to run this if we never
+    /// made an accept request or if all of them have already been fulfilled? This means that if we
+    /// were able to wake up an accept then our job is done and we can exit.
+    pub(crate) async fn run(&self) {
+        for _ in 0..self.max_number_tries {
+            sleep(Duration::from_secs(1)).await;
 
-                // If I need to worry about ip and udp headers then I need to also worry about tun/tap bytes.
-                // Offset the tun/tap header, which is 4 bytes
-                if self.need_ip_and_udp_headers {
-                    offset = 4;
+            // Lock acquired
+            let mut manager = self.manager.lock().await;
+
+            match manager.try_to_wake_buffered_accept() {
+                Ok(_) => {
+                    return;
                 }
-
-                if let Ok(packet_headers) = PacketHeaders::from_ip_slice(&read_buf[offset..]) {
-                    ip_header_len = packet_headers.ip.unwrap().header_len();
-                    let (ip_header, _) =
-                        Ipv4Header::from_slice(&read_buf[offset..ip_header_len + offset]).unwrap();
-
-                    // Not udp; drop.
-                    if ip_header.protocol != 0x11 {
-                        return Poll::Pending;
-                    }
-
-                    let udp_header = packet_headers.transport.unwrap().udp().unwrap();
-                    udp_header_len = udp_header.header_len();
-
-                    src_ip = ip_header.source;
-                    dst_ip = ip_header.destination;
-                    src_port = udp_header.source_port;
-                    dst_port = udp_header.destination_port;
-                }
-                let wrapped_bluefin_packet = BluefinPacket::deserialise(
-                    &read_buf[offset + ip_header_len + udp_header_len..],
-                );
-
-                // Not a bluefin packet; drop.
-                if let Err(_) = wrapped_bluefin_packet {
-                    return Poll::Pending;
-                }
-
-                let payload = wrapped_bluefin_packet.unwrap();
-                let packet = Packet {
-                    src_ip,
-                    dst_ip,
-                    src_port,
-                    dst_port,
-                    payload,
-                };
-
-                return Poll::Ready(packet);
+                Err(_) => continue,
             }
-            // TODO: Handle this error better...
-            Poll::Ready(Err(e)) => {
-                eprintln!("{e}");
-                Poll::Pending
-            }
-            _ => Poll::Pending,
-        }
-    }
-
-    /// The same as `poll_read_packet()` except strip away the ip + udp layer.
-    fn poll_read_bluefin_packet(&mut self, cx: &mut Context) -> Poll<BluefinPacket> {
-        match self.poll_read_packet(cx) {
-            Poll::Ready(packet) => Poll::Ready(packet.payload),
-            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-/// Future representing a new bluefin connection request. This is essentially the same as `Read<'a>` except
-/// that it handles the special case of accepting a new connection
-pub struct Accept {
-    /// Unique id representing one Accept request. This is required such that we only register at most
-    /// one waker per accept request.
-    pub id: String,
-    pub source_id: u32,
-    pub(crate) reader: Reader,
-    pub(crate) file: Arc<Mutex<File>>,
-    /// Connection manager is shared across all connections for a device.
-    pub(crate) conn_manager: Arc<Mutex<ConnectionManager>>,
-    pub(crate) need_ip_and_udp_headers: bool,
-}
-
-/// Future for a general read over the network for an existing connection
-#[derive(Clone)]
-pub struct Read {
-    /// The id takes the form `<other_id>_<this_id>`. Because a `Read` can only be awaited
-    /// on existing connection, then the `other_id` is already defined and must exist in our
-    /// manager.
-    pub id: String,
-    pub(crate) reader: Reader,
-    pub(crate) file: Arc<Mutex<File>>,
-    /// Connection manager is shared across all connections for a device.
-    pub(crate) conn_manager: Arc<Mutex<ConnectionManager>>,
-    pub(crate) need_ip_and_udp_headers: bool,
-    pub(crate) is_client_first_read: bool,
-}
-
-impl Accept {
+impl ReadWorker {
     pub(crate) fn new(
-        source_id: u32,
-        file: Arc<Mutex<File>>,
-        conn_manager: Arc<Mutex<ConnectionManager>>,
+        manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
+        file: File,
         need_ip_and_udp_headers: bool,
+        host_type: BluefinHost,
     ) -> Self {
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-        let reader = Reader::new(Arc::clone(&file), need_ip_and_udp_headers);
         Self {
             id,
-            source_id,
+            manager,
             file,
-            reader,
-            conn_manager,
             need_ip_and_udp_headers,
+            host_type,
         }
     }
 
-    fn build_connection_from_conn_buffer(&self, conn_buf: &ConnectionBuffer) -> Option<Connection> {
-        if let Some(packet) = &conn_buf.packet {
-            let mut conn = Connection::new(
-                // The destination id must be whatever the src is calling its src id
-                packet.payload.header.source_connection_id as u32,
-                packet.payload.header.packet_number,
-                packet.dst_ip,
-                packet.dst_port,
-                packet.src_ip,
-                packet.src_port,
-                BluefinHost::PackLeader,
-                self.need_ip_and_udp_headers,
-                Arc::clone(&self.file),
-                Arc::clone(&self.conn_manager),
+    /// Helper to determine whether a given `packet` is a valid hello packet eg. client-hello or pack-leader-hello
+    fn is_hello_packet(&self, packet: &Packet) -> bool {
+        let header = packet.payload.header;
+        let other_id = header.source_connection_id;
+        let this_id = header.destination_connection_id;
+
+        // if client-hello then, must have a non-zero source id
+        if self.host_type == BluefinHost::PackLeader && other_id == 0x0 {
+            return false;
+        }
+
+        // if client-hello then, the destination id must be 0x0
+        if self.host_type == BluefinHost::PackLeader && this_id != 0x0 {
+            return false;
+        }
+
+        // Client hellos' must have type UnencryptedHandshake
+        if header.type_and_type_specific_payload.packet_type != PacketType::UnencryptedHandshake {
+            return false;
+        }
+
+        true
+    }
+
+    fn get_packet_from_buffer(&self, buf: &[u8]) -> Result<Packet> {
+        let mut offset = 0;
+        let mut ip_header_len = 0;
+        let mut udp_header_len = 0;
+        let mut src_ip = [0; 4];
+        let mut dst_ip = [0; 4];
+        let mut src_port = 0;
+        let mut dst_port = 0;
+
+        // If I need to worry about ip and udp headers then I need to also worry about tun/tap bytes.
+        // Offset the tun/tap header, which is 4 bytes
+        if self.need_ip_and_udp_headers {
+            offset = 4;
+        }
+
+        if let Ok(packet_headers) = PacketHeaders::from_ip_slice(&buf[offset..]) {
+            ip_header_len = packet_headers.ip.unwrap().header_len();
+            let (ip_header, _) =
+                Ipv4Header::from_slice(&buf[offset..ip_header_len + offset]).unwrap();
+
+            // Not udp; drop.
+            if ip_header.protocol != 0x11 {
+                // TODO: Return better error
+                return Err(BluefinError::DeserialiseError("Not UDP-based.".to_string()));
+            }
+
+            let udp_header = packet_headers.transport.unwrap().udp().unwrap();
+            udp_header_len = udp_header.header_len();
+
+            src_ip = ip_header.source;
+            dst_ip = ip_header.destination;
+            src_port = udp_header.source_port;
+            dst_port = udp_header.destination_port;
+        }
+
+        let wrapped_bluefin_packet =
+            BluefinPacket::deserialise(&buf[offset + ip_header_len + udp_header_len..]);
+
+        // Not a bluefin packet; drop.
+        if let Err(_) = wrapped_bluefin_packet {
+            // TODO: Return better error
+            return Err(BluefinError::DeserialiseError(
+                "Wrong connection".to_string(),
+            ));
+        }
+
+        let payload = wrapped_bluefin_packet.unwrap();
+        Ok(Packet {
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            payload,
+        })
+    }
+
+    /// Run a single, infinite loop. This continuously reads from the network, verifies if it is an Bluefin packet,
+    /// performs simple validations and tries to buffer the packet via the `ConnectionManager`.
+    pub(crate) async fn run(&mut self) {
+        loop {
+            sleep(Duration::from_secs(3)).await;
+
+            let mut buf = vec![0; 1504];
+            let res = self.file.read(&mut buf).await;
+
+            // Can't work with a read error
+            if let Err(_) = res {
+                continue;
+            }
+
+            let size = res.unwrap();
+            let packet_res = self.get_packet_from_buffer(&buf[..size]);
+
+            // Not a bluefin packet
+            if let Err(_) = packet_res {
+                continue;
+            }
+
+            let packet = packet_res.unwrap();
+            let header = packet.payload.header;
+            let key_from_packet = format!(
+                "{}_{}",
+                header.source_connection_id, header.destination_connection_id
             );
-            conn.source_id = self.source_id;
+            let is_hello = self.is_hello_packet(&packet);
 
-            return Some(conn);
-        }
-        None
-    }
-}
+            // Lock acquired
+            {
+                let mut manager = self.manager.lock().await;
 
-impl Future for Accept {
-    // TODO: This doesn't really yield a connection, but more of a potential connection.
-    type Output = Connection;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        let _self = self.get_mut();
-        let mut conn_manager = (*_self.conn_manager).lock().unwrap();
-
-        // First check if we managed to buffer the new connection request
-        if let Some(conn_buf) = conn_manager.search_new_conn_req_buffer(_self.id.clone()) {
-            if let Some(conn) = _self.build_connection_from_conn_buffer(conn_buf) {
-                // Remove request (it must exist)
-                let _ = conn_manager.remove_new_conn_req(_self.id.to_string());
-
-                // Generate new connection key
-                let key = format!("{}_{}", conn.dest_id, conn.source_id);
-                // Register in map
-                conn_manager.register_new_connection(key);
-
-                return Poll::Ready(conn);
-            }
-        }
-
-        // Ok, maybe there is something left in the unhandled buffer.
-        if let Some(conn_buf) = conn_manager.consume_unhandled_new_connection_req() {
-            if let Some(conn) = _self.build_connection_from_conn_buffer(&conn_buf) {
-                // Generate new connection key
-                let key = format!("{}_{}", conn.dest_id, conn.source_id);
-                // Register in map
-                conn_manager.register_new_connection(key);
-
-                return Poll::Ready(conn);
-            }
-        }
-
-        // Didn't find anything in our buffer yet... anything sitting in the socket?
-        match _self.reader.poll_read_packet(cx) {
-            // Yes! We have a bluefin packet
-            Poll::Ready(packet) => {
-                let bluefin_packet = packet.payload.clone();
-                let other_id = bluefin_packet.header.source_connection_id;
-                let this_id = bluefin_packet.header.destination_connection_id;
-
-                let key = format!("{}_{}", other_id, this_id);
-                let first_read_key = format!("0_{}", this_id);
-
-                // This already exists... let's redirect it to the correct buffer and wait...
-                if conn_manager.conn_exists(&key) {
-                    // Add to existing conn's buffer.
-                    let _ = conn_manager.buffer_to_existing_connection(&key, packet);
-                    // Register this future's waker
-                    let _ = conn_manager
-                        .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
-                    return Poll::Pending;
-                }
-
-                // This is a first read packet.
-                if conn_manager.conn_exists(&first_read_key) {
-                    let _ = conn_manager.buffer_to_existing_connection(&first_read_key, packet);
-                    // Register this future's waker
-                    let _ = conn_manager
-                        .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
-                    return Poll::Pending;
-                }
-
-                // Packet describes a new connection but is not a handshake request... disregard
-                if bluefin_packet
-                    .header
-                    .type_and_type_specific_payload
-                    .packet_type
-                    != PacketType::UnencryptedHandshake
-                {
-                    // Register this future's waker
-                    let _ = conn_manager
-                        .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
-                    return Poll::Pending;
-                }
-
-                // New connection id AND header is an handshake type BUT the destination id is not
-                // set to zero. This is an invalid packet. Disregard.
-                if this_id != 0 {
-                    // Register this future's waker
-                    let _ = conn_manager
-                        .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
-                    return Poll::Pending;
-                }
-
-                // Finally... this is indeed a valid handshake request. Let's create the connection.
-                let mut conn = Connection::new(
-                    // The destination id must be whatever the src is calling its src id
-                    bluefin_packet.header.source_connection_id as u32,
-                    bluefin_packet.header.packet_number,
-                    packet.dst_ip,
-                    packet.dst_port,
-                    packet.src_ip,
-                    packet.src_port,
-                    BluefinHost::PackLeader,
-                    _self.need_ip_and_udp_headers,
-                    Arc::clone(&_self.file),
-                    Arc::clone(&_self.conn_manager),
-                );
-                conn.source_id = _self.source_id;
-
-                // Remove request (if it exists)
-                let _ = conn_manager.remove_new_conn_req(_self.id.clone());
-
-                // Generate new connection key
-                let key = format!("{}_{}", conn.dest_id, conn.source_id);
-                // Register in map
-                conn_manager.register_new_connection(key);
-
-                Poll::Ready(conn)
-            }
-            // Nope, nothing yet... let's put this on pause
-            Poll::Pending => {
-                // Register this future's waker. It's best to register this since it's possible that
-                // another read request would encounter a new-connection request.
-                let _ = conn_manager
-                    .register_new_connection_request(_self.id.to_string(), cx.waker().clone());
-                Poll::Pending
-            }
-        }
-    }
-}
-
-impl Read {
-    pub(crate) fn new(
-        id: String,
-        file: Arc<Mutex<File>>,
-        conn_manager: Arc<Mutex<ConnectionManager>>,
-        need_ip_and_udp_headers: bool,
-    ) -> Self {
-        let reader = Reader::new(Arc::clone(&file), need_ip_and_udp_headers);
-        let is_client_first_read = id.split("_").nth(0).unwrap() == "0";
-        Self {
-            id,
-            reader,
-            file,
-            conn_manager: Arc::clone(&conn_manager),
-            need_ip_and_udp_headers,
-            is_client_first_read,
-        }
-    }
-}
-
-impl Future for Read {
-    type Output = Packet;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let _self = self.get_mut();
-        let mut conn_manager = (*_self.conn_manager).lock().unwrap();
-
-        // We found a buffered packet! Yay!
-        if let Some(packet) = conn_manager.consume_conn_buf(_self.id.clone()) {
-            return Poll::Ready(packet);
-        }
-
-        // We did not... let's peek into the socket and see if something is waiting for us
-        match _self.reader.poll_read_packet(cx) {
-            Poll::Ready(packet) => {
-                let key_from_packet = format!(
-                    "{}_{}",
-                    packet.payload.header.source_connection_id,
-                    packet.payload.header.destination_connection_id
-                );
-                let potential_key =
-                    format!("0_{}", packet.payload.header.destination_connection_id);
-
-                if !conn_manager.conn_exists(&key_from_packet) {
-                    // It's possible that this packet is meant for a client first read
-                    if conn_manager.conn_exists(&potential_key) {
-                        // This is this read!
-                        if _self.id == potential_key {
-                            return Poll::Ready(packet);
+                match self.host_type {
+                    BluefinHost::PackLeader => {
+                        // Found a client hello AND I have never encountered this connection before.
+                        // This must be an client-hello awaiting a pack-leader's `Accept`.
+                        let buffer_exists = manager.buffer_exists(&key_from_packet);
+                        if is_hello && !buffer_exists {
+                            let _ = manager.buffer_client_hello(packet);
+                            continue;
                         }
-                        // Nope, then this is another client first read packet, just not for us.
-                        let _ = conn_manager.buffer_to_existing_connection(&potential_key, packet);
-                        conn_manager
-                            .add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
-                        return Poll::Pending;
                     }
+                    BluefinHost::Client => {
+                        let potential_pack_leader_key =
+                            format!("0_{}", header.destination_connection_id);
+                        let open_buffer_exists = manager.buffer_exists(&potential_pack_leader_key);
 
-                    // New connection requests should have the dst id to 0x0. Drop this packet.
-                    if packet.payload.header.destination_connection_id != 0x0 {
-                        conn_manager
-                            .add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
-                        return Poll::Pending;
+                        // Found a pack-leader hello AND I have an open connection awaiting a response
+                        if is_hello && open_buffer_exists {
+                            let _ = manager.buffer_packet_to_existing_connection(
+                                &potential_pack_leader_key,
+                                packet,
+                            );
+                            continue;
+                        }
                     }
-
-                    // New connection requests should have type `UnencryptedHandshake`
-                    if packet
-                        .payload
-                        .header
-                        .type_and_type_specific_payload
-                        .packet_type
-                        != PacketType::UnencryptedHandshake
-                    {
-                        conn_manager
-                            .add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
-                        return Poll::Pending;
-                    }
-
-                    // This is looking like a new connection request! Good for them but not for me...
-                    conn_manager.buffer_to_new_connection_request(packet);
-                    conn_manager.add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
-                    return Poll::Pending;
+                    _ => todo!(),
                 }
 
-                // So this packet is indeed for an existing connection... just not this one. Buffer
-                // it and wake.
-                if key_from_packet != _self.id {
-                    let _ = conn_manager.buffer_to_existing_connection(&key_from_packet, packet);
-                    conn_manager.add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
-                    return Poll::Pending;
-                }
-
-                // So this connection has been registered AND it is indeed mine! Let's clean up and return.
-                let _ = conn_manager.consume_conn_buf(key_from_packet);
-                Poll::Ready(packet)
+                // Let's try buffering this to a connection, if it exists
+                let _ = manager.buffer_packet_to_existing_connection(&key_from_packet, packet);
             }
-            // Nothing yet... let's just register our waker and wait
-            Poll::Pending => {
-                conn_manager.add_waker_to_existing_conn(_self.id.clone(), cx.waker().clone());
-                Poll::Pending
-            }
+            // Lock released
         }
     }
 }

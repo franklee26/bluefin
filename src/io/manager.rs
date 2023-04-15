@@ -1,6 +1,9 @@
 use crate::core::error::BluefinError;
 use crate::core::packet::Packet;
+use crate::utils::common::SyncConnBufferRef;
+use std::collections::VecDeque;
 use std::result;
+use std::sync::Arc;
 use std::{collections::HashMap, task::Waker};
 
 /// Bluefin Result yields a BluefinError
@@ -21,14 +24,6 @@ impl ConnectionBuffer {
         }
     }
 
-    /// Create a new buffer with just a waker.
-    pub(crate) fn new_with_waker(waker: Waker) -> Self {
-        Self {
-            packet: None,
-            waker: Some(waker),
-        }
-    }
-
     /// Adds just the `packet` to the connection's buffer. If the buffer is
     /// full then an error is returned.
     pub(crate) fn add_to_buffer(&mut self, packet: Packet) -> Result<()> {
@@ -37,18 +32,6 @@ impl ConnectionBuffer {
         }
 
         self.packet = Some(packet);
-        Ok(())
-    }
-
-    /// Adds `packet` and its associated waker to the connection's buffer.
-    /// If the buffer is full then an error is returned.
-    pub(crate) fn add_to_buffer_with_waker(&mut self, packet: Packet, waker: Waker) -> Result<()> {
-        if self.packet.is_some() {
-            return Err(BluefinError::BufferFullError);
-        }
-
-        self.packet = Some(packet);
-        self.waker = Some(waker);
         Ok(())
     }
 
@@ -69,185 +52,151 @@ impl ConnectionBuffer {
 /// Buffer at most 10 unhandled requests. Otherwise, we might get overburdended with
 /// these requests.
 const MAX_UNHANDLED_NEW_CONNECTION_REQ: usize = 10;
+
 #[derive(Debug)]
 pub(crate) struct ConnectionManager {
-    /// A connection is identified by the key `<other_id>_<mine_id>`. For example if a client
-    /// with key `abc` connected to the current host with conn id `def` then the host would
-    /// look for `abc_def`. In the case that a client is requesting a new connection then
-    /// then the host would expect the `dst_id` to be `0x0` (see handshake protocol). This means
-    /// the key for a new connection request from client `abc` would be `abc_0`.
-    connection_map: HashMap<String, ConnectionBuffer>,
+    /// Maps a connection to its connection buffer. At any moment in time, there can be at most
+    /// two actors trying to access this buffer: the connection itself or this manager. Because
+    /// accessing the buffer is done in the `BufferedRead` poll's implementation, this mutex
+    /// must be blocking.
+    buffer_map: HashMap<String, SyncConnBufferRef>,
 
-    /// A map tracking new connection `Accept`'s. Because a new connection does not have a defined
-    /// id, we use the `Accept`'s unique id to track each waker. We need a separate map because we
-    /// need to quickly identify if a buffer applies to a normal socket read or if the buffer was
-    /// buffering a new connection request.
-    new_connection_req_map: HashMap<String, ConnectionBuffer>,
+    /// Serves the exact same purpose as `buffer_map` except it is intended for new `Accept` requests
+    /// only. This makes it easy for us to find packets that should be directed to `BufferedReads`
+    /// awaiting the client-hello.
+    accept_buffer_map: HashMap<String, SyncConnBufferRef>,
 
-    /// Sometimes, we might encounter a new connect request but we didn't register a pending `Accept`
-    /// request. For example, the current thread might be still processing another `Accept.await` and
-    /// we encounter a new connect request. In this case, we buffer as many of these unhandled requests
-    /// as we can.
-    unhandled_new_connection_req: Vec<ConnectionBuffer>,
+    /// Buffers in client hello packets that couldn't be buffered in `accept_buffer_map` since there
+    /// was no outstanding `Accept` requests.
+    unhandled_client_hellos: VecDeque<Packet>,
 }
 
 impl ConnectionManager {
     pub(crate) fn new() -> Self {
         Self {
-            connection_map: HashMap::new(),
-            new_connection_req_map: HashMap::new(),
-            unhandled_new_connection_req: Vec::new(),
+            buffer_map: HashMap::new(),
+            accept_buffer_map: HashMap::new(),
+            unhandled_client_hellos: VecDeque::new(),
         }
     }
 
-    /// Register an `Accept`'s new connection request. If we have already registered a buffer
-    /// for this `Accept` request then this function errors.
-    pub(crate) fn register_new_connection_request(
-        &mut self,
-        accept_id: String,
-        waker: Waker,
-    ) -> Result<()> {
-        if self.new_connection_req_map.contains_key(&accept_id) {
-            return Err(BluefinError::BufferFullError);
+    /// Attempts to buffer the first packet in `unhandled_client_hellos` into the first `Accept`
+    /// buffer we find
+    pub(crate) fn try_to_wake_buffered_accept(&mut self) -> Result<()> {
+        // Can't do anything if either of these buffers are empty
+        if self.accept_buffer_map.is_empty() || self.unhandled_client_hellos.is_empty() {
+            return Err(BluefinError::BufferEmptyError);
         }
 
-        let conn_buf = ConnectionBuffer::new_with_waker(waker);
+        let packet = self.unhandled_client_hellos.pop_front().unwrap();
+        let cloned = self.accept_buffer_map.clone();
+        let (key, buf) = cloned.iter().next().unwrap();
 
-        self.new_connection_req_map.insert(accept_id, conn_buf);
+        let mut guard = buf.lock().unwrap();
+        guard.add_to_buffer(packet)?;
+
+        if let Some(waker) = &guard.waker {
+            waker.wake_by_ref();
+        }
+
+        let _ = self.accept_buffer_map.remove(key);
+
         Ok(())
     }
 
-    /// Registers a new connection. The key here may take the usual `<other>_<mine>` id form
-    /// OR it can just take the form `0_<mine>` when the client is initiating the handshake
-    /// and is waiting for the pack leader's response.
-    pub(crate) fn register_new_connection(&mut self, key: String) {
-        let conn_buf = ConnectionBuffer::new();
-        self.connection_map.insert(key, conn_buf);
+    pub(crate) fn buffer_unhandled_client_hello(&mut self, packet: Packet) -> Result<()> {
+        if self.unhandled_client_hellos.len() >= MAX_UNHANDLED_NEW_CONNECTION_REQ {
+            return Err(BluefinError::BufferFullError);
+        }
+
+        self.unhandled_client_hellos.push_back(packet);
+
+        Ok(())
     }
 
-    /// Adds a packet to an existing connection. If the connection does not exist
-    /// then this function returns an error.
-    pub(crate) fn buffer_to_existing_connection(
+    /// Registers a new connection
+    pub(crate) fn register_new_connection(
+        &mut self,
+        key: &str,
+        buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
+    ) {
+        let _ = self.buffer_map.insert(key.to_string(), buffer);
+    }
+
+    /// Registers a new accept buffer, creates its shared buffer and returns an Arc<> reference to it
+    pub(crate) fn register_new_accept_connection(&mut self, key: &str) -> SyncConnBufferRef {
+        let buf = Arc::new(std::sync::Mutex::new(ConnectionBuffer::new()));
+
+        let _ = self
+            .accept_buffer_map
+            .insert(key.to_string(), Arc::clone(&buf));
+
+        buf
+    }
+
+    /// Returns whether or not a given key has been registered in the manager
+    pub(crate) fn buffer_exists(&self, key: &str) -> bool {
+        self.buffer_map.contains_key(key)
+    }
+
+    /// Adds a packet to an existing connection buffer. If the connection does not exist then this errors. Notice
+    /// that this function is blocking; it will block until the current thread acquires the lock for this buffer.
+    pub(crate) fn buffer_packet_to_existing_connection(
         &mut self,
         key: &str,
         packet: Packet,
     ) -> Result<()> {
-        if !self.conn_exists(&key) {
+        if !self.buffer_exists(key) {
             return Err(BluefinError::NoSuchConnectionError);
         }
 
-        let conn_buf = self.connection_map.get_mut(key).unwrap();
+        {
+            let mut guard = self.buffer_map.get(key).unwrap().lock().unwrap();
+            guard.packet = Some(packet);
 
-        // Add the packet to buffer
-        conn_buf.add_to_buffer(packet)?;
-
-        // wake up future
-        conn_buf.waker.as_ref().unwrap().wake_by_ref();
-
-        Ok(())
-    }
-
-    /// Adds a packet to any pending new connection request buffers. If there are no new connection
-    /// requests then we try to buffer into a temporary buffer. Otherwise, we pick the first pending
-    /// request (FIFO), buffer the packet and signal the waker.
-    pub(crate) fn buffer_to_new_connection_request(&mut self, packet: Packet) {
-        for (_, conn_buf) in &mut self.new_connection_req_map {
-            // I need a waker!
-            if conn_buf.waker.is_none() {
-                continue;
+            // Signal the waker if it exists
+            if let Some(waker) = &guard.waker {
+                waker.wake_by_ref();
+                // Consumed.
+                guard.waker = None;
             }
-
-            (*conn_buf).packet = Some(packet);
-            conn_buf.waker.as_ref().unwrap().wake_by_ref();
-
-            return;
         }
 
-        // Couldn't find a corresponding new conn request buffered. Let's store this for now.
-        self.buffer_unhandled_new_connection_req(packet);
-    }
-
-    /// Removes a connection from the connection map.
-    pub(crate) fn remove_conn(&mut self, key: String) -> Result<()> {
-        if !self.connection_map.contains_key(&key) {
-            return Err(BluefinError::NoSuchConnectionError);
+        // We need to delete this entry if it's just a client first-read
+        if key.starts_with("0_") {
+            self.buffer_map.remove(key);
         }
-
-        let _ = self.connection_map.remove(&key);
 
         Ok(())
     }
 
-    /// Removes a new connection request with accept_id `key`. It's important to remove these requests
-    /// from the manager such that we don't re-awake an already woken new connection request poll.
-    pub(crate) fn remove_new_conn_req(&mut self, key: String) -> Result<()> {
-        if !self.new_connection_req_map.contains_key(&key) {
-            // TODO: fix error
-            return Err(BluefinError::NoSuchConnectionError);
+    /// Takes in a valid client-hello `packet` and tries to buffer it into the oldest entry in the
+    /// `accept_buffer_map`. If such an entry exists then we try to signal it's waker. Else, this
+    /// function errors.
+    pub(crate) fn buffer_client_hello(&mut self, packet: Packet) -> Result<()> {
+        // Can't buffer this!
+        if self.accept_buffer_map.is_empty() {
+            return self.buffer_unhandled_client_hello(packet);
         }
 
-        let _ = self.new_connection_req_map.remove(&key);
+        for (key, val) in self.accept_buffer_map.clone().iter() {
+            let mut guard = val.lock().unwrap();
 
-        Ok(())
-    }
+            // buffer in packet
+            if let Ok(_) = guard.add_to_buffer(packet.clone()) {
+                // wake waker
+                if let Some(waker) = &guard.waker {
+                    waker.wake_by_ref();
+                }
 
-    /// Checks whether a given connection is already opened. `dst_id` refers to the
-    /// incoming packet's destination id (aka. the current host's conn id) and
-    /// `src_id` refers to what the other host's id is.
-    pub(crate) fn conn_exists(&self, key: &str) -> bool {
-        self.connection_map.contains_key(key)
-    }
+                // delete this entry
+                self.accept_buffer_map.remove(key);
 
-    /// Fetches the connection buffer for a given connection `key` and resets the buffer content
-    /// and drops the waker (if they exist)
-    pub(crate) fn consume_conn_buf(&mut self, key: String) -> Option<Packet> {
-        if let Some(conn_buff) = self.connection_map.get_mut(&key) {
-            return conn_buff.consume();
+                return Ok(());
+            }
         }
 
-        None
-    }
-
-    /// Registers a waker to an existing connection.
-    pub(crate) fn add_waker_to_existing_conn(&mut self, key: String, waker: Waker) {
-        if !self.conn_exists(&key) {
-            return;
-        }
-        let conn_buf = self.connection_map.get_mut(&key).unwrap();
-
-        // No need to re-register
-        if conn_buf.waker.is_some() {
-            return;
-        }
-
-        // Register waker
-        (*conn_buf).waker = Some(waker);
-    }
-
-    /// Checks whether there is already a registered buffer for a new connection request
-    /// with key `accept_id`. If there is no such entry then we return none.
-    pub(crate) fn search_new_conn_req_buffer(
-        &self,
-        accept_id: String,
-    ) -> Option<&ConnectionBuffer> {
-        self.new_connection_req_map.get(&accept_id)
-    }
-
-    /// Consumes a buffer from the unhandled new connection request buffer.
-    pub(crate) fn consume_unhandled_new_connection_req(&mut self) -> Option<ConnectionBuffer> {
-        self.unhandled_new_connection_req.pop()
-    }
-
-    /// Buffers an unhandled new connection request. This should only get called if we there
-    /// are no more `Accept` connection buffers available.
-    fn buffer_unhandled_new_connection_req(&mut self, packet: Packet) {
-        // Buffer size exceeded. Cannot buffer this packet. This means this packet may be lost.
-        if self.unhandled_new_connection_req.len() >= MAX_UNHANDLED_NEW_CONNECTION_REQ {
-            return;
-        }
-
-        let mut conn_buf = ConnectionBuffer::new();
-        let _ = conn_buf.add_to_buffer(packet);
-        self.unhandled_new_connection_req.push(conn_buf);
+        // TODO: return better error
+        Err(BluefinError::BufferEmptyError)
     }
 }

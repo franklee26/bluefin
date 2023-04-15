@@ -1,18 +1,18 @@
 use std::{
-    fmt,
+    fmt::{self, Debug},
     io::{self, ErrorKind},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
-use etherparse::{PacketBuilder, PacketHeaders};
+use etherparse::PacketBuilder;
 use rand::{
     distributions::{Alphanumeric, DistString},
     Rng,
 };
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::AsyncWriteExt,
     time::{sleep, timeout},
 };
 
@@ -25,13 +25,13 @@ use crate::{
         serialisable::Serialisable,
     },
     io::{
-        manager::{ConnectionManager, Result},
-        read::Read,
+        buffered_read::BufferedRead,
+        manager::{ConnectionBuffer, Result},
     },
 };
 
 const MAX_NUM_OPEN_STREAMS: usize = 10;
-const MAX_NUMBER_OF_RETRIES: usize = 3;
+const MAX_NUMBER_OF_RETRIES: usize = 1;
 
 /// A Bluefin `Connection`. This struct represents an established Bluefin connection
 /// and keeps track of the state of the connection, input/output buffers and other
@@ -42,7 +42,7 @@ const MAX_NUMBER_OF_RETRIES: usize = 3;
 pub struct Connection {
     pub id: String,
     pub(crate) need_ip_udp_headers: bool,
-    pub(crate) file: Arc<Mutex<File>>,
+    pub(crate) file: File,
     pub source_id: u32,
     pub dest_id: u32,
     pub num_streams: usize,
@@ -53,7 +53,7 @@ pub struct Connection {
     pub(crate) source_port: Option<u16>,
     pub(crate) destination_port: Option<u16>,
     pub(crate) context: Context,
-    pub(crate) conn_manager: Arc<Mutex<ConnectionManager>>,
+    pub(crate) buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
 }
 
 /// Read result contains the read bluefin packet along with additional metadata
@@ -76,12 +76,6 @@ impl fmt::Display for Connection {
     }
 }
 
-impl Drop for Connection {
-    fn drop(&mut self) {
-        eprintln!("Dropping connection {}", self.id);
-    }
-}
-
 impl Connection {
     /// Returns a new connection instance.
     /// TODO: we might need to be stricter with this and return a Result<> instead
@@ -94,8 +88,8 @@ impl Connection {
         destination_port: u16,
         host_type: BluefinHost,
         need_ip_udp_headers: bool,
-        file: Arc<Mutex<File>>,
-        conn_manager: Arc<Mutex<ConnectionManager>>,
+        file: File,
+        buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
     ) -> Connection {
         let source_id: u32 = rand::thread_rng().gen();
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
@@ -112,7 +106,7 @@ impl Connection {
             destination_ip: Some(destination_ip),
             source_port: Some(source_port),
             destination_port: Some(destination_port),
-            conn_manager,
+            buffer,
             context: Context {
                 host_type,
                 state: State::Handshake,
@@ -194,110 +188,44 @@ impl Connection {
         self.need_ip_udp_headers = need_ip_udp_headers;
     }
 
-    /// This function is similar to `read` except:
-    ///     1. Return value is wrapped with a `Result<BluefinReadResult, BluefinError>` instead of
-    ///        io::Result<>. This makes it easier to deal with bluefin-specific errors.
-    ///     2. This function is expecting the input to be a bluefin packet and not arbitrary bytes. If
-    ///        the incoming bytes can not be deserialised into a bluefin packet then this errors.
-    ///     3. No need to provide a buffer; we internally malloc 1504 byte buffer. This means the invoker
-    ///        does not necessarily need to work with buffer ptr arithmetic.
-    pub async fn bluefin_read_packet(&mut self) -> Result<BluefinReadResult> {
-        let mut buf = vec![0; 1504];
-
-        match self.read(&mut buf).await {
-            Ok((offset, size)) => {
-                let packet = BluefinPacket::deserialise(&buf[offset..offset + size])?;
-                Ok(BluefinReadResult {
-                    size,
-                    offset,
-                    packet,
-                })
-            }
-            Err(err) => Err(BluefinError::ReadError(err.to_string())),
-        }
+    async fn reset_file(&mut self) {
+        self.file = self.file.try_clone().await.unwrap();
     }
 
-    async fn read_impl(
-        &mut self,
-        key: Option<String>,
-        timeout: Option<Duration>,
-    ) -> Result<Packet> {
-        let key = key.unwrap_or(format!("{}_{}", self.dest_id, self.source_id));
+    async fn read_impl(&mut self, timeout: Option<Duration>) -> Result<Packet> {
         let timeout = timeout.unwrap_or(Duration::from_secs(3));
-        let read = Read::new(
-            key,
-            Arc::clone(&self.file),
-            Arc::clone(&self.conn_manager),
-            self.need_ip_udp_headers,
-        );
         let mut num_retries = 0;
 
         while num_retries < MAX_NUMBER_OF_RETRIES {
-            if let Ok(packet) = tokio::time::timeout(timeout, read.clone()).await {
+            let read = BufferedRead::new(Arc::clone(&self.buffer));
+            if let Ok(packet) = tokio::time::timeout(timeout, read).await {
                 return Ok(packet);
+            }
+            num_retries += 1;
+
+            if num_retries >= MAX_NUMBER_OF_RETRIES {
+                break;
             }
 
             let jitter: u64 = rand::thread_rng().gen_range(0..=3);
-            let sleep_in_secs = 2_u64.pow(num_retries as u32) + jitter;
-            sleep(Duration::from_secs(sleep_in_secs)).await;
-
-            num_retries += 1;
+            let sleep_in_millis = (2_u64.pow(num_retries as u32) + jitter) * 100;
+            sleep(Duration::from_millis(sleep_in_millis)).await;
         }
 
-        eprintln!("Timed out read!");
+        // Reset file
+        self.reset_file().await;
+
         Err(BluefinError::ReadError(
             "Failed to read a packet.".to_string(),
         ))
     }
 
-    pub(crate) async fn read_with_id(&mut self, id: String) -> Result<Packet> {
-        self.read_impl(Some(id), None).await
-    }
-
     pub(crate) async fn read_with_timeout(&mut self, duration: Duration) -> Result<Packet> {
-        self.read_impl(None, Some(duration)).await
+        self.read_impl(Some(duration)).await
     }
 
-    pub(crate) async fn read_with_id_and_timeout(
-        &mut self,
-        id: String,
-        duration: Duration,
-    ) -> Result<Packet> {
-        self.read_impl(Some(id), Some(duration)).await
-    }
-
-    /// Default read future. This reads any buffered content at the default id `<other>_<this>` and
-    /// times out after 3 seconds.
-    pub(crate) async fn read_v2(&mut self) -> Result<Packet> {
-        self.read_impl(None, None).await
-    }
-
-    /// read has a built in timeout of 10 sec. If the future does not yield a
-    /// result in thie timeout period, then this function returns an error.
-    /// Otherwise, the exact read contents are stored in the conn.bytes_in.
-    ///
-    /// Returns an offset and size pair
-    pub(crate) async fn read(&mut self, buf: &mut [u8]) -> io::Result<(usize, usize)> {
-        let mut file = (*self.file).lock().unwrap();
-        let mut size = timeout(self.timeout, file.read(buf)).await??;
-        drop(file);
-
-        // If I don't need to worry about ip/udp headers then I'm using a UDP socket. This means
-        // that I'm just getting the Bluefin packet. Easy.
-        if !self.need_ip_udp_headers {
-            return Ok((0, size));
-        }
-
-        // Else, I need to worry about the additional ip + udp headers. Let's strip them and
-        // return.
-        let ip_packet = PacketHeaders::from_ip_slice(&buf[4..]).unwrap();
-        let ip_header_len = ip_packet.ip.unwrap().header_len();
-        let udp_header_len = ip_packet.transport.unwrap().udp().unwrap().header_len();
-
-        let offset = 4 + ip_header_len + udp_header_len;
-        size -= offset;
-
-        Ok((offset, size))
+    pub(crate) async fn read_with_id_and_timeout(&mut self, duration: Duration) -> Result<Packet> {
+        self.read_impl(Some(duration)).await
     }
 
     pub(crate) async fn write_error_message(&mut self, err_msg: &[u8]) -> io::Result<()> {
@@ -323,22 +251,14 @@ impl Connection {
 
         let bytes_out = self.bytes_out.as_ref().unwrap();
 
-        let mut file = (*self.file).lock().unwrap();
-
         // No need to pre-build; just flush buffer
         if !self.need_ip_udp_headers {
-            let ans = file.write_all(bytes_out).await;
-            return ans;
+            return self.file.write_all(bytes_out).await;
         }
 
         let packet_builder =
             PacketBuilder::ipv4(self.source_ip.unwrap(), self.destination_ip.unwrap(), 20)
                 .udp(self.source_port.unwrap(), self.destination_port.unwrap());
-        eprintln!(
-            "dst: {:?}:{}",
-            self.destination_ip.unwrap(),
-            self.destination_port.unwrap()
-        );
 
         let mut tun_tap_bytes = vec![0, 0, 0, 2];
         let mut writer = Vec::<u8>::with_capacity(packet_builder.size(bytes_out.capacity()));
@@ -346,7 +266,12 @@ impl Connection {
         tun_tap_bytes.append(&mut writer);
 
         self.bytes_out = None;
-        timeout(Duration::from_secs(5), file.write_all(&tun_tap_bytes)).await?
+        match timeout(Duration::from_secs(3), self.file.write_all(&tun_tap_bytes)).await? {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e),
+        }
+
+        // timeout(Duration::from_secs(5), file.write_all(&tun_tap_bytes)).await?
     }
 
     pub(crate) fn get_packet(&self, payload: Option<Vec<u8>>) -> BluefinPacket {

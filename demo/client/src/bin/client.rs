@@ -5,7 +5,7 @@ use rand::Rng;
 use bluefin::hosts::client::BluefinClient;
 use tokio::time::sleep;
 
-const NUMBER_OF_CONNECTIONS: usize = 5;
+const NUMBER_OF_CONNECTIONS: usize = 50;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -15,22 +15,22 @@ async fn main() -> std::io::Result<()> {
         .build();
 
     let port = rand::thread_rng().gen_range(10000..50000);
+    let other_port = rand::thread_rng().gen_range(10000..50000);
     eprintln!("0.0.0.0:{}", port);
-    client
-        .bind("0.0.0.0", port)
-        .expect("Failed to bind client socket");
+    let _ = client.bind("0.0.0.0", port);
 
     for i in 0..NUMBER_OF_CONNECTIONS {
         eprintln!();
-        let other_port = rand::thread_rng().gen_range(10000..50000);
-        let conn = client
-            .connect("192.168.55.2", other_port)
-            .await
-            .expect("Failed to connect to host");
+        let conn_res = client.connect("192.168.55.2", other_port).await;
         tokio::spawn(async move {
-            eprintln!("{i}: {conn}");
+            match conn_res {
+                Ok(conn) => {
+                    eprintln!("{i}: {conn}");
+                }
+                Err(e) => eprintln!("{i}: {e}"),
+            }
         });
-        sleep(Duration::from_secs(1)).await;
+        sleep(Duration::from_millis(250)).await;
     }
 
     Ok(())

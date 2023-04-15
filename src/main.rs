@@ -9,7 +9,6 @@ async fn main() {
         .build();
 
     loop {
-        eprintln!("\n>>> Loop begins");
         let conn_res = pack_leader.accept().await;
         tokio::spawn(async move {
             if let Ok(conn) = conn_res {

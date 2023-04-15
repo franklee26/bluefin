@@ -48,7 +48,7 @@ impl AcceptWorker {
     /// were able to wake up an accept then our job is done and we can exit.
     pub(crate) async fn run(&self) {
         for _ in 0..self.max_number_tries {
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_secs(2)).await;
 
             // Lock acquired
             let mut manager = self.manager.lock().await;

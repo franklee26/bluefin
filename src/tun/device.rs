@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::IntoRawFd;
 use std::process::Command;
 use tun::platform::Device;
-use tun_tap::{Iface, Mode};
+use tun_tap::Iface;
 
 // This only exists because it's a pain to work with tun/tap devices
 // on Mac OS

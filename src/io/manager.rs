@@ -104,7 +104,12 @@ impl ConnectionManager {
         Ok(())
     }
 
-    pub(crate) fn buffer_unhandled_client_hello(&mut self, packet: Packet) -> Result<()> {
+    /// Buffers in an unhandled client hello `packet`. This happens when we receive a client-hello
+    /// but we can't find any pending `Accept` requests in `accept_buffer_map`. We store this for
+    /// later use incase another `Accept` request comes and can potentially pick up this unhandled
+    /// packet. In order to avoid burdening memory, we only buffer a limited number of these packets.
+    /// TODO: Add TTL for these packets
+    fn buffer_unhandled_client_hello(&mut self, packet: Packet) -> Result<()> {
         if self.unhandled_client_hellos.len() >= MAX_UNHANDLED_NEW_CONNECTION_REQ {
             return Err(BluefinError::BufferFullError);
         }

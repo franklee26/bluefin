@@ -11,7 +11,7 @@ use crate::core::packet::Packet;
 use super::manager::ConnectionBuffer;
 
 pub struct BufferedRead {
-    /// Unique id per buffered read request
+    /// Unique id per buffered read request, mostly used for debugging purposes
     id: u32,
     /// This connection's buffer
     buffer: Arc<Mutex<ConnectionBuffer>>,

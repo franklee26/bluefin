@@ -1,5 +1,5 @@
 use std::{
-    io::{self, ErrorKind},
+    io::{self},
     net::UdpSocket,
     os::fd::{AsRawFd, FromRawFd},
     sync::Arc,
@@ -12,12 +12,14 @@ use tokio::fs::File;
 use crate::{
     core::{
         context::{BluefinHost, State},
+        error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
         packet::BluefinPacket,
         serialisable::Serialisable,
     },
+    handshake::handshake::HandshakeHandler,
     io::{
-        manager::{ConnectionBuffer, ConnectionManager},
+        manager::{ConnectionBuffer, ConnectionManager, Result},
         read::ReadWorker,
     },
     network::connection::Connection,
@@ -74,12 +76,9 @@ impl BluefinClient {
     /// This function builds a Bluefin handshake packet and asynchronously begins
     /// the handshake with the pack-leader. If the handshake completes successfully
     /// then an `Connection` struct is returned.
-    pub async fn connect(&mut self, address: &str, port: i32) -> io::Result<Connection> {
+    pub async fn connect(&mut self, address: &str, port: i32) -> Result<Connection> {
         if self.socket.is_none() {
-            return Err(io::Error::new(
-                ErrorKind::Other,
-                "No socket found. Ensure that client is binded to address.",
-            ));
+            return Err(BluefinError::InvalidSocketError);
         }
 
         if !self.established_udp_connection {
@@ -150,7 +149,7 @@ impl BluefinClient {
         // Generate and send client-hello
         let client_hello = self.get_client_hello_packet(conn.source_id, packet_number);
         conn.set_bytes_out(client_hello.serialise());
-        conn.write().await;
+        conn.write().await?;
 
         // Wait for pack-leader response. (This read will delete our first-read entry). Be generous with this read.
         let packet = conn
@@ -162,6 +161,7 @@ impl BluefinClient {
             packet.payload.header.source_connection_id,
             packet.payload.header.destination_connection_id
         );
+        conn.dest_id = packet.payload.header.source_connection_id;
 
         // register our 'real' connection
         // Lock acquired
@@ -171,16 +171,8 @@ impl BluefinClient {
         }
         // Lock released
 
-        // Finally, send the hello-client handshake
-        // if let Err(handshake_err) = bluefin_handshake_handle(&mut conn).await {
-        //     return Err(io::Error::new(
-        //         ErrorKind::NotConnected,
-        //         format!(
-        //             "Failed to complete handshake with pack-leader: {}",
-        //             handshake_err
-        //         ),
-        //     ));
-        // }
+        let mut handshake_handler = HandshakeHandler::new(&mut conn, packet, BluefinHost::Client);
+        handshake_handler.handle().await?;
 
         conn.context.state = State::Ready;
 

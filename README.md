@@ -19,19 +19,19 @@ async fn main() {
         .name("utun3".to_string())
         .bind_address("192.168.55.2".to_string())
         .netmask("255.255.255.0".to_string())
-        .source_id(0x01030108)
         .build();
 
     loop {
-        let mut buf = vec![0; 1504];
-        let connection_res = pack_leader.accept(&mut buf).await;
+        let connection_res = pack_leader.accept().await;
 
         tokio::spawn(async move {
             match connection_res {
-                Ok(mut conn) => conn.process().await,
+                Ok(conn) => println!("Conn ready! {conn})"),
                 Err(err) => eprintln!("\nConnection attempt failed: {:?}", err),
             }
         });
+
+        sleep(Duration::from_secs(1)).await;
     }
 }
 ```
@@ -41,7 +41,6 @@ async fn main() {
 async fn main() -> std::io::Result<()> {
     let mut client = BluefinClient::builder()
         .name("test_client".to_string())
-        .source_id(0x01020304)
         .build();
 
     let port = rand::thread_rng().gen_range(10000..50000);
@@ -53,6 +52,7 @@ async fn main() -> std::io::Result<()> {
         .await
         .expect("Failed to connect to host");
 
+    eprintln!("Conn ready! {conn}");
     Ok(())
 }
 ```

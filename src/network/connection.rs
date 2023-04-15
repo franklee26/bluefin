@@ -1,6 +1,5 @@
 use std::{
     fmt::{self, Debug},
-    io::{self, ErrorKind},
     sync::Arc,
     time::Duration,
 };
@@ -22,7 +21,6 @@ use crate::{
         error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
         packet::{BluefinPacket, Packet},
-        serialisable::Serialisable,
     },
     io::{
         buffered_read::BufferedRead,
@@ -31,7 +29,7 @@ use crate::{
 };
 
 const MAX_NUM_OPEN_STREAMS: usize = 10;
-const MAX_NUMBER_OF_RETRIES: usize = 1;
+const MAX_NUMBER_OF_RETRIES: usize = 2;
 
 /// A Bluefin `Connection`. This struct represents an established Bluefin connection
 /// and keeps track of the state of the connection, input/output buffers and other
@@ -228,32 +226,19 @@ impl Connection {
         self.read_impl(Some(duration)).await
     }
 
-    pub(crate) async fn write_error_message(&mut self, err_msg: &[u8]) -> io::Result<()> {
-        // TODO: I don't know why I need to try_clone. Without this, the write() invocations
-        // is blocked and never completes.
-        let mut packet = self.get_packet(Some(err_msg.into()));
-        packet.header.type_and_type_specific_payload.packet_type = PacketType::Error;
-        self.context.state = State::Error;
-
-        self.set_bytes_out(packet.serialise());
-        self.write().await?;
-
-        Ok(())
-    }
-
-    pub(crate) async fn write(&mut self) -> io::Result<()> {
+    pub(crate) async fn write(&mut self) -> Result<()> {
         if self.bytes_out.is_none() {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "Can't write zero bytes",
-            ));
+            return Err(BluefinError::BufferEmptyError);
         }
 
         let bytes_out = self.bytes_out.as_ref().unwrap();
 
         // No need to pre-build; just flush buffer
         if !self.need_ip_udp_headers {
-            return self.file.write_all(bytes_out).await;
+            match self.file.write_all(bytes_out).await {
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(BluefinError::WriteError(format!("Failed to write. {}", e))),
+            }
         }
 
         let packet_builder =
@@ -266,12 +251,16 @@ impl Connection {
         tun_tap_bytes.append(&mut writer);
 
         self.bytes_out = None;
-        match timeout(Duration::from_secs(3), self.file.write_all(&tun_tap_bytes)).await? {
-            Ok(()) => Ok(()),
-            Err(e) => Err(e),
+        let wrapped = timeout(Duration::from_secs(3), self.file.write_all(&tun_tap_bytes)).await;
+        if let Err(e) = wrapped {
+            return Err(BluefinError::WriteError(format!("Failed to write. {}", e)));
         }
+        let timeout = wrapped.unwrap();
 
-        // timeout(Duration::from_secs(5), file.write_all(&tun_tap_bytes)).await?
+        match timeout {
+            Ok(()) => Ok(()),
+            Err(e) => Err(BluefinError::WriteError(format!("Failed to write. {}", e))),
+        }
     }
 
     pub(crate) fn get_packet(&self, payload: Option<Vec<u8>>) -> BluefinPacket {

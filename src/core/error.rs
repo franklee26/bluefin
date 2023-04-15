@@ -1,5 +1,3 @@
-use std::error;
-
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -48,4 +46,7 @@ pub enum BluefinError {
 
     #[error("No such waker.")]
     NoSuchWakerError,
+
+    #[error("Socket is not valid")]
+    InvalidSocketError,
 }

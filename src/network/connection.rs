@@ -228,12 +228,6 @@ impl Connection {
         self.read_impl(Some(duration)).await
     }
 
-    /// Default read future. This reads any buffered content at the default id `<other>_<this>` and
-    /// times out after 3 seconds.
-    pub(crate) async fn read_v2(&mut self) -> Result<Packet> {
-        self.read_impl(None).await
-    }
-
     pub(crate) async fn write_error_message(&mut self, err_msg: &[u8]) -> io::Result<()> {
         // TODO: I don't know why I need to try_clone. Without this, the write() invocations
         // is blocked and never completes.

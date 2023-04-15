@@ -111,6 +111,11 @@ impl Serialisable for BluefinPacket {
     where
         Self: Sized,
     {
+        if bytes.len() < 20 {
+            return Err(BluefinError::DeserialiseError(
+                "Cannot deserialise into Bluefin packet with less than 20 bytes".to_string(),
+            ));
+        }
         // Header is 20 bytes
         let header = BluefinHeader::deserialise(&bytes[..20])?;
         let payload = bytes[20..].to_vec();

@@ -1,31 +1,39 @@
 use std::{
-    io::{self, ErrorKind, Read},
+    io::{self, ErrorKind},
     os::fd::FromRawFd,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use crate::{
     core::{
-        context::State, error::BluefinError, packet::BluefinPacket, serialisable::Serialisable,
+        context::{BluefinHost, State},
+        error::BluefinError,
+        packet::BluefinPacket,
+        serialisable::Serialisable,
     },
     handshake::handshake::bluefin_handshake_handle,
     io::{
+        buffered_read::BufferedRead,
         manager::{ConnectionManager, Result},
-        read::Accept,
+        read::{AcceptWorker, ReadWorker},
     },
     network::connection::Connection,
     tun::device::BluefinDevice,
+    utils::common::build_connection_from_packet,
 };
 use etherparse::{Ipv4Header, PacketHeaders};
 use rand::Rng;
 use tokio::fs::File;
 
+const NUMBER_OF_WORKER_THREADS: usize = 2;
+
 pub struct BluefinPackLeader {
     num_connections: usize,
-    file: Arc<Mutex<File>>,
+    file: File,
     fd: i32,
     name: String,
-    manager: Arc<Mutex<ConnectionManager>>,
+    manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    spawned_read_thread: bool,
 }
 
 impl BluefinPackLeader {
@@ -72,8 +80,7 @@ impl BluefinPackLeaderBuilder {
             .build();
 
         let fd = device.get_raw_fd();
-        let raw_file = unsafe { File::from_raw_fd(fd) };
-        let file = Arc::new(Mutex::new(raw_file));
+        let file = unsafe { File::from_raw_fd(fd) };
 
         let manager = ConnectionManager::new();
 
@@ -81,8 +88,9 @@ impl BluefinPackLeaderBuilder {
             num_connections: 0,
             fd,
             file,
-            manager: Arc::new(Mutex::new(manager)),
+            manager: Arc::new(tokio::sync::Mutex::new(manager)),
             name,
+            spawned_read_thread: false,
         }
     }
 }
@@ -110,55 +118,67 @@ impl BluefinPackLeader {
         Ok(())
     }
 
-    /// Pack-leader accepts a bluefin connection request. This function reads in the client
-    /// request then parses and validates the packet contents. If the packet is correctly
-    /// constructed then the pack-leader responds with a pack-leader-hello handshake response
-    /// and continues the handshake.
-    ///
-    /// Once the handshake is completed is a Connection struct returned. This process is
-    /// asynchronous.
-    /*
-    pub async fn accept(&mut self, buf: &mut [u8]) -> io::Result<Connection> {
-        // Notice that this `read` does not timeout... we keep waiting until we receive a request
-        let num_bytes_read = self.raw_file.read(buf).await?;
-
-        let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-
-        // Build new connection handle
-        let mut connection = Connection::new(
-            id.clone(),
-            self.source_id,
-            self.fd,
-            BluefinHost::PackLeader,
-            Duration::from_secs(10),
-        );
-
-        // Parse and validate ip, udp and finally bluefin packets. Proceed with handshake.
-        self.parse_and_set_header_info(&mut connection, &buf[..num_bytes_read])
-            .await?;
-
-        // Update connection count
-        self.num_connections += 1;
-        connection.context.state = State::Ready;
-
-        Ok(connection)
-    }
-    */
-
     /// Pack-leader accepts a bluefin connection request. This function return an `Accept` future
     /// which asynchronously reads incoming bytes. Upon a valid bluefin handshake request packet,
     /// and successful handshake completion, the future registers and creates a `Connection` instance.
     pub async fn accept(&mut self) -> Result<Connection> {
         // Receive initial connection status
         let source_id: u32 = rand::thread_rng().gen();
-        let mut conn = Accept::new(
+
+        // Spawn some read worker threads
+        if !self.spawned_read_thread {
+            for _ in 0..NUMBER_OF_WORKER_THREADS {
+                let mut worker = ReadWorker::new(
+                    Arc::clone(&self.manager),
+                    self.file.try_clone().await.unwrap(),
+                    true,
+                    BluefinHost::PackLeader,
+                );
+
+                tokio::spawn(async move {
+                    worker.run().await;
+                });
+            }
+
+            self.spawned_read_thread = true;
+        }
+
+        // Spawn an Accept helper
+        let accept_worker = AcceptWorker::new(Arc::clone(&self.manager));
+        let accept_worker_join_handle = tokio::spawn(async move {
+            accept_worker.run().await;
+        });
+
+        let key = format!("0_{}", source_id);
+
+        // Lock acquired
+        let buffer = {
+            let mut manager = self.manager.lock().await;
+            manager.register_new_accept_connection(&key)
+        };
+        // Lock released
+
+        let read = BufferedRead::new(Arc::clone(&buffer));
+        let packet = read.await;
+
+        // Abort the accept worker thread, we already found a packet!
+        accept_worker_join_handle.abort();
+        let mut conn = build_connection_from_packet(
+            &packet,
             source_id,
-            Arc::clone(&self.file),
-            Arc::clone(&self.manager),
+            BluefinHost::PackLeader,
             true,
-        )
-        .await;
-        eprintln!("So far built: {conn}");
+            Arc::clone(&buffer),
+            self.file.try_clone().await.unwrap(),
+        );
+
+        // Lock acquired
+        {
+            let mut manager = self.manager.lock().await;
+            // generate new entry (no need to delete old entry, handled by worker job)
+            manager.register_new_connection(&key, Arc::clone(&buffer));
+        }
+        // Lock released
 
         bluefin_handshake_handle(&mut conn).await?;
 

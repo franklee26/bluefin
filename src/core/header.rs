@@ -229,7 +229,7 @@ pub struct BluefinHeader {
     /// desination_connection_id is 32 bits
     pub destination_connection_id: u32,
     /// packet_number is 64 bits
-    pub packet_number: i64,
+    pub packet_number: u64,
 }
 
 impl BluefinHeader {
@@ -249,7 +249,7 @@ impl BluefinHeader {
         }
     }
 
-    pub fn with_packet_number(&mut self, packet_number: i64) {
+    pub fn with_packet_number(&mut self, packet_number: u64) {
         self.packet_number = packet_number;
     }
 }
@@ -289,7 +289,7 @@ impl Serialisable for BluefinHeader {
                     .try_into()
                     .expect("destination connection id should be 4 bytes"),
             ),
-            packet_number: i64::from_be_bytes(
+            packet_number: u64::from_be_bytes(
                 bytes[12..20]
                     .try_into()
                     .expect("packet number should be 8 bytes"),

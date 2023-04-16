@@ -29,7 +29,6 @@ use crate::{
 };
 
 const MAX_NUM_OPEN_STREAMS: usize = 10;
-const MAX_NUMBER_OF_RETRIES: usize = 2;
 
 /// A Bluefin `Connection`. This struct represents an established Bluefin connection
 /// and keeps track of the state of the connection, input/output buffers and other
@@ -44,7 +43,6 @@ pub struct Connection {
     pub source_id: u32,
     pub dest_id: u32,
     pub num_streams: usize,
-    timeout: Duration,
     pub(crate) source_ip: Option<[u8; 4]>,
     pub(crate) destination_ip: Option<[u8; 4]>,
     pub(crate) source_port: Option<u16>,
@@ -78,7 +76,7 @@ impl Connection {
     /// TODO: we might need to be stricter with this and return a Result<> instead
     pub(crate) fn new(
         dest_id: u32,
-        packet_number: i64,
+        packet_number: u64,
         source_ip: [u8; 4],
         source_port: u16,
         destination_ip: [u8; 4],
@@ -97,7 +95,6 @@ impl Connection {
             source_id,
             dest_id,
             num_streams: 0,
-            timeout: Duration::from_secs(10),
             source_ip: Some(source_ip),
             destination_ip: Some(destination_ip),
             source_port: Some(source_port),
@@ -184,6 +181,34 @@ impl Connection {
         self.file = self.file.try_clone().await.unwrap();
     }
 
+    /// Identical to `read` but with a specified timeout `duration`
+    pub async fn read_with_timeout(&mut self, duration: Duration) -> Result<Packet> {
+        self.read_impl(Some(duration), None).await
+    }
+
+    /// Identical to `read` but with a specified timeout `duration` and an `max_number_of_tries` retries
+    pub async fn read_with_timeout_and_retries(
+        &mut self,
+        duration: Duration,
+        max_number_of_tries: usize,
+    ) -> Result<Packet> {
+        self.read_impl(Some(duration), Some(max_number_of_tries))
+            .await
+    }
+
+    /// Default `Connection`-based read (as opposed to stream reads). This tries to read from the
+    /// connection buffer with a default timeout duration of 3 seconds and a max of two total
+    /// tries. Note that this read should only really be used for handshake and error communications
+    /// between hosts. While data transfer is allowed with direct connections, it is recommended
+    /// to use `Stream`-based reads instead.
+    ///
+    /// Note that this invocation is blocking as it accesses the `connection_manager`, which is
+    /// shared across all connection's per device. This is why `Stream` reads are recommended; they
+    /// are less blocking than this as this can block the `accept()` process.
+    pub async fn read(&mut self) -> Result<Packet> {
+        self.read_impl(None, None).await
+    }
+
     async fn read_impl(
         &mut self,
         timeout: Option<Duration>,
@@ -202,20 +227,9 @@ impl Connection {
         ))
     }
 
-    pub(crate) async fn read_with_timeout(&mut self, duration: Duration) -> Result<Packet> {
-        self.read_impl(Some(duration), None).await
-    }
-
-    pub(crate) async fn read_with_timeout_and_retries(
-        &mut self,
-        duration: Duration,
-        max_number_of_tries: usize,
-    ) -> Result<Packet> {
-        self.read_impl(Some(duration), Some(max_number_of_tries))
-            .await
-    }
-
-    pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+    /// `Connection`-based writes. Unlike `Connection`-reads, this call is not blocking. This writes in the
+    /// `bytes` + any required udp + IP headers to the wire. The invoker will need to prepare the Bluefin headers.
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
         // No need to pre-build; just flush buffer
         if !self.need_ip_udp_headers {
             match self.file.write_all(bytes).await {
@@ -245,7 +259,8 @@ impl Connection {
         }
     }
 
-    pub(crate) fn get_packet(&self, payload: Option<Vec<u8>>) -> BluefinPacket {
+    /// Helper to build a `BluefinPacket` along with an optional data `payload`.
+    pub fn get_packet(&self, payload: Option<Vec<u8>>) -> BluefinPacket {
         let packet_type = match self.context.state {
             State::Handshake => PacketType::UnencryptedHandshake,
             State::Error => PacketType::Error,

@@ -5,7 +5,7 @@ use rand::Rng;
 use bluefin::hosts::client::BluefinClient;
 use tokio::time::sleep;
 
-const NUMBER_OF_CONNECTIONS: usize = 10;
+const NUMBER_OF_CONNECTIONS: usize = 5;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -24,8 +24,14 @@ async fn main() -> std::io::Result<()> {
         let conn_res = client.connect("192.168.55.2", other_port).await;
         tokio::spawn(async move {
             match conn_res {
-                Ok(conn) => {
+                Ok(mut conn) => {
                     eprintln!("{i}: {conn}");
+                    let res = conn.read().await;
+                    if let Ok(packet) = res {
+                        let payload = packet.payload.payload;
+                        let str = std::str::from_utf8(&payload).unwrap();
+                        eprintln!("Received: {:?}", str);
+                    }
                 }
                 Err(e) => eprintln!("{i}: {e}"),
             }

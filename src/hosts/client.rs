@@ -11,7 +11,7 @@ use tokio::fs::File;
 
 use crate::{
     core::{
-        context::{BluefinHost, State},
+        context::BluefinHost,
         error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
         packet::BluefinPacket,
@@ -28,7 +28,6 @@ use crate::{
 #[derive(Debug)]
 pub struct BluefinClient {
     name: String,
-    timeout: Duration,
     socket: Option<UdpSocket>,
     src_ip: Option<String>,
     src_port: Option<i32>,
@@ -40,15 +39,11 @@ pub struct BluefinClient {
 
 pub struct BluefinClientBuilder {
     name: Option<String>,
-    timeout: Option<Duration>,
 }
 
 impl BluefinClient {
     pub fn builder() -> BluefinClientBuilder {
-        BluefinClientBuilder {
-            name: None,
-            timeout: None,
-        }
+        BluefinClientBuilder { name: None }
     }
 
     /// Creates and binds a UDP socket to `address:port`
@@ -173,8 +168,6 @@ impl BluefinClient {
         let mut handshake_handler = HandshakeHandler::new(&mut conn, packet, BluefinHost::Client);
         handshake_handler.handle().await?;
 
-        conn.context.state = State::Ready;
-
         Ok(conn)
     }
 }
@@ -185,16 +178,10 @@ impl BluefinClientBuilder {
         self
     }
 
-    pub fn timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
     pub fn build(&mut self) -> BluefinClient {
         let manager = ConnectionManager::new();
         BluefinClient {
             name: self.name.clone().unwrap(),
-            timeout: self.timeout.unwrap_or(Duration::from_secs(10)),
             src_ip: None,
             src_port: None,
             manager: Arc::new(tokio::sync::Mutex::new(manager)),

@@ -11,7 +11,6 @@ const NUMBER_OF_CONNECTIONS: usize = 5;
 async fn main() -> std::io::Result<()> {
     let mut client = BluefinClient::builder()
         .name("test_client".to_string())
-        .timeout(Duration::from_secs(30))
         .build();
 
     let port = rand::thread_rng().gen_range(10000..50000);

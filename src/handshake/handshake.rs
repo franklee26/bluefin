@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{
     core::{
-        context::BluefinHost,
+        context::{BluefinHost, State},
         error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
         packet::{BluefinPacket, Packet},
@@ -95,10 +95,10 @@ impl<'a> HandshakeHandler<'a> {
     ///     * Client has sent client-hello
     ///     * Pack-leader has sent it's response back to client
     ///
-    /// This function parses the incoming pack-leader-hello and performs validation. This is
-    /// almost identical to the `validate` function in `Packet.rs` except we need to set
-    /// connection's destination id (we did not know this value yet until the pack-leader has
-    /// responded back with it's pack-leader-hello).
+    /// This function parses the incoming pack-leader-hello and performs validation. If the incoming packet
+    /// is valid then the connection context is updated and the client finally responds with its
+    /// client-ack. As for the client, the handshake is established and the connection will go into
+    /// ready state.
     async fn bluefin_client_handshake_handler(&mut self) -> Result<()> {
         // Just get the header; as usual, we don't care about the payload during this part of the handshake
         let header = self.incoming_packet.payload.header;
@@ -137,6 +137,9 @@ impl<'a> HandshakeHandler<'a> {
                 "Could not sent pack-leader the client-ack.".to_string(),
             ));
         }
+
+        self.conn.context.state = State::Ready;
+
         Ok(())
     }
 }

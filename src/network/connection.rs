@@ -23,7 +23,7 @@ use crate::{
         packet::{BluefinPacket, Packet},
     },
     io::{
-        buffered_read::BufferedRead,
+        buffered_read::{self, BufferedRead},
         manager::{ConnectionBuffer, Result},
     },
 };
@@ -45,7 +45,6 @@ pub struct Connection {
     pub dest_id: u32,
     pub num_streams: usize,
     timeout: Duration,
-    pub(crate) bytes_out: Option<Vec<u8>>,
     pub(crate) source_ip: Option<[u8; 4]>,
     pub(crate) destination_ip: Option<[u8; 4]>,
     pub(crate) source_port: Option<u16>,
@@ -99,7 +98,6 @@ impl Connection {
             dest_id,
             num_streams: 0,
             timeout: Duration::from_secs(10),
-            bytes_out: None,
             source_ip: Some(source_ip),
             destination_ip: Some(destination_ip),
             source_port: Some(source_port),
@@ -178,10 +176,6 @@ impl Connection {
     }
     */
 
-    pub(crate) fn set_bytes_out(&mut self, bytes_out: Vec<u8>) {
-        self.bytes_out = Some(bytes_out);
-    }
-
     pub(crate) fn need_ip_udp_headers(&mut self, need_ip_udp_headers: bool) {
         self.need_ip_udp_headers = need_ip_udp_headers;
     }
@@ -190,24 +184,14 @@ impl Connection {
         self.file = self.file.try_clone().await.unwrap();
     }
 
-    async fn read_impl(&mut self, timeout: Option<Duration>) -> Result<Packet> {
-        let timeout = timeout.unwrap_or(Duration::from_secs(3));
-        let mut num_retries = 0;
-
-        while num_retries < MAX_NUMBER_OF_RETRIES {
-            let read = BufferedRead::new(Arc::clone(&self.buffer));
-            if let Ok(packet) = tokio::time::timeout(timeout, read).await {
-                return Ok(packet);
-            }
-            num_retries += 1;
-
-            if num_retries >= MAX_NUMBER_OF_RETRIES {
-                break;
-            }
-
-            let jitter: u64 = rand::thread_rng().gen_range(0..=3);
-            let sleep_in_millis = (2_u64.pow(num_retries as u32) + jitter) * 100;
-            sleep(Duration::from_millis(sleep_in_millis)).await;
+    async fn read_impl(
+        &mut self,
+        timeout: Option<Duration>,
+        max_number_of_tries: Option<usize>,
+    ) -> Result<Packet> {
+        let buffered_read = BufferedRead::new(Arc::clone(&self.buffer));
+        if let Some(packet) = buffered_read.read(timeout, max_number_of_tries).await {
+            return Ok(packet);
         }
 
         // Reset file
@@ -219,23 +203,22 @@ impl Connection {
     }
 
     pub(crate) async fn read_with_timeout(&mut self, duration: Duration) -> Result<Packet> {
-        self.read_impl(Some(duration)).await
+        self.read_impl(Some(duration), None).await
     }
 
-    pub(crate) async fn read_with_id_and_timeout(&mut self, duration: Duration) -> Result<Packet> {
-        self.read_impl(Some(duration)).await
+    pub(crate) async fn read_with_timeout_and_retries(
+        &mut self,
+        duration: Duration,
+        max_number_of_tries: usize,
+    ) -> Result<Packet> {
+        self.read_impl(Some(duration), Some(max_number_of_tries))
+            .await
     }
 
-    pub(crate) async fn write(&mut self) -> Result<()> {
-        if self.bytes_out.is_none() {
-            return Err(BluefinError::BufferEmptyError);
-        }
-
-        let bytes_out = self.bytes_out.as_ref().unwrap();
-
+    pub(crate) async fn write(&mut self, bytes: &[u8]) -> Result<()> {
         // No need to pre-build; just flush buffer
         if !self.need_ip_udp_headers {
-            match self.file.write_all(bytes_out).await {
+            match self.file.write_all(bytes).await {
                 Ok(_) => return Ok(()),
                 Err(e) => return Err(BluefinError::WriteError(format!("Failed to write. {}", e))),
             }
@@ -246,11 +229,10 @@ impl Connection {
                 .udp(self.source_port.unwrap(), self.destination_port.unwrap());
 
         let mut tun_tap_bytes = vec![0, 0, 0, 2];
-        let mut writer = Vec::<u8>::with_capacity(packet_builder.size(bytes_out.capacity()));
-        let _ = packet_builder.write(&mut writer, &bytes_out);
+        let mut writer = Vec::<u8>::with_capacity(packet_builder.size(bytes.len()));
+        let _ = packet_builder.write(&mut writer, &bytes);
         tun_tap_bytes.append(&mut writer);
 
-        self.bytes_out = None;
         let wrapped = timeout(Duration::from_secs(3), self.file.write_all(&tun_tap_bytes)).await;
         if let Err(e) = wrapped {
             return Err(BluefinError::WriteError(format!("Failed to write. {}", e)));

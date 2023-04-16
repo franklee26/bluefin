@@ -69,9 +69,8 @@ impl<'a> HandshakeHandler<'a> {
 
         // Build and send packet
         let packet = BluefinPacket::builder().header(header).build();
-        self.conn.set_bytes_out(packet.serialise());
 
-        if let Err(respond_err) = self.conn.write().await {
+        if let Err(respond_err) = self.conn.write(&packet.serialise()).await {
             return Err(BluefinError::HandshakeError(format!(
                 "Failed to send pack-leader response to client: {}",
                 respond_err
@@ -79,7 +78,11 @@ impl<'a> HandshakeHandler<'a> {
         }
 
         // Read and validate client-ack. Let's keep this short so that we don't keep blocking the `Accept` thread
-        if let Err(e) = self.conn.read_with_timeout(Duration::from_secs(2)).await {
+        if let Err(e) = self
+            .conn
+            .read_with_timeout_and_retries(Duration::from_secs(2), 2)
+            .await
+        {
             eprintln!("Failed to read client ack.");
             return Err(e);
         }
@@ -128,9 +131,8 @@ impl<'a> HandshakeHandler<'a> {
         self.conn.dest_id = dest_id;
         // Validated the pack-leader's response. Ack-back.
         let ack_packet = self.conn.get_packet(None).serialise();
-        self.conn.set_bytes_out(ack_packet);
 
-        if let Err(_) = self.conn.write().await {
+        if let Err(_) = self.conn.write(&ack_packet).await {
             return Err(BluefinError::HandshakeError(
                 "Could not sent pack-leader the client-ack.".to_string(),
             ));

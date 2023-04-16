@@ -1,4 +1,4 @@
-use bluefin::hosts::pack_leader::BluefinPackLeader;
+use bluefin::{core::serialisable::Serialisable, hosts::pack_leader::BluefinPackLeader};
 
 #[tokio::main]
 async fn main() {
@@ -11,8 +11,12 @@ async fn main() {
     loop {
         let conn_res = pack_leader.accept().await;
         tokio::spawn(async move {
-            if let Ok(conn) = conn_res {
+            if let Ok(mut conn) = conn_res {
                 eprintln!("Received: {conn}");
+                let payload = format!("Hello {}, from {}!", conn.dest_id, conn.source_id);
+                let packet = conn.get_packet(Some(payload.as_bytes().into()));
+
+                let _ = conn.write(&packet.serialise()).await;
             }
         });
     }

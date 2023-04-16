@@ -29,11 +29,11 @@ pub struct BluefinPacketBuilder {
 /// and the deserialised bluefin packet
 #[derive(Clone, Debug)]
 pub struct Packet {
-    pub(crate) src_ip: [u8; 4],
-    pub(crate) dst_ip: [u8; 4],
-    pub(crate) src_port: u16,
-    pub(crate) dst_port: u16,
-    pub(crate) payload: BluefinPacket,
+    pub src_ip: [u8; 4],
+    pub dst_ip: [u8; 4],
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: BluefinPacket,
 }
 
 impl BluefinStreamPacket {

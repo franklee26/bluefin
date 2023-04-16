@@ -60,7 +60,7 @@ impl BluefinClient {
         Ok(())
     }
 
-    fn get_client_hello_packet(&self, src_id: u32, packet_number: i64) -> BluefinPacket {
+    fn get_client_hello_packet(&self, src_id: u32, packet_number: u64) -> BluefinPacket {
         let type_fields = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0x0);
         let security_fields = BluefinSecurityFields::new(true, 0b000_1111);
 
@@ -108,7 +108,7 @@ impl BluefinClient {
             self.spawned_read_threads = true;
         }
 
-        let packet_number = rand::thread_rng().gen();
+        let packet_number: u64 = rand::thread_rng().gen();
         let src_ip: Vec<u8> = self
             .src_ip
             .as_ref()

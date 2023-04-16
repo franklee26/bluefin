@@ -63,8 +63,9 @@ pub(crate) struct ConnectionManager {
 
     /// Serves the exact same purpose as `buffer_map` except it is intended for new `Accept` requests
     /// only. This makes it easy for us to find packets that should be directed to `BufferedReads`
-    /// awaiting the client-hello.
-    accept_buffer_map: HashMap<String, SyncConnBufferRef>,
+    /// awaiting the client-hello. Notice that the order of this is important; we want to handle
+    /// accept's in an FIFO mannger.
+    accept_buffer_queue: VecDeque<SyncConnBufferRef>,
 
     /// Buffers in client hello packets that couldn't be buffered in `accept_buffer_map` since there
     /// was no outstanding `Accept` requests.
@@ -75,7 +76,7 @@ impl ConnectionManager {
     pub(crate) fn new() -> Self {
         Self {
             buffer_map: HashMap::new(),
-            accept_buffer_map: HashMap::new(),
+            accept_buffer_queue: VecDeque::new(),
             unhandled_client_hellos: VecDeque::new(),
         }
     }
@@ -84,22 +85,19 @@ impl ConnectionManager {
     /// buffer we find
     pub(crate) fn try_to_wake_buffered_accept(&mut self) -> Result<()> {
         // Can't do anything if either of these buffers are empty
-        if self.accept_buffer_map.is_empty() || self.unhandled_client_hellos.is_empty() {
+        if self.accept_buffer_queue.is_empty() || self.unhandled_client_hellos.is_empty() {
             return Err(BluefinError::BufferEmptyError);
         }
 
         let packet = self.unhandled_client_hellos.pop_front().unwrap();
-        let cloned = self.accept_buffer_map.clone();
-        let (key, buf) = cloned.iter().next().unwrap();
+        let accept_buf = self.accept_buffer_queue.pop_front().unwrap();
 
-        let mut guard = buf.lock().unwrap();
+        let mut guard = accept_buf.lock().unwrap();
         guard.add_to_buffer(packet)?;
 
         if let Some(waker) = &guard.waker {
             waker.wake_by_ref();
         }
-
-        let _ = self.accept_buffer_map.remove(key);
 
         Ok(())
     }
@@ -132,9 +130,7 @@ impl ConnectionManager {
     pub(crate) fn register_new_accept_connection(&mut self, key: &str) -> SyncConnBufferRef {
         let buf = Arc::new(std::sync::Mutex::new(ConnectionBuffer::new()));
 
-        let _ = self
-            .accept_buffer_map
-            .insert(key.to_string(), Arc::clone(&buf));
+        self.accept_buffer_queue.push_back(Arc::clone(&buf));
 
         buf
     }
@@ -176,29 +172,35 @@ impl ConnectionManager {
     }
 
     /// Takes in a valid client-hello `packet` and tries to buffer it into the oldest entry in the
-    /// `accept_buffer_map`. If such an entry exists then we try to signal it's waker. Else, this
+    /// `accept_buffer_queue`. If such an entry exists then we try to signal it's waker. Else, this
     /// function errors.
     pub(crate) fn buffer_client_hello(&mut self, packet: Packet) -> Result<()> {
         // Can't buffer this!
-        if self.accept_buffer_map.is_empty() {
+        if self.accept_buffer_queue.is_empty() {
             return self.buffer_unhandled_client_hello(packet);
         }
 
-        for (key, val) in self.accept_buffer_map.clone().iter() {
-            let mut guard = val.lock().unwrap();
+        let mut winner_packet = packet.clone();
 
-            // buffer in packet
-            if let Ok(_) = guard.add_to_buffer(packet.clone()) {
-                // wake waker
-                if let Some(waker) = &guard.waker {
-                    waker.wake_by_ref();
-                }
+        // If there are already unhandled client-hello packets, then they should go first
+        if !self.unhandled_client_hellos.is_empty() {
+            winner_packet = self.unhandled_client_hellos.pop_front().unwrap();
 
-                // delete this entry
-                self.accept_buffer_map.remove(key);
+            // Buffer in this packet as unhandled
+            self.unhandled_client_hellos.push_back(packet);
+        }
 
-                return Ok(());
+        let first_buf = self.accept_buffer_queue.pop_front().unwrap();
+        let mut guard = first_buf.lock().unwrap();
+
+        // buffer in packet
+        if let Ok(_) = guard.add_to_buffer(winner_packet) {
+            // wake waker
+            if let Some(waker) = &guard.waker {
+                waker.wake_by_ref();
             }
+
+            return Ok(());
         }
 
         // TODO: return better error

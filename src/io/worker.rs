@@ -34,7 +34,7 @@ impl AcceptWorker {
     pub(crate) fn new(manager: Arc<tokio::sync::Mutex<ConnectionManager>>) -> Self {
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         // TODO: adjust the number more dynamically?
-        let max_number_tries = 10;
+        let max_number_tries = 15;
         Self {
             id,
             manager,
@@ -48,7 +48,9 @@ impl AcceptWorker {
     /// were able to wake up an accept then our job is done and we can exit.
     pub(crate) async fn run(&self) {
         for _ in 0..self.max_number_tries {
-            sleep(Duration::from_secs(2)).await;
+            // We need to keep this short. This job is racing against the `ReadWorker` we want to make sure
+            // that the unhandled client hello buffer gets cleaned quickly
+            sleep(Duration::from_secs(1)).await;
 
             // Lock acquired
             let mut manager = self.manager.lock().await;

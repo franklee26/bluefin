@@ -5,7 +5,7 @@ use rand::Rng;
 use bluefin::hosts::client::BluefinClient;
 use tokio::time::sleep;
 
-const NUMBER_OF_CONNECTIONS: usize = 5;
+const NUMBER_OF_CONNECTIONS: usize = 25;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -35,7 +35,8 @@ async fn main() -> std::io::Result<()> {
                 Err(e) => eprintln!("{i}: {e}"),
             }
         });
-        sleep(Duration::from_millis(250)).await;
+
+        sleep(Duration::from_millis(500)).await;
     }
 
     Ok(())

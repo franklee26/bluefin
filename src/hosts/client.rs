@@ -20,7 +20,7 @@ use crate::{
     handshake::handshake::HandshakeHandler,
     io::{
         manager::{ConnectionBuffer, ConnectionManager, Result},
-        read::ReadWorker,
+        worker::ReadWorker,
     },
     network::connection::Connection,
 };
@@ -148,12 +148,11 @@ impl BluefinClient {
 
         // Generate and send client-hello
         let client_hello = self.get_client_hello_packet(conn.source_id, packet_number);
-        conn.set_bytes_out(client_hello.serialise());
-        conn.write().await?;
+        conn.write(&client_hello.serialise()).await?;
 
         // Wait for pack-leader response. (This read will delete our first-read entry). Be generous with this read.
         let packet = conn
-            .read_with_id_and_timeout(Duration::from_secs(10))
+            .read_with_timeout_and_retries(Duration::from_secs(5), 3)
             .await
             .unwrap();
         let key = format!(

@@ -6,7 +6,7 @@ use crate::{
     io::{
         buffered_read::BufferedRead,
         manager::{ConnectionManager, Result},
-        read::{AcceptWorker, ReadWorker},
+        worker::{AcceptWorker, ReadWorker},
     },
     network::connection::Connection,
     tun::device::BluefinDevice,

@@ -80,33 +80,48 @@ impl BluefinPackLeaderBuilder {
 }
 
 impl BluefinPackLeader {
+    /// Spawns some reader-worker threads. These threads will only get spawned at first
+    /// invocation of `accept` and will run forever until the main thread has completed.
+    #[inline]
+    async fn spawn_read_threads(&mut self) {
+        if self.spawned_read_thread {
+            return;
+        }
+
+        for _ in 0..NUMBER_OF_WORKER_THREADS {
+            let mut worker = ReadWorker::new(
+                Arc::clone(&self.manager),
+                self.file.try_clone().await.unwrap(),
+                true,
+                BluefinHost::PackLeader,
+            );
+
+            tokio::spawn(async move {
+                worker.run().await;
+            });
+        }
+
+        self.spawned_read_thread = true;
+    }
+
+    /// Spawns a single `Accept`-helper worker. These workers are spawned once per `accept()` invocation
+    /// and have a finite lifetime; they check if there are any potential matches between an existing
+    /// unhandled client-hello and an pending `Accept` request.
+    #[inline]
+    fn spawn_accept_read_threads(&self) -> tokio::task::JoinHandle<()> {
+        // Spawn an Accept helper
+        let accept_worker = AcceptWorker::new(Arc::clone(&self.manager));
+        tokio::spawn(async move {
+            accept_worker.run().await;
+        })
+    }
+
     /// Pack-leader accepts a bluefin connection request. Upon first invocation, this function spawns
     /// a number of read thread workers. This function waits asynchronously for a client hello, registers
     /// the relevant connection buffers and completes the handshake.
     pub async fn accept(&mut self) -> Result<Connection> {
         // Spawn some read worker threads
-        if !self.spawned_read_thread {
-            for _ in 0..NUMBER_OF_WORKER_THREADS {
-                let mut worker = ReadWorker::new(
-                    Arc::clone(&self.manager),
-                    self.file.try_clone().await.unwrap(),
-                    true,
-                    BluefinHost::PackLeader,
-                );
-
-                tokio::spawn(async move {
-                    worker.run().await;
-                });
-            }
-
-            self.spawned_read_thread = true;
-        }
-
-        // Spawn an Accept helper
-        let accept_worker = AcceptWorker::new(Arc::clone(&self.manager));
-        let accept_worker_join_handle = tokio::spawn(async move {
-            accept_worker.run().await;
-        });
+        self.spawn_read_threads().await;
 
         // Generate source id
         let source_id: u32 = rand::thread_rng().gen();
@@ -119,12 +134,15 @@ impl BluefinPackLeader {
         };
         // Lock released
 
+        // Spawn accept-helper worker
+        let accept_worker_join_handle = self.spawn_accept_read_threads();
+
         // Await for client-hello
-        let read = BufferedRead::new(Arc::clone(&buffer));
-        let packet = read.await;
+        let packet = BufferedRead::new(Arc::clone(&buffer)).await;
 
         // Abort the accept worker thread, we already found a packet!
         accept_worker_join_handle.abort();
+
         let mut conn = build_connection_from_packet(
             &packet,
             source_id,

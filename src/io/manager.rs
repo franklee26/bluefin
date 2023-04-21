@@ -1,11 +1,13 @@
 use crate::core::error::BluefinError;
 use crate::core::packet::Packet;
+use crate::set_waker;
 use crate::utils::common::SyncConnBufferRef;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::task::Waker;
 
+use super::Buffer;
 use super::Result;
 
 /// Buffer at most 10 unhandled requests. Otherwise, we might get overburdended with
@@ -26,22 +28,27 @@ impl ConnectionBuffer {
             waker: None,
         }
     }
+}
+
+impl Buffer for ConnectionBuffer {
+    type BufferData = Packet;
+    type ConsumedData = Self::BufferData;
 
     /// Adds just the `packet` to the connection's buffer. If the buffer is
     /// full then an error is returned.
-    pub(crate) fn add_to_buffer(&mut self, packet: Packet) -> Result<()> {
+    fn add(&mut self, data: Self::BufferData) -> Result<()> {
         if self.packet.is_some() {
             return Err(BluefinError::BufferFullError);
         }
 
-        self.packet = Some(packet);
+        self.packet = Some(data);
         Ok(())
     }
 
     /// Consumes the buffer. If there is nothing in the buffer then nothing
     /// is returned. Otherwise the packet is yielded and the packet + waker
     /// are dropped from the buffer.
-    pub(crate) fn consume(&mut self) -> Option<Packet> {
+    fn consume(&mut self) -> Option<Self::ConsumedData> {
         self.waker = None;
 
         if self.packet.is_none() {
@@ -50,6 +57,8 @@ impl ConnectionBuffer {
 
         Some(self.packet.take().unwrap())
     }
+
+    set_waker!();
 }
 
 #[derive(Debug)]
@@ -92,7 +101,7 @@ impl ConnectionManager {
         let accept_buf = self.accept_buffer_queue.pop_front().unwrap();
 
         let mut guard = accept_buf.lock().unwrap();
-        guard.add_to_buffer(packet)?;
+        guard.add(packet)?;
 
         if let Some(waker) = &guard.waker {
             waker.wake_by_ref();
@@ -193,7 +202,7 @@ impl ConnectionManager {
         let mut guard = first_buf.lock().unwrap();
 
         // buffer in packet
-        if let Ok(_) = guard.add_to_buffer(winner_packet) {
+        if let Ok(_) = guard.add(winner_packet) {
             // wake waker
             if let Some(waker) = &guard.waker {
                 waker.wake_by_ref();

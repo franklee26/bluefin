@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, task::Waker};
 
-use crate::core::error::BluefinError;
+use crate::{core::error::BluefinError, set_waker};
 
-use super::Result;
+use super::{Buffer, Result};
 
 #[derive(Debug)]
 pub struct StreamBuffer {
@@ -15,10 +15,10 @@ pub struct StreamBuffer {
 /// Maximum 'window' or number of segments we can keep buffered.
 const MAXIMUM_WINDOW_SIZE: u64 = 100;
 
-/// Iterator for currently available, in-ordered buffered data stored in `StreamManagerEntry`
-pub struct Iter(Vec<StreamBuffer>);
+/// Iterator for consumed currently available, in-ordered buffered data stored in `StreamManagerEntry`
+pub struct ConsumedIter(Vec<StreamBuffer>);
 
-impl IntoIterator for Iter {
+impl IntoIterator for ConsumedIter {
     type Item = StreamBuffer;
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
@@ -34,6 +34,8 @@ pub(crate) struct StreamManagerEntry {
     pub(crate) expected: u64,
     /// Buffered contents for the stream. Key is the segment number and the value is the segment's `StreamBuffer`
     pub(crate) buffer: HashMap<u64, StreamBuffer>,
+    /// Waker for the current stream entry
+    pub(crate) waker: Option<Waker>,
 }
 
 impl StreamManagerEntry {
@@ -41,25 +43,13 @@ impl StreamManagerEntry {
         Self {
             expected,
             buffer: HashMap::new(),
+            waker: None,
         }
     }
 
+    /// Get an iterator over the present buffered data (if any), in order
     #[inline]
-    pub(crate) fn insert(&mut self, buffer: StreamBuffer) -> Result<()> {
-        // Segment is not within the current window, cannot insert.
-        if buffer.segment_number >= self.expected + MAXIMUM_WINDOW_SIZE
-            || buffer.segment_number < self.expected
-        {
-            return Err(BluefinError::UnexpectedSegmentError);
-        }
-
-        let _ = self.buffer.insert(buffer.segment_number, buffer);
-
-        Ok(())
-    }
-
-    #[inline]
-    fn into_iter(&mut self) -> Iter {
+    pub(crate) fn into_iter(&mut self) -> ConsumedIter {
         let mut v = vec![];
         let mut last_segment_num = self.expected;
 
@@ -75,13 +65,39 @@ impl StreamManagerEntry {
 
         self.expected = last_segment_num;
 
-        Iter(v)
+        ConsumedIter(v)
     }
 }
 
-#[derive(Debug)]
+impl Buffer for StreamManagerEntry {
+    type BufferData = StreamBuffer;
+    type ConsumedData = ConsumedIter;
+
+    #[inline]
+    fn add(&mut self, data: Self::BufferData) -> Result<()> {
+        // Segment is not within the current window, cannot insert.
+        if data.segment_number >= self.expected + MAXIMUM_WINDOW_SIZE
+            || data.segment_number < self.expected
+        {
+            return Err(BluefinError::UnexpectedSegmentError);
+        }
+
+        let _ = self.buffer.insert(data.segment_number, data);
+
+        Ok(())
+    }
+
+    #[inline]
+    fn consume(&mut self) -> Option<Self::ConsumedData> {
+        Some(self.into_iter())
+    }
+
+    set_waker!();
+}
+
 /// Manages stream IO buffering. Streams require a separate manager from the connection-based
 /// `ConnectionManager` as streams are bytestreams and require a different flow control.
+#[derive(Debug)]
 pub(crate) struct StreamManager {
     stream_map: HashMap<u64, StreamManagerEntry>,
 }

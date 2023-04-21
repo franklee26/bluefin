@@ -47,23 +47,22 @@ impl StreamManagerEntry {
         }
     }
 
-    /// Get an iterator over the present buffered data (if any), in order
+    /// Get an iterator over the present buffered data (if any), in order. Because this consumes the buffered data,
+    /// therefore the next `expected` segment number is updated.
     #[inline]
     pub(crate) fn into_iter(&mut self) -> ConsumedIter {
         let mut v = vec![];
-        let mut last_segment_num = self.expected;
+        let curr_expected = self.expected;
 
-        for num in self.expected..self.expected + MAXIMUM_WINDOW_SIZE {
+        for num in curr_expected..curr_expected + MAXIMUM_WINDOW_SIZE {
             match self.buffer.remove(&num) {
                 Some(buf) => {
-                    last_segment_num = buf.segment_number;
+                    self.expected = buf.segment_number + 1;
                     v.push(buf);
                 }
                 None => break,
             }
         }
-
-        self.expected = last_segment_num;
 
         ConsumedIter(v)
     }

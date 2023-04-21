@@ -135,7 +135,7 @@ impl ConnectionManager {
     }
 
     /// Registers a new accept buffer, creates its shared buffer and returns an Arc<> reference to it
-    pub(crate) fn register_new_accept_connection(&mut self, key: &str) -> SyncConnBufferRef {
+    pub(crate) fn register_new_accept_connection(&mut self) -> SyncConnBufferRef {
         let buf = Arc::new(std::sync::Mutex::new(ConnectionBuffer::new()));
 
         self.accept_buffer_queue.push_back(Arc::clone(&buf));

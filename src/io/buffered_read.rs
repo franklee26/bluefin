@@ -42,8 +42,8 @@ where
         let mut num_retries = 0;
 
         while num_retries < max_number_of_tries {
-            if let Ok(packet) = tokio::time::timeout(timeout, self.clone()).await {
-                return Some(packet);
+            if let Ok(data) = tokio::time::timeout(timeout, self.clone()).await {
+                return Some(data);
             }
             num_retries += 1;
 
@@ -73,10 +73,10 @@ where
         let _self = self.as_ref();
         let mut guard = (*_self.buffer).lock().unwrap();
 
-        if let Some(packet) = guard.consume() {
+        if let Some(data) = guard.consume() {
             // Reset waker
             guard.set_waker(None);
-            return Poll::Ready(packet);
+            return Poll::Ready(data);
         }
 
         guard.set_waker(Some(cx.waker().clone()));

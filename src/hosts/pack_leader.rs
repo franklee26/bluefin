@@ -130,12 +130,11 @@ impl BluefinPackLeader {
 
         // Generate source id
         let source_id: u32 = rand::thread_rng().gen();
-        let temp_key = format!("0_{}", source_id);
 
         // Lock acquired
         let buffer = {
             let mut manager = self.manager.lock().await;
-            manager.register_new_accept_connection(&temp_key)
+            manager.register_new_accept_connection()
         };
         // Lock released
 

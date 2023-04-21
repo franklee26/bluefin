@@ -8,20 +8,24 @@ use std::{
 use rand::Rng;
 use tokio::time::sleep;
 
-use crate::core::packet::Packet;
-
-use super::manager::ConnectionBuffer;
+use super::Buffer;
 
 #[derive(Clone)]
-pub(crate) struct BufferedRead {
+pub(crate) struct BufferedRead<T>
+where
+    T: Buffer + Clone,
+{
     /// Unique id per buffered read request, mostly used for debugging purposes
     id: u32,
     /// This connection's buffer
-    buffer: Arc<Mutex<ConnectionBuffer>>,
+    buffer: Arc<Mutex<T>>,
 }
 
-impl BufferedRead {
-    pub(crate) fn new(buffer: Arc<Mutex<ConnectionBuffer>>) -> Self {
+impl<T> BufferedRead<T>
+where
+    T: Buffer + Clone,
+{
+    pub(crate) fn new(buffer: Arc<Mutex<T>>) -> Self {
         let id: u32 = rand::thread_rng().gen();
         Self { id, buffer }
     }
@@ -32,14 +36,14 @@ impl BufferedRead {
         self,
         timeout: Option<Duration>,
         max_number_of_tries: Option<usize>,
-    ) -> Option<Packet> {
+    ) -> Option<T::ConsumedData> {
         let timeout = timeout.unwrap_or(Duration::from_secs(3));
         let max_number_of_tries = max_number_of_tries.unwrap_or(3);
         let mut num_retries = 0;
 
         while num_retries < max_number_of_tries {
-            if let Ok(packet) = tokio::time::timeout(timeout, self.clone()).await {
-                return Some(packet);
+            if let Ok(data) = tokio::time::timeout(timeout, self.clone()).await {
+                return Some(data);
             }
             num_retries += 1;
 
@@ -56,8 +60,11 @@ impl BufferedRead {
     }
 }
 
-impl Future for BufferedRead {
-    type Output = Packet;
+impl<T> Future for BufferedRead<T>
+where
+    T: Buffer + Clone,
+{
+    type Output = T::ConsumedData;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -66,13 +73,13 @@ impl Future for BufferedRead {
         let _self = self.as_ref();
         let mut guard = (*_self.buffer).lock().unwrap();
 
-        if let Some(packet) = guard.consume() {
+        if let Some(data) = guard.consume() {
             // Reset waker
-            guard.waker = None;
-            return Poll::Ready(packet);
+            guard.set_waker(None);
+            return Poll::Ready(data);
         }
 
-        guard.waker = Some(cx.waker().clone());
+        guard.set_waker(Some(cx.waker().clone()));
         Poll::Pending
     }
 }

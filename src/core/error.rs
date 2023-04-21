@@ -47,6 +47,9 @@ pub enum BluefinError {
     #[error("No such waker.")]
     NoSuchWakerError,
 
-    #[error("Socket is not valid")]
+    #[error("Socket is not valid.")]
     InvalidSocketError,
+
+    #[error("Encountered segment with unexpected segment number.")]
+    UnexpectedSegmentError,
 }

@@ -1,13 +1,16 @@
 use crate::core::error::BluefinError;
 use crate::core::packet::Packet;
 use crate::utils::common::SyncConnBufferRef;
+use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::result;
 use std::sync::Arc;
-use std::{collections::HashMap, task::Waker};
+use std::task::Waker;
 
-/// Bluefin Result yields a BluefinError
-pub type Result<T> = result::Result<T, BluefinError>;
+use super::Result;
+
+/// Buffer at most 10 unhandled requests. Otherwise, we might get overburdended with
+/// these requests.
+const MAX_UNHANDLED_NEW_CONNECTION_REQ: usize = 10;
 
 /// Represents the buffered bytes for a connection.
 #[derive(Clone, Debug)]
@@ -48,10 +51,6 @@ impl ConnectionBuffer {
         Some(self.packet.take().unwrap())
     }
 }
-
-/// Buffer at most 10 unhandled requests. Otherwise, we might get overburdended with
-/// these requests.
-const MAX_UNHANDLED_NEW_CONNECTION_REQ: usize = 10;
 
 #[derive(Debug)]
 pub(crate) struct ConnectionManager {

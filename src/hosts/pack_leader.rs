@@ -5,8 +5,10 @@ use crate::{
     handshake::handshake::HandshakeHandler,
     io::{
         buffered_read::BufferedRead,
-        manager::{ConnectionManager, Result},
+        manager::ConnectionManager,
+        stream_manager::StreamManager,
         worker::{AcceptWorker, ReadWorker},
+        Result,
     },
     network::connection::Connection,
     tun::device::BluefinDevice,
@@ -20,6 +22,7 @@ const NUMBER_OF_WORKER_THREADS: usize = 2;
 pub struct BluefinPackLeader {
     file: File,
     manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
     spawned_read_thread: bool,
 }
 
@@ -70,10 +73,12 @@ impl BluefinPackLeaderBuilder {
         let file = unsafe { File::from_raw_fd(fd) };
 
         let manager = ConnectionManager::new();
+        let stream_manager = StreamManager::new();
 
         BluefinPackLeader {
             file,
             manager: Arc::new(tokio::sync::Mutex::new(manager)),
+            stream_manager: Arc::new(tokio::sync::Mutex::new(stream_manager)),
             spawned_read_thread: false,
         }
     }
@@ -149,6 +154,7 @@ impl BluefinPackLeader {
             BluefinHost::PackLeader,
             true,
             Arc::clone(&buffer),
+            Arc::clone(&self.stream_manager),
             self.file.try_clone().await.unwrap(),
         );
         let key = format!("{}_{}", conn.dest_id, conn.source_id);

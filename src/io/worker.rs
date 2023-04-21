@@ -9,7 +9,8 @@ use crate::core::header::PacketType;
 use crate::core::serialisable::Serialisable;
 use crate::core::{error::BluefinError, packet::BluefinPacket, packet::Packet};
 
-use super::manager::{ConnectionManager, Result};
+use super::manager::ConnectionManager;
+use super::Result;
 
 /// Essentially a read-worker thread. Each worker attempts to read in bytes from the wire. Then,
 /// the worker determiens if the packet is a valid bluefin packet. If so, the worker will attempt

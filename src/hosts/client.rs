@@ -19,19 +19,21 @@ use crate::{
     },
     handshake::handshake::HandshakeHandler,
     io::{
-        manager::{ConnectionBuffer, ConnectionManager, Result},
+        manager::{ConnectionBuffer, ConnectionManager},
+        stream_manager::StreamManager,
         worker::ReadWorker,
+        Result,
     },
     network::connection::Connection,
 };
 
-#[derive(Debug)]
 pub struct BluefinClient {
     name: String,
     socket: Option<UdpSocket>,
     src_ip: Option<String>,
     src_port: Option<i32>,
     manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
+    stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
     file: Option<File>,
     established_udp_connection: bool,
     spawned_read_threads: bool,
@@ -129,6 +131,7 @@ impl BluefinClient {
             false,
             self.file.as_ref().unwrap().try_clone().await.unwrap(),
             Arc::clone(&buffer),
+            Arc::clone(&self.stream_manager),
         );
         conn.need_ip_udp_headers(false);
 
@@ -180,11 +183,14 @@ impl BluefinClientBuilder {
 
     pub fn build(&mut self) -> BluefinClient {
         let manager = ConnectionManager::new();
+        let stream_manager = StreamManager::new();
+
         BluefinClient {
             name: self.name.clone().unwrap(),
             src_ip: None,
             src_port: None,
             manager: Arc::new(tokio::sync::Mutex::new(manager)),
+            stream_manager: Arc::new(tokio::sync::Mutex::new(stream_manager)),
             file: None,
             socket: None,
             established_udp_connection: false,

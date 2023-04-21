@@ -4,7 +4,7 @@ use tokio::fs::File;
 
 use crate::{
     core::{context::BluefinHost, packet::Packet},
-    io::manager::ConnectionBuffer,
+    io::{manager::ConnectionBuffer, stream_manager::StreamManager},
     network::connection::Connection,
 };
 
@@ -19,6 +19,7 @@ pub(crate) fn build_connection_from_packet(
     host_type: BluefinHost,
     need_ip_and_udp_headers: bool,
     buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
+    stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
     file: File,
 ) -> Connection {
     let mut conn = Connection::new(
@@ -33,6 +34,7 @@ pub(crate) fn build_connection_from_packet(
         need_ip_and_udp_headers,
         file,
         buffer,
+        stream_manager,
     );
     conn.source_id = source_id;
 

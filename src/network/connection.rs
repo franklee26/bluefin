@@ -9,11 +9,7 @@ use rand::{
     distributions::{Alphanumeric, DistString},
     Rng,
 };
-use tokio::{
-    fs::File,
-    io::AsyncWriteExt,
-    time::{sleep, timeout},
-};
+use tokio::{fs::File, io::AsyncWriteExt, time::timeout};
 
 use crate::{
     core::{
@@ -23,8 +19,8 @@ use crate::{
         packet::{BluefinPacket, Packet},
     },
     io::{
-        buffered_read::{self, BufferedRead},
-        manager::{ConnectionBuffer, Result},
+        buffered_read::BufferedRead, manager::ConnectionBuffer, stream_manager::StreamManager,
+        Result,
     },
 };
 
@@ -49,6 +45,7 @@ pub struct Connection {
     pub(crate) destination_port: Option<u16>,
     pub(crate) context: Context,
     pub(crate) buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
+    pub(crate) stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
 }
 
 /// Read result contains the read bluefin packet along with additional metadata
@@ -85,6 +82,7 @@ impl Connection {
         need_ip_udp_headers: bool,
         file: File,
         buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
+        stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
     ) -> Connection {
         let source_id: u32 = rand::thread_rng().gen();
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
@@ -100,6 +98,7 @@ impl Connection {
             source_port: Some(source_port),
             destination_port: Some(destination_port),
             buffer,
+            stream_manager,
             context: Context {
                 host_type,
                 state: State::Handshake,

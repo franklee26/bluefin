@@ -8,7 +8,7 @@ use crate::{
         packet::{BluefinPacket, Packet},
         serialisable::Serialisable,
     },
-    io::manager::Result,
+    io::Result,
     network::connection::Connection,
 };
 

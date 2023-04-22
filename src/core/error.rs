@@ -44,6 +44,9 @@ pub enum BluefinError {
     #[error("Connection already exists. Nothing done.")]
     ConnectionAlreadyExists,
 
+    #[error("Stream already exists. Nothing done.")]
+    StreamAlreadyExists,
+
     #[error("No such waker.")]
     NoSuchWakerError,
 
@@ -52,4 +55,10 @@ pub enum BluefinError {
 
     #[error("Encountered segment with unexpected segment number.")]
     UnexpectedSegmentError,
+
+    #[error("Could not buffer data: `{0}`")]
+    CannotBufferError(String),
+
+    #[error("No such stream buffered")]
+    NoSuchStreamError,
 }

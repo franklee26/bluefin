@@ -13,7 +13,7 @@ use crate::{
     core::{
         context::BluefinHost,
         error::BluefinError,
-        header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
+        header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
         serialisable::Serialisable,
     },
@@ -58,11 +58,16 @@ impl BluefinClient {
     }
 
     fn get_client_hello_packet(&self, src_id: u32, packet_number: u64) -> BluefinPacket {
-        let type_fields = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0x0);
         let security_fields = BluefinSecurityFields::new(true, 0b000_1111);
 
         // Temporarily set dest id to zero
-        let mut header = BluefinHeader::new(src_id, 0x0, type_fields, security_fields);
+        let mut header = BluefinHeader::new(
+            src_id,
+            0x0,
+            PacketType::UnencryptedHandshake,
+            0x0,
+            security_fields,
+        );
         header.with_packet_number(packet_number);
 
         BluefinPacket::builder().header(header).build()

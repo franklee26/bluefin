@@ -1,6 +1,9 @@
 use std::{collections::HashMap, task::Waker};
 
-use crate::{core::error::BluefinError, set_waker};
+use crate::{
+    core::{error::BluefinError, header::PacketType, packet::Packet},
+    set_waker,
+};
 
 use super::{Buffer, Result};
 
@@ -28,7 +31,7 @@ impl IntoIterator for ConsumedIter {
 }
 
 #[derive(Debug)]
-pub(crate) struct StreamManagerEntry {
+pub(crate) struct StreamManagerBuffer {
     /// The smallest sequence number that we are expecting to have non-empty data for. This means that each
     /// read action should yield buffered data from `expected` and onwards (contiguously).
     pub(crate) expected: u64,
@@ -38,7 +41,7 @@ pub(crate) struct StreamManagerEntry {
     pub(crate) waker: Option<Waker>,
 }
 
-impl StreamManagerEntry {
+impl StreamManagerBuffer {
     pub(crate) fn new(expected: u64) -> Self {
         Self {
             expected,
@@ -68,7 +71,7 @@ impl StreamManagerEntry {
     }
 }
 
-impl Buffer for StreamManagerEntry {
+impl Buffer for StreamManagerBuffer {
     type BufferData = StreamBuffer;
     type ConsumedData = ConsumedIter;
 
@@ -98,7 +101,8 @@ impl Buffer for StreamManagerEntry {
 /// `ConnectionManager` as streams are bytestreams and require a different flow control.
 #[derive(Debug)]
 pub(crate) struct StreamManager {
-    stream_map: HashMap<u64, StreamManagerEntry>,
+    /// Key: stream id (14 bits), value: buffered values for the stream
+    stream_map: HashMap<u16, StreamManagerBuffer>,
 }
 
 impl StreamManager {
@@ -106,5 +110,58 @@ impl StreamManager {
         Self {
             stream_map: HashMap::new(),
         }
+    }
+
+    /// Registers a new stream into the stream manager. This readies an empty buffer in the manager
+    /// provided that the `stream_id` has not already been registered. If so, then this function
+    /// returns an error. Else, the newly created stream buffer will be expecting to receive
+    /// packets with packet number `expected` and above (up to the window maximum)
+    pub(crate) fn register_new_stream(&mut self, stream_id: u16, expected: u64) -> Result<()> {
+        if self.stream_map.contains_key(&stream_id) {
+            return Err(BluefinError::StreamAlreadyExists);
+        }
+
+        let buf = StreamManagerBuffer::new(expected);
+        let _ = self.stream_map.insert(stream_id, buf);
+
+        Ok(())
+    }
+
+    /// Tries to buffer the `packet` into the stream buffer. If the packet number is not within
+    /// the buffer's current acceptance window then the data is not buffered and the packet is
+    /// dropped.
+    pub(crate) fn buffer_to_existing_stream(&mut self, packet: Packet) -> Result<()> {
+        let header = packet.payload.header;
+        let payload = packet.payload.payload;
+
+        // We're not going to do anything if the payload is empty
+        if payload.is_empty() {
+            return Ok(());
+        }
+
+        // We can only buffer stream packets
+        if header.type_field != PacketType::Stream {
+            return Err(BluefinError::CannotBufferError(
+                "Cannot buffer non-stream packet into stream manager".to_string(),
+            ));
+        }
+
+        // Stream id is the last 14 bits of the type_specific_payload
+        let stream_id = header.type_specific_payload & 0x3fff;
+
+        // Stream must already exist
+        if !self.stream_map.contains_key(&stream_id) {
+            return Err(BluefinError::NoSuchStreamError);
+        }
+
+        let buf_data = StreamBuffer {
+            segment_number: header.packet_number,
+            data: payload,
+        };
+
+        let entry = self.stream_map.get_mut(&stream_id).unwrap();
+        entry.add(buf_data)?;
+
+        Ok(())
     }
 }

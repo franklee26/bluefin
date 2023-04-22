@@ -48,64 +48,6 @@ impl StreamPacketType {
     }
 }
 
-/// This struct contains both the packet type and type-specific fields. Together, these
-/// two fields are 2 one byte.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct BluefinTypeFields {
-    /// The packet type is 4 bits
-    pub packet_type: PacketType,
-    /// Packet-type specific payload is 12 bits
-    pub type_specific_payload: u16,
-}
-
-impl BluefinTypeFields {
-    pub fn new(packet_type: PacketType, type_specific_payload: u16) -> Self {
-        // Ensure that the packet_type and payload have the correct size
-        // packet_type is 4 bits
-        if packet_type as u8 > 15 {
-            panic!("packet_type field cannot be longer than 4 bits");
-        }
-        // type_specific_payload is 12 bits 0b0000 0000 0000
-        if type_specific_payload > 4095 {
-            panic!("type_specific_payload field cannot be longer than 12 bits");
-        }
-        Self {
-            packet_type,
-            type_specific_payload,
-        }
-    }
-}
-
-impl Serialisable for BluefinTypeFields {
-    #[inline]
-    fn serialise(&self) -> Vec<u8> {
-        let mut two_bytes: u16 = 0x0;
-        two_bytes |= self.packet_type as u16;
-        two_bytes <<= 12;
-        two_bytes |= self.type_specific_payload;
-        vec![
-            ((two_bytes & 0xff00) >> 8) as u8,
-            (two_bytes & 0x00ff) as u8,
-        ]
-    }
-
-    #[inline]
-    fn deserialise(bytes: &[u8]) -> Result<Self, BluefinError> {
-        if bytes.len() < 2 {
-            return Err(BluefinError::DeserialiseError(
-                "Bluefin type fields are two bytes".to_string(),
-            ));
-        }
-        // Two bytes. First 4 bits is the packet_type then the remaining 12 bits are the type-specific payload
-        let packet_type = (bytes[0] & 0xf0) >> 4;
-        let type_specific_payload: u16 = (((bytes[0] & 0x0f) as u16) << 8) | (bytes[1] as u16);
-        Ok(Self {
-            packet_type: PacketType::from_u8(packet_type),
-            type_specific_payload,
-        })
-    }
-}
-
 /// This struct contains the encryption flag and header-protection fields for a total of 8 bits
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BluefinSecurityFields {
@@ -157,57 +99,7 @@ impl Serialisable for BluefinSecurityFields {
 /// 0               1               2               3
 ///  0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |                     Stream id                          | Type |
-/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// ```
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct BluefinStreamHeader {
-    // Stream id is 28 bits
-    pub stream_id: u32,
-    // Type is 4 bits
-    pub stream_type: u8,
-}
-
-impl BluefinStreamHeader {
-    pub(crate) fn new(stream_id: u32, stream_type: StreamPacketType) -> Self {
-        Self {
-            stream_id,
-            stream_type: stream_type as u8,
-        }
-    }
-}
-
-impl Serialisable for BluefinStreamHeader {
-    fn serialise(&self) -> Vec<u8> {
-        let id_masked = (self.stream_id << 4) & 0xfffffff0;
-        let options_masked = (self.stream_type as u32) & 0x0f;
-        let ans = id_masked | options_masked;
-        ans.to_be_bytes().into()
-    }
-
-    fn deserialise(bytes: &[u8]) -> Result<Self, BluefinError>
-    where
-        Self: Sized,
-    {
-        if bytes.len() != 4 {
-            return Err(BluefinError::DeserialiseError(
-                "Bluefin stream header must be exactly 4 bytes".to_string(),
-            ));
-        }
-        Ok(Self {
-            stream_type: bytes[3] & 0x0f,
-            stream_id: (u32::from_be_bytes(bytes.try_into().expect("stream id should be 28 bits"))
-                & 0xfffffff0)
-                >> 4,
-        })
-    }
-}
-
-/// ```text
-/// 0               1               2               3
-///  0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
-/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |    Version    |  Type |     Type payload      |E|    Mask     |
+/// |Version|  Type |         Type payload          |E|    Mask     |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |                   Source connection id                        |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -220,10 +112,12 @@ impl Serialisable for BluefinStreamHeader {
 ///
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct BluefinHeader {
-    // The version is 8 bits
+    // The version is 4 bits
     pub version: u8,
-    /// type and type_specific_payload total is 16 bits
-    pub type_and_type_specific_payload: BluefinTypeFields,
+    // The type is 4 bits
+    pub type_field: PacketType,
+    /// type_specific_payload is 16 bits
+    pub type_specific_payload: u16,
     /// encryption and mask field total is 8 bits
     pub security_fields: BluefinSecurityFields,
     /// source_connection_id is 32 bits
@@ -238,12 +132,14 @@ impl BluefinHeader {
     pub fn new(
         source_connection_id: u32,
         destination_connection_id: u32,
-        type_and_type_specific_payload: BluefinTypeFields,
+        type_field: PacketType,
+        type_specific_payload: u16,
         security_fields: BluefinSecurityFields,
     ) -> Self {
         Self {
             version: 0x0,
-            type_and_type_specific_payload,
+            type_field,
+            type_specific_payload,
             security_fields,
             source_connection_id,
             destination_connection_id,
@@ -258,9 +154,10 @@ impl BluefinHeader {
 
 impl Serialisable for BluefinHeader {
     fn serialise(&self) -> Vec<u8> {
+        let first_byte = (self.version << 4) | self.type_field as u8;
         [
-            [self.version].as_slice(),
-            self.type_and_type_specific_payload.serialise().as_slice(),
+            &first_byte.to_be_bytes().as_slice(),
+            &self.type_specific_payload.to_be_bytes().as_slice(),
             self.security_fields.serialise().as_slice(),
             &self.source_connection_id.to_be_bytes(),
             &self.destination_connection_id.to_be_bytes(),
@@ -275,11 +172,15 @@ impl Serialisable for BluefinHeader {
                 "Bluefin header must be exactly 20 bytes".to_string(),
             ));
         }
-        let type_and_type_specific_payload = BluefinTypeFields::deserialise(&bytes[1..3])?;
         let security_fields = BluefinSecurityFields::deserialise(&[bytes[3]])?;
         Ok(Self {
-            version: bytes[0].try_into().expect("version is 1 byte"),
-            type_and_type_specific_payload,
+            version: (bytes[0] & 0xf0) >> 4,
+            type_field: PacketType::from_u8(bytes[0] & 0x0f),
+            type_specific_payload: u16::from_be_bytes(
+                bytes[1..3]
+                    .try_into()
+                    .expect("type specific payload should be 2 bytes"),
+            ),
             security_fields,
             source_connection_id: u32::from_be_bytes(
                 bytes[4..8]
@@ -303,42 +204,25 @@ impl Serialisable for BluefinHeader {
 #[cfg(test)]
 mod tests {
     use crate::core::{
-        header::{BluefinSecurityFields, PacketType, StreamPacketType},
+        header::{BluefinSecurityFields, PacketType},
         serialisable::Serialisable,
     };
 
-    use super::{BluefinHeader, BluefinStreamHeader, BluefinTypeFields};
-
-    #[test]
-    fn type_and_type_specific_payload_should_serialise_and_deserialise_correctly() {
-        let fields = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0b0001_0011_0111);
-        assert_eq!(fields.packet_type, PacketType::UnencryptedHandshake);
-        assert_eq!(fields.type_specific_payload, 0b0001_0011_0111);
-        let serialised = fields.serialise();
-        // The byte stream would look like (in network order) 0b0000 0001 0011 0111
-        assert_eq!(serialised.len(), 2);
-        assert_eq!(serialised[0], 0b0000_0001);
-        assert_eq!(serialised[1], 0b0011_0111);
-
-        let deserialised = BluefinTypeFields::deserialise(&serialised);
-        match deserialised {
-            Ok(d_field) => assert_eq!(d_field, fields),
-            Err(_) => assert!(false),
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "type_specific_payload field cannot be longer than 12 bits")]
-    fn type_and_type_specific_payload_should_panic_if_payload_is_out_of_bounds() {
-        let _ = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0b1_0000_0000_0000);
-    }
+    use super::BluefinHeader;
 
     #[test]
     fn bluefin_header_should_serialise_and_deserialise_properly() {
-        let types = BluefinTypeFields::new(PacketType::Error, 0b0011_0111_1111);
         let security_fields = BluefinSecurityFields::new(true, 0b001_1111);
-        let header = BluefinHeader::new(0x01020304, 0x04030201, types, security_fields);
+        let header = BluefinHeader::new(
+            0x01020304,
+            0x04030201,
+            PacketType::DiscoveryProbe,
+            0x1234,
+            security_fields,
+        );
         assert_eq!(header.version, 0x0);
+        assert_eq!(header.type_field, PacketType::DiscoveryProbe);
+        assert_eq!(header.type_specific_payload, 0x1234);
 
         let serialised = header.serialise();
         // Headers are 20 bytes
@@ -348,23 +232,6 @@ mod tests {
         match deserialised {
             Ok(d_field) => assert_eq!(d_field, header),
             Err(_) => assert!(false),
-        }
-    }
-
-    #[test]
-    fn bluefin_stream_header_should_serialise_and_deserialise_properly() {
-        let stream_id: u32 = 0b1010_1100_0001_1110_0001_0010_1101;
-        let stream_type = StreamPacketType::OpenRequest;
-        let stream_header = BluefinStreamHeader::new(stream_id, stream_type);
-
-        let serialised = stream_header.serialise();
-        // Header is 4 bytes
-        assert_eq!(serialised.len(), 4);
-
-        let deserialised = BluefinStreamHeader::deserialise(&serialised);
-        match deserialised {
-            Ok(d_header) => assert_eq!(d_header, stream_header),
-            Err(_) => unreachable!(),
         }
     }
 }

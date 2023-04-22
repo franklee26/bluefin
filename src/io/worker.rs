@@ -100,7 +100,7 @@ impl ReadWorker {
         }
 
         // Client hellos' must have type UnencryptedHandshake
-        if header.type_and_type_specific_payload.packet_type != PacketType::UnencryptedHandshake {
+        if header.type_field != PacketType::UnencryptedHandshake {
             return false;
         }
 
@@ -142,18 +142,8 @@ impl ReadWorker {
             dst_port = udp_header.destination_port;
         }
 
-        let wrapped_bluefin_packet =
-            BluefinPacket::deserialise(&buf[offset + ip_header_len + udp_header_len..]);
+        let payload = BluefinPacket::deserialise(&buf[offset + ip_header_len + udp_header_len..])?;
 
-        // Not a bluefin packet; drop.
-        if let Err(_) = wrapped_bluefin_packet {
-            // TODO: Return better error
-            return Err(BluefinError::DeserialiseError(
-                "Wrong connection".to_string(),
-            ));
-        }
-
-        let payload = wrapped_bluefin_packet.unwrap();
         Ok(Packet {
             src_ip,
             dst_ip,

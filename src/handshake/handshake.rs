@@ -4,7 +4,7 @@ use crate::{
     core::{
         context::{BluefinHost, State},
         error::BluefinError,
-        header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
+        header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::{BluefinPacket, Packet},
         serialisable::Serialisable,
     },
@@ -56,13 +56,13 @@ impl<'a> HandshakeHandler<'a> {
         // Set packet_number for context
         self.conn.context.packet_number = header.packet_number + 1;
 
-        let type_fields = BluefinTypeFields::new(PacketType::UnencryptedHandshake, 0x0);
         let security_fields = BluefinSecurityFields::new(true, 0b000_1111);
 
         let mut header = BluefinHeader::new(
             self.conn.source_id,
             self.conn.dest_id,
-            type_fields,
+            PacketType::UnencryptedHandshake,
+            0x0,
             security_fields,
         );
         header.with_packet_number(self.conn.context.packet_number);

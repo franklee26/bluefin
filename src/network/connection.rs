@@ -15,7 +15,7 @@ use crate::{
     core::{
         context::{BluefinHost, Context, State},
         error::BluefinError,
-        header::{BluefinHeader, BluefinSecurityFields, BluefinTypeFields, PacketType},
+        header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::{BluefinPacket, Packet},
     },
     io::{
@@ -23,6 +23,8 @@ use crate::{
         Result,
     },
 };
+
+use super::stream::Stream;
 
 const MAX_NUM_OPEN_STREAMS: usize = 10;
 
@@ -107,70 +109,13 @@ impl Connection {
         }
     }
 
-    /*
-    pub async fn request_stream(&mut self) -> Result<Stream, BluefinError> {
-        // Can't request a stream if the connection is not ready
-        if self.context.state != State::Ready {
-            return Err(BluefinError::CannotOpenStreamError);
-        }
-
-        // Can't open too many streams
-        if self.num_streams >= MAX_NUM_OPEN_STREAMS {
-            return Err(BluefinError::CannotOpenStreamError);
-        }
-
-        // Ok, let's build the stream packet (no payload)
-        let packet = self.get_packet(None);
-        let mut rng = rand::thread_rng();
-        let stream_id: u32 = rng.gen();
-
-        let stream_header = BluefinStreamHeader::new(stream_id, StreamPacketType::OpenRequest);
-        let stream_packet = BluefinStreamPacket::builder()
-            .header(packet.header)
-            .stream_header(stream_header)
-            .build();
-
-        self.set_bytes_out(stream_packet.serialise());
-        eprintln!("Writing... {:?}", self.bytes_out.clone().unwrap());
-        self.write().await;
-
-        let stream = Stream::new(
-            stream_id,
-            self.source_id,
-            self.dest_id,
-            self.raw_file.try_clone().await.unwrap(),
-            self.need_ip_udp_headers,
-            self.timeout,
-        );
-
-        Ok(stream)
+    pub async fn request_stream(&mut self) -> Result<Stream> {
+        todo!()
     }
-    pub async fn accept_stream(&mut self) -> Result<Stream, BluefinError> {
-        if self.context.state != State::Ready {
-            return Err(BluefinError::CannotOpenStreamError);
-        }
 
-        if self.num_streams >= MAX_NUM_OPEN_STREAMS {
-            return Err(BluefinError::CannotOpenStreamError);
-        }
-
-        let mut buf = vec![0; 1504];
-        let (offset, size) = self.read(&mut buf).await.unwrap();
-        eprintln!("Read stream request: {:?}", &buf[offset..offset + size]);
-
-        let id: u32 = 0;
-        let stream = Stream::new(
-            id,
-            self.source_id,
-            self.dest_id,
-            self.raw_file.try_clone().await.unwrap(),
-            self.need_ip_udp_headers,
-            self.timeout,
-        );
-        self.num_streams += 1;
-        Ok(stream)
+    pub async fn accept_stream(&mut self) -> Result<Stream> {
+        todo!()
     }
-    */
 
     pub(crate) fn need_ip_udp_headers(&mut self, need_ip_udp_headers: bool) {
         self.need_ip_udp_headers = need_ip_udp_headers;
@@ -269,11 +214,15 @@ impl Connection {
             State::Ready => PacketType::Data,
         };
         // TODO: additional type specific fields?
-        let type_fields = BluefinTypeFields::new(packet_type, 0x0);
         // TODO: tls encryption + mask?
         let security_fields = BluefinSecurityFields::new(false, 0x0);
-        let mut header =
-            BluefinHeader::new(self.source_id, self.dest_id, type_fields, security_fields);
+        let mut header = BluefinHeader::new(
+            self.source_id,
+            self.dest_id,
+            packet_type,
+            0x0,
+            security_fields,
+        );
         header.with_packet_number(self.context.packet_number);
         if payload.is_some() {
             let packet = BluefinPacket::builder()

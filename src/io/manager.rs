@@ -36,6 +36,7 @@ impl Buffer for ConnectionBuffer {
 
     /// Adds just the `packet` to the connection's buffer. If the buffer is
     /// full then an error is returned.
+    #[inline]
     fn add(&mut self, data: Self::BufferData) -> Result<()> {
         if self.packet.is_some() {
             return Err(BluefinError::BufferFullError);
@@ -48,14 +49,11 @@ impl Buffer for ConnectionBuffer {
     /// Consumes the buffer. If there is nothing in the buffer then nothing
     /// is returned. Otherwise the packet is yielded and the packet + waker
     /// are dropped from the buffer.
+    #[inline]
     fn consume(&mut self) -> Option<Self::ConsumedData> {
         self.waker = None;
 
-        if self.packet.is_none() {
-            return None;
-        }
-
-        Some(self.packet.take().unwrap())
+        self.packet.take()
     }
 
     set_waker!();
@@ -115,6 +113,7 @@ impl ConnectionManager {
     /// later use incase another `Accept` request comes and can potentially pick up this unhandled
     /// packet. In order to avoid burdening memory, we only buffer a limited number of these packets.
     /// TODO: Add TTL for these packets
+    #[inline]
     fn buffer_unhandled_client_hello(&mut self, packet: Packet) -> Result<()> {
         if self.unhandled_client_hellos.len() >= MAX_UNHANDLED_NEW_CONNECTION_REQ {
             return Err(BluefinError::BufferFullError);

@@ -25,13 +25,16 @@ use crate::{
         Result,
     },
     network::connection::Connection,
+    utils::common::string_to_vec_ip,
 };
+
+use super::NUMBER_OF_WORKER_THREADS;
 
 pub struct BluefinClient {
     name: String,
     socket: Option<UdpSocket>,
     src_ip: Option<String>,
-    src_port: Option<i32>,
+    src_port: Option<u16>,
     manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
     stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
     file: Option<File>,
@@ -49,7 +52,8 @@ impl BluefinClient {
     }
 
     /// Creates and binds a UDP socket to `address:port`
-    pub fn bind(&mut self, address: &str, port: i32) -> io::Result<()> {
+    #[inline]
+    pub fn bind(&mut self, address: &str, port: u16) -> io::Result<()> {
         let socket = UdpSocket::bind(format!("{}:{}", address, port)).unwrap();
         self.socket = Some(socket);
         self.src_ip = Some(address.to_string());
@@ -57,6 +61,7 @@ impl BluefinClient {
         Ok(())
     }
 
+    #[inline]
     fn get_client_hello_packet(&self, src_id: u32, packet_number: u64) -> BluefinPacket {
         let security_fields = BluefinSecurityFields::new(true, 0b000_1111);
 
@@ -73,65 +78,71 @@ impl BluefinClient {
         BluefinPacket::builder().header(header).build()
     }
 
+    /// Spawns some reader-worker threads. These threads will only get spawned at first
+    /// invocation of `accept` and will run forever until the main thread has completed.
+    #[inline]
+    async fn spawn_read_threads(&mut self) {
+        if self.spawned_read_threads {
+            return;
+        }
+
+        for _ in 0..NUMBER_OF_WORKER_THREADS {
+            let mut worker = ReadWorker::new(
+                Arc::clone(&self.manager),
+                self.file.as_ref().unwrap().try_clone().await.unwrap(),
+                false,
+                BluefinHost::Client,
+            );
+
+            tokio::spawn(async move {
+                worker.run().await;
+            });
+        }
+
+        self.spawned_read_threads = true;
+    }
+
+    #[inline]
+    fn establish_udp_conn(&mut self, address: &str, port: u16) -> Result<()> {
+        if self.socket.is_none() {
+            return Err(BluefinError::InvalidSocketError);
+        }
+
+        if self.established_udp_connection {
+            return Ok(());
+        }
+
+        let socket = self.socket.as_ref().unwrap();
+        let _ = socket.connect(format!("{}:{}", address, port));
+        let fd = socket.as_raw_fd();
+        let file = unsafe { File::from_raw_fd(fd) };
+        self.file = Some(file);
+
+        self.established_udp_connection = true;
+        Ok(())
+    }
+
     /// Request a bluefin connection to `address:port`.
     ///
     /// This function builds a Bluefin handshake packet and asynchronously begins
     /// the handshake with the pack-leader. If the handshake completes successfully
     /// then an `Connection` struct is returned.
-    pub async fn connect(&mut self, address: &str, port: i32) -> Result<Connection> {
-        if self.socket.is_none() {
-            return Err(BluefinError::InvalidSocketError);
-        }
-
-        if !self.established_udp_connection {
-            let socket = self.socket.as_ref().unwrap();
-            let _ = socket.connect(format!("{}:{}", address, port));
-            let fd = socket.as_raw_fd();
-            let file = unsafe { File::from_raw_fd(fd) };
-            self.file = Some(file);
-
-            self.established_udp_connection = true;
-        }
-
-        if !self.spawned_read_threads {
-            for _ in 0..2 {
-                let mut worker = ReadWorker::new(
-                    Arc::clone(&self.manager),
-                    self.file.as_ref().unwrap().try_clone().await.unwrap(),
-                    false,
-                    BluefinHost::Client,
-                );
-
-                tokio::spawn(async move {
-                    worker.run().await;
-                });
-            }
-
-            self.spawned_read_threads = true;
-        }
+    pub async fn connect(&mut self, address: &str, port: u16) -> Result<Connection> {
+        self.establish_udp_conn(address, port)?;
+        self.spawn_read_threads().await;
 
         let packet_number: u64 = rand::thread_rng().gen();
-        let src_ip: Vec<u8> = self
-            .src_ip
-            .as_ref()
-            .unwrap()
-            .split(".")
-            .map(|s| s.parse::<u8>().unwrap())
-            .collect();
-
-        let dst_ip: Vec<u8> = address
-            .split(".")
-            .map(|s| s.parse::<u8>().unwrap())
-            .collect();
+        let src_ip = string_to_vec_ip(self.src_ip.as_ref().unwrap());
+        let dst_ip = string_to_vec_ip(address);
 
         let buffer = Arc::new(std::sync::Mutex::new(ConnectionBuffer::new()));
         let mut conn = Connection::new(
             0x0,
             packet_number,
-            [src_ip[0], src_ip[1], src_ip[2], src_ip[3]],
-            self.src_port.unwrap() as u16,
-            [dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]],
-            port as u16,
+            src_ip.try_into().unwrap(),
+            self.src_port.unwrap(),
+            dst_ip.try_into().unwrap(),
+            port,
             BluefinHost::Client,
             false,
             self.file.as_ref().unwrap().try_clone().await.unwrap(),
@@ -156,8 +167,7 @@ impl BluefinClient {
         // Wait for pack-leader response. (This read will delete our first-read entry). Be generous with this read.
         let packet = conn
             .read_with_timeout_and_retries(Duration::from_secs(5), 3)
-            .await
-            .unwrap();
+            .await?;
         let key = format!(
             "{}_{}",
             packet.payload.header.source_connection_id,

@@ -30,6 +30,20 @@ impl IntoIterator for ConsumedIter {
     }
 }
 
+impl ConsumedIter {
+    /// Returns `true` if there are any `StreamBuffer` buffered
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Returns the number of elements in the iterator
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StreamManagerBuffer {
     /// The smallest sequence number that we are expecting to have non-empty data for. This means that each
@@ -91,7 +105,12 @@ impl Buffer for StreamManagerBuffer {
 
     #[inline]
     fn consume(&mut self) -> Option<Self::ConsumedData> {
-        Some(self.into_iter())
+        let iter = self.into_iter();
+        if iter.is_empty() {
+            return None;
+        }
+
+        Some(iter)
     }
 
     set_waker!();

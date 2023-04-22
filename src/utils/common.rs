@@ -40,3 +40,9 @@ pub(crate) fn build_connection_from_packet(
 
     conn
 }
+
+/// Converts a string representation of an ip address to a byte-vector representation
+#[inline]
+pub(crate) fn string_to_vec_ip(ip: &str) -> Vec<u8> {
+    ip.split(".").map(|s| s.parse::<u8>().unwrap()).collect()
+}

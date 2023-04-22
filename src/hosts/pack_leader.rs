@@ -17,7 +17,7 @@ use crate::{
 use rand::Rng;
 use tokio::fs::File;
 
-const NUMBER_OF_WORKER_THREADS: usize = 2;
+use super::NUMBER_OF_WORKER_THREADS;
 
 pub struct BluefinPackLeader {
     file: File,

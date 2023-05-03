@@ -4,7 +4,6 @@ use std::{
     time::Duration,
 };
 
-use etherparse::PacketBuilder;
 use rand::{
     distributions::{Alphanumeric, DistString},
     Rng,
@@ -19,14 +18,13 @@ use crate::{
         packet::{BluefinPacket, Packet},
     },
     io::{
-        buffered_read::BufferedRead, manager::ConnectionBuffer, stream_manager::StreamManager,
+        buffered_read::BufferedRead, manager::ConnectionBuffer, stream_manager::ReadStreamManager,
         Result,
     },
+    utils::common::{get_writeable_bytes, WriteContext},
 };
 
 use super::stream::Stream;
-
-const MAX_NUM_OPEN_STREAMS: usize = 10;
 
 /// A Bluefin `Connection`. This struct represents an established Bluefin connection
 /// and keeps track of the state of the connection, input/output buffers and other
@@ -47,7 +45,7 @@ pub struct Connection {
     pub(crate) destination_port: Option<u16>,
     pub(crate) context: Context,
     pub(crate) buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
-    pub(crate) stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
+    pub(crate) read_stream_manager: Arc<tokio::sync::Mutex<ReadStreamManager>>,
 }
 
 /// Read result contains the read bluefin packet along with additional metadata
@@ -84,7 +82,7 @@ impl Connection {
         need_ip_udp_headers: bool,
         file: File,
         buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
-        stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
+        read_stream_manager: Arc<tokio::sync::Mutex<ReadStreamManager>>,
     ) -> Connection {
         let source_id: u32 = rand::thread_rng().gen();
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
@@ -100,7 +98,7 @@ impl Connection {
             source_port: Some(source_port),
             destination_port: Some(destination_port),
             buffer,
-            stream_manager,
+            read_stream_manager,
             context: Context {
                 host_type,
                 state: State::Handshake,
@@ -174,24 +172,17 @@ impl Connection {
     /// `Connection`-based writes. Unlike `Connection`-reads, this call is not blocking. This writes in the
     /// `bytes` + any required udp + IP headers to the wire. The invoker will need to prepare the Bluefin headers.
     pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        // No need to pre-build; just flush buffer
-        if !self.need_ip_udp_headers {
-            match self.file.write_all(bytes).await {
-                Ok(_) => return Ok(()),
-                Err(e) => return Err(BluefinError::WriteError(format!("Failed to write. {}", e))),
-            }
-        }
+        let cx = WriteContext {
+            need_ip_udp_headers: self.need_ip_udp_headers,
+            src_ip: self.source_ip.unwrap_or([0, 0, 0, 0]),
+            dst_ip: self.destination_ip.unwrap_or([0, 0, 0, 0]),
+            src_port: self.source_port.unwrap_or(0),
+            dst_port: self.destination_port.unwrap_or(0),
+        };
 
-        let packet_builder =
-            PacketBuilder::ipv4(self.source_ip.unwrap(), self.destination_ip.unwrap(), 20)
-                .udp(self.source_port.unwrap(), self.destination_port.unwrap());
+        let out = get_writeable_bytes(bytes, cx);
 
-        let mut tun_tap_bytes = vec![0, 0, 0, 2];
-        let mut writer = Vec::<u8>::with_capacity(packet_builder.size(bytes.len()));
-        let _ = packet_builder.write(&mut writer, &bytes);
-        tun_tap_bytes.append(&mut writer);
-
-        let wrapped = timeout(Duration::from_secs(3), self.file.write_all(&tun_tap_bytes)).await;
+        let wrapped = timeout(Duration::from_secs(3), self.file.write_all(&out)).await;
         if let Err(e) = wrapped {
             return Err(BluefinError::WriteError(format!("Failed to write. {}", e)));
         }

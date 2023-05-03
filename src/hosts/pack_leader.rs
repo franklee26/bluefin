@@ -6,7 +6,7 @@ use crate::{
     io::{
         buffered_read::BufferedRead,
         manager::ConnectionManager,
-        stream_manager::StreamManager,
+        stream_manager::ReadStreamManager,
         worker::{AcceptWorker, ReadWorker},
         Result,
     },
@@ -22,7 +22,7 @@ use super::NUMBER_OF_WORKER_THREADS;
 pub struct BluefinPackLeader {
     file: File,
     manager: Arc<tokio::sync::Mutex<ConnectionManager>>,
-    stream_manager: Arc<tokio::sync::Mutex<StreamManager>>,
+    read_stream_manager: Arc<tokio::sync::Mutex<ReadStreamManager>>,
     spawned_read_thread: bool,
 }
 
@@ -73,12 +73,12 @@ impl BluefinPackLeaderBuilder {
         let file = unsafe { File::from_raw_fd(fd) };
 
         let manager = ConnectionManager::new();
-        let stream_manager = StreamManager::new();
+        let stream_manager = ReadStreamManager::new();
 
         BluefinPackLeader {
             file,
             manager: Arc::new(tokio::sync::Mutex::new(manager)),
-            stream_manager: Arc::new(tokio::sync::Mutex::new(stream_manager)),
+            read_stream_manager: Arc::new(tokio::sync::Mutex::new(stream_manager)),
             spawned_read_thread: false,
         }
     }
@@ -153,7 +153,7 @@ impl BluefinPackLeader {
             BluefinHost::PackLeader,
             true,
             Arc::clone(&buffer),
-            Arc::clone(&self.stream_manager),
+            Arc::clone(&self.read_stream_manager),
             self.file.try_clone().await.unwrap(),
         );
         let key = format!("{}_{}", conn.dest_id, conn.source_id);

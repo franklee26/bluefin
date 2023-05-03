@@ -3,6 +3,7 @@ use std::{result, task::Waker};
 use crate::core::error::BluefinError;
 
 pub mod buffered_read;
+pub mod buffered_write;
 pub mod manager;
 pub mod stream_manager;
 pub mod worker;

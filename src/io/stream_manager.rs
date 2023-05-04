@@ -172,26 +172,29 @@ impl SegmentBuffer {
     }
 
     /// Returns an iterator over consumable segments. Segments are consumable if they are within the range
-    /// [s, r). This function does NOT update `s`, it is up to the actual sender to update s.
+    /// [s, r). This function updates `s`, it is therefore up to the sender to actually use the yielded
+    /// segments. Otherwise, they will have to retrieve them manually.
     fn into_iter(&mut self) -> SegmentBufferIter {
         let mut buf = vec![];
 
-        let mut ptr = self.s;
-        while ptr - self.s < self.buffer.len() as u64 && ptr < self.l + MAXIMUM_WINDOW_SIZE {
-            buf.push(self.buffer[(ptr - self.s) as usize].clone());
-            ptr += 1;
+        let r = self.l + MAXIMUM_WINDOW_SIZE;
+        while self.s - self.l < self.len() as u64 && self.s < r {
+            buf.push(self.buffer[(self.s - self.l) as usize].clone());
+            self.s += 1;
         }
 
         SegmentBufferIter(buf)
     }
 
     /// Enqueues segment
+    #[inline]
     fn push(&mut self, segment: Segment) {
         self.e = segment.header.packet_number + 1;
         self.buffer.push(segment);
     }
 
     /// Slides the window left, updating the left pointer to `l`.
+    #[inline]
     fn slide(&mut self, l: u64) {
         // Do nothing if we are reacting to an ack we have already dealt with
         if l < self.l {
@@ -203,16 +206,19 @@ impl SegmentBuffer {
     }
 
     /// Returns the left pointer aka the smallest segment number we are waiting for an ack
+    #[inline]
     fn waiting_for(&self) -> u64 {
         self.l
     }
 
     /// Returns the next expected segment number to be buffered eg. the `e` pointer.
+    #[inline]
     fn next_expected(&self) -> u64 {
         self.e
     }
 
     /// Returns the length of the buffer
+    #[inline]
     fn len(&self) -> usize {
         self.buffer.len()
     }
@@ -326,12 +332,14 @@ impl WriteStreamManager {
     }
 
     /// Buffers the write data into a queue. Notice that no segments are created from this invocation.
+    #[inline]
     pub(crate) fn enqueue(&mut self, data: Vec<u8>) {
         self.data_buffer.push_back(data);
     }
 
     /// Consumes the buffered segments are returns the largest allowable iterable of segments ready to
     /// be sent.
+    #[inline]
     pub(crate) fn segment_buffer_into_iter(&mut self) -> SegmentBufferIter {
         // We can only send segments within the allowable window. Because the left pointer is the smallest
         // segment number we have not received an ack for, then we can only get segments within the window
@@ -339,6 +347,7 @@ impl WriteStreamManager {
         self.segment_buffer.into_iter()
     }
 
+    #[inline]
     pub(crate) fn acked(&mut self, acked: u64) {
         self.segment_buffer.slide(acked + 1);
     }
@@ -474,6 +483,7 @@ mod tests {
 
         // Handle ack so the window slides by 1
         stream_manager.acked(LEFT);
+        assert_eq!(stream_manager.segment_buffer.len(), 0);
         assert_eq!(stream_manager.segment_buffer.waiting_for(), LEFT + 1);
 
         // Try to get 2 segments; enqueud 310 bytes of data. First segment should get
@@ -506,5 +516,81 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn write_stream_manager_does_not_yield_after_r() {
+        let mut manager = create_write_stream_manager();
+        // we can only yield up to 100 segments from l. Beyond that we yield nothing
+        // until we slide l.
+        // Enqueue 100 * 12 = 1200 bytes.
+        for _ in 0..=101 {
+            let payload = create_payload_of_size(100, 0x0);
+            manager.enqueue(payload);
+        }
+
+        // Only 100 segments created
+        assert_eq!(100, manager.data_to_segments());
+
+        // Last segments created
+        assert_eq!(2, manager.data_to_segments());
+
+        // Nothing left
+        assert_eq!(0, manager.data_to_segments());
+
+        // Check that segments buffer is in correct state
+        assert_eq!(LEFT + 102, manager.segment_buffer.e);
+        assert_eq!(LEFT, manager.segment_buffer.l);
+        assert_eq!(LEFT, manager.segment_buffer.s);
+
+        // Assert that the `s` pointer behaves as expected
+        let first_iter = manager.segment_buffer_into_iter();
+        let mut first_count = 0;
+        for seg in first_iter {
+            assert_eq!(seg.header.packet_number, LEFT + first_count);
+            first_count += 1;
+        }
+        // Only 100 segments yielded despite their being 102 segments in buffer
+        assert_eq!(100, first_count);
+        // We yielded everything in [LEFT, LEFT + 99]. We have not yielded LEFT + 100 and
+        // LEFT + 101 because we didn't slide our window.
+        assert_eq!(LEFT + 100, manager.segment_buffer.s);
+        assert_eq!(LEFT + 102, manager.segment_buffer.e);
+        assert_eq!(LEFT, manager.segment_buffer.l);
+
+        let second_iter = manager.segment_buffer_into_iter();
+        let mut second_count = 0;
+        for _ in second_iter {
+            second_count += 1;
+        }
+        // Did not yield anything because `s` is at `r`.
+        assert_eq!(0, second_count);
+        assert_eq!(102, manager.segment_buffer.len());
+
+        // Slide window by 1
+        manager.acked(LEFT);
+        assert_eq!(101, manager.segment_buffer.len());
+        assert_eq!(LEFT + 1, manager.segment_buffer.l);
+        let third_iter = manager.segment_buffer_into_iter();
+        let mut third_count = 0;
+        for _ in third_iter {
+            third_count += 1;
+        }
+        // Only yield one segment since we only slid by one
+        assert_eq!(1, third_count);
+        assert_eq!(LEFT + 101, manager.segment_buffer.s);
+
+        // Slide window by 3 more
+        manager.acked(LEFT + 3);
+        assert_eq!(98, manager.segment_buffer.len());
+        assert_eq!(LEFT + 4, manager.segment_buffer.l);
+        let fourth_iter = manager.segment_buffer_into_iter();
+        let mut fourth_count = 0;
+        for _ in fourth_iter {
+            fourth_count += 1;
+        }
+        assert_eq!(LEFT + 102, manager.segment_buffer.s);
+        // Slide the window by a total of 4 but there is only one segment left
+        assert_eq!(1, fourth_count);
     }
 }

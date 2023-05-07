@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    ops::Deref,
     task::Waker,
     vec,
 };
@@ -8,7 +9,7 @@ use crate::{
     core::{
         error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
-        packet::{BluefinPacket, Packet},
+        packet::BluefinPacket,
     },
     set_waker,
 };
@@ -136,6 +137,30 @@ pub(crate) struct ReadStreamManager {
 /// Type alias for semantics. Segments are packets but with 'squished' data contents.
 pub type Segment = BluefinPacket;
 
+/// A segment struct but with the additional `acked` metadata
+#[derive(Debug)]
+struct WrappedSegment {
+    segment: Segment,
+    acked: bool,
+}
+
+impl WrappedSegment {
+    fn new(segment: Segment) -> Self {
+        Self {
+            segment,
+            acked: false,
+        }
+    }
+}
+
+/// Nice-to-have deref trait to retrieve the inner segment
+impl Deref for WrappedSegment {
+    type Target = Segment;
+    fn deref(&self) -> &Self::Target {
+        &self.segment
+    }
+}
+
 /// Buffers ready to-send segments.
 /// ```text
 /// SegmentBuffer
@@ -158,7 +183,7 @@ struct SegmentBuffer {
     /// buffer must have a segment number of `e - 1`. If the buffer is empty then `e == l`.
     e: u64,
     /// The actual segment buffer
-    buffer: Vec<Segment>,
+    buffer: Vec<WrappedSegment>,
 }
 
 impl SegmentBuffer {
@@ -183,26 +208,31 @@ impl SegmentBuffer {
             self.s += 1;
         }
 
-        SegmentBufferIter(buf)
+        SegmentBufferIter::new(buf)
     }
 
     /// Enqueues segment
     #[inline]
     fn push(&mut self, segment: Segment) {
         self.e = segment.header.packet_number + 1;
-        self.buffer.push(segment);
+        self.buffer.push(WrappedSegment::new(segment));
     }
 
-    /// Slides the window left, updating the left pointer to `l`.
+    /// Try to slide the window left as much as possible
     #[inline]
-    fn slide(&mut self, l: u64) {
-        // Do nothing if we are reacting to an ack we have already dealt with
-        if l < self.l {
-            return;
+    fn slide(&mut self) {
+        let l = self.l;
+
+        while ((self.l - l) as usize) < self.buffer.len()
+            && self.l - l < MAXIMUM_WINDOW_SIZE
+            && self.buffer[(self.l - l) as usize].acked
+        {
+            self.l += 1;
         }
 
-        self.buffer = self.buffer.split_off((l - self.l) as usize);
-        self.l = l;
+        if l != self.l {
+            self.buffer = self.buffer.split_off((self.l - l) as usize);
+        }
     }
 
     /// Returns the left pointer aka the smallest segment number we are waiting for an ack
@@ -222,18 +252,51 @@ impl SegmentBuffer {
     fn len(&self) -> usize {
         self.buffer.len()
     }
+
+    /// Handles an ack and tries to slide the window right if possible
+    fn ack(&mut self, segment_number: u64) {
+        let ix = segment_number - self.l;
+
+        // Out of bounds
+        if segment_number < self.l || ix >= self.buffer.len() as u64 {
+            return;
+        }
+
+        self.buffer[ix as usize].acked = true;
+        self.slide();
+    }
 }
 
 /// Iterator for consumed segments
 #[derive(Debug)]
-pub(crate) struct SegmentBufferIter(Vec<Segment>);
+pub(crate) struct SegmentBufferIter {
+    inner: Vec<Segment>,
+    ix: usize,
+}
 
-impl IntoIterator for SegmentBufferIter {
+impl SegmentBufferIter {
+    fn new(inner: Vec<Segment>) -> Self {
+        Self { inner, ix: 0 }
+    }
+}
+
+impl Iterator for SegmentBufferIter {
     type Item = Segment;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
 
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ix >= self.inner.len() {
+            return None;
+        }
+
+        self.ix += 1;
+        Some(self.inner[self.ix - 1].clone())
+    }
+
+    fn count(self) -> usize
+    where
+        Self: Sized,
+    {
+        self.inner.len()
     }
 }
 
@@ -349,7 +412,7 @@ impl WriteStreamManager {
 
     #[inline]
     pub(crate) fn acked(&mut self, acked: u64) {
-        self.segment_buffer.slide(acked + 1);
+        self.segment_buffer.ack(acked);
     }
 }
 
@@ -409,6 +472,8 @@ impl ReadStreamManager {
 }
 
 mod tests {
+    use crate::io::stream_manager::MAXIMUM_WINDOW_SIZE;
+
     use super::WriteStreamManager;
 
     const STREAM_ID: u16 = 0x1234;
@@ -558,39 +623,70 @@ mod tests {
         assert_eq!(LEFT + 102, manager.segment_buffer.e);
         assert_eq!(LEFT, manager.segment_buffer.l);
 
-        let second_iter = manager.segment_buffer_into_iter();
-        let mut second_count = 0;
-        for _ in second_iter {
-            second_count += 1;
-        }
         // Did not yield anything because `s` is at `r`.
-        assert_eq!(0, second_count);
+        assert_eq!(0, manager.segment_buffer_into_iter().count());
         assert_eq!(102, manager.segment_buffer.len());
 
         // Slide window by 1
         manager.acked(LEFT);
         assert_eq!(101, manager.segment_buffer.len());
         assert_eq!(LEFT + 1, manager.segment_buffer.l);
-        let third_iter = manager.segment_buffer_into_iter();
-        let mut third_count = 0;
-        for _ in third_iter {
-            third_count += 1;
-        }
+
         // Only yield one segment since we only slid by one
-        assert_eq!(1, third_count);
+        assert_eq!(1, manager.segment_buffer_into_iter().count());
         assert_eq!(LEFT + 101, manager.segment_buffer.s);
 
-        // Slide window by 3 more
-        manager.acked(LEFT + 3);
-        assert_eq!(98, manager.segment_buffer.len());
-        assert_eq!(LEFT + 4, manager.segment_buffer.l);
-        let fourth_iter = manager.segment_buffer_into_iter();
-        let mut fourth_count = 0;
-        for _ in fourth_iter {
-            fourth_count += 1;
-        }
+        // Slide window by another
+        manager.acked(LEFT + 1);
+        assert_eq!(100, manager.segment_buffer.len());
+        assert_eq!(LEFT + 2, manager.segment_buffer.l);
+        assert_eq!(1, manager.segment_buffer_into_iter().count());
         assert_eq!(LEFT + 102, manager.segment_buffer.s);
-        // Slide the window by a total of 4 but there is only one segment left
-        assert_eq!(1, fourth_count);
+    }
+
+    #[test]
+    fn write_stream_manager_handles_acks_correctly() {
+        let mut manager = create_write_stream_manager();
+        // Enqueue 100 * 105 = 10,500 bytes or 105 segments
+        for _ in 0..105 {
+            manager.enqueue(create_payload_of_size(100, 0x0));
+        }
+
+        // Maximum number of segments created
+        assert_eq!(MAXIMUM_WINDOW_SIZE as usize, manager.data_to_segments());
+        // Five segments remaining
+        assert_eq!(5 as usize, manager.data_to_segments());
+
+        // Max number of segments yielded
+        assert_eq!(
+            MAXIMUM_WINDOW_SIZE as usize,
+            manager.segment_buffer_into_iter().count()
+        );
+
+        // Can't yield anymore segments as we have hit the window
+        assert_eq!(0, manager.segment_buffer_into_iter().count());
+
+        // LEFT LEFT+1 LEFT+2 LEFT+3 ...
+        // Ack LEFT + 3 but we still need to ack LEFT, no sliding
+        manager.acked(LEFT + 3);
+        assert_eq!(0, manager.segment_buffer_into_iter().count());
+
+        manager.acked(LEFT + 1);
+        assert_eq!(0, manager.segment_buffer_into_iter().count());
+
+        manager.acked(LEFT + 2);
+        assert_eq!(0, manager.segment_buffer_into_iter().count());
+
+        // Finally, missing piece acked. We slide the window by four.
+        manager.acked(LEFT);
+        assert_eq!(4, manager.segment_buffer_into_iter().count());
+
+        // Get the last segment
+        manager.acked(LEFT + 4);
+        assert_eq!(1, manager.segment_buffer_into_iter().count());
+
+        // Nothing left
+        manager.acked(LEFT + 5);
+        assert_eq!(0, manager.segment_buffer_into_iter().count());
     }
 }

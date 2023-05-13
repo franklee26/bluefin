@@ -1,5 +1,5 @@
 use std::{
-    fmt::{self, format, Debug},
+    fmt::{self, Debug},
     sync::Arc,
     time::Duration,
 };
@@ -164,6 +164,7 @@ impl Connection {
         self.read_impl(None, None, false).await
     }
 
+    #[inline(always)]
     async fn read_impl(
         &mut self,
         timeout: Option<Duration>,

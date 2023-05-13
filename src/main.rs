@@ -21,7 +21,7 @@ async fn main() {
 
                 let _ = conn.write(&packet.serialise()).await;
 
-                sleep(Duration::from_secs(2)).await;
+                sleep(Duration::from_millis(1250)).await;
 
                 let payload = format!("This is my second message to {:#08x}...", conn.dest_id);
                 let packet = conn.get_packet(Some(payload.as_bytes().into()));

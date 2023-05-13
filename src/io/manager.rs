@@ -143,6 +143,7 @@ impl ConnectionManager {
     }
 
     /// Returns whether or not a given key has been registered in the manager
+    #[inline]
     pub(crate) fn buffer_exists(&self, key: &str) -> bool {
         self.buffer_map.contains_key(key)
     }

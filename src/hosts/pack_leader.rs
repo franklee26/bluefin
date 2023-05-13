@@ -147,6 +147,7 @@ impl BluefinPackLeader {
         // Abort the accept worker thread, we already found a packet!
         accept_worker_join_handle.abort();
 
+        let packet_number: u64 = rand::thread_rng().gen();
         let mut conn = build_connection_from_packet(
             &packet,
             source_id,
@@ -155,6 +156,7 @@ impl BluefinPackLeader {
             Arc::clone(&buffer),
             Arc::clone(&self.read_stream_manager),
             self.file.try_clone().await.unwrap(),
+            packet_number,
         );
         let key = format!("{}_{}", conn.dest_id, conn.source_id);
 

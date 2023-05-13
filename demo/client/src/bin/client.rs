@@ -25,11 +25,17 @@ async fn main() -> std::io::Result<()> {
             match conn_res {
                 Ok(mut conn) => {
                     eprintln!("{i}: {conn}");
-                    let res = conn.read().await;
-                    if let Ok(packet) = res {
-                        let payload = packet.payload.payload;
-                        let str = std::str::from_utf8(&payload).unwrap();
-                        eprintln!("Received: {:?}", str);
+                    for _ in 0..2 {
+                        match conn.read().await {
+                            Ok(packet) => {
+                                let payload = packet.payload.payload;
+                                let str = std::str::from_utf8(&payload).unwrap();
+                                eprintln!("Received: {:?}", str);
+                            }
+                            Err(e) => {
+                                eprintln!("Error ({:#08x}): {e}", conn.source_id);
+                            }
+                        }
                     }
                 }
                 Err(e) => eprintln!("{i}: {e}"),

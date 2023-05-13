@@ -51,11 +51,12 @@ impl AcceptWorker {
         for _ in 0..self.max_number_tries {
             // We need to keep this short. This job is racing against the `ReadWorker` we want to make sure
             // that the unhandled client hello buffer gets cleaned quickly
-            sleep(Duration::from_secs(1)).await;
+            sleep(Duration::from_millis(500)).await;
 
             // Lock acquired
             let mut manager = self.manager.lock().await;
 
+            // Lock released
             match manager.try_to_wake_buffered_accept() {
                 Ok(_) => {
                     return;
@@ -84,6 +85,7 @@ impl ReadWorker {
     }
 
     /// Helper to determine whether a given `packet` is a valid hello packet eg. client-hello or pack-leader-hello
+    #[inline]
     fn is_hello_packet(&self, packet: &Packet) -> bool {
         let header = packet.payload.header;
         let other_id = header.source_connection_id;
@@ -107,6 +109,7 @@ impl ReadWorker {
         true
     }
 
+    #[inline]
     fn get_packet_from_buffer(&self, buf: &[u8]) -> Result<Packet> {
         let mut offset = 0;
         let mut ip_header_len = 0;
@@ -156,8 +159,13 @@ impl ReadWorker {
     /// Run a single, infinite loop. This continuously reads from the network, verifies if it is an Bluefin packet,
     /// performs simple validations and tries to buffer the packet via the `ConnectionManager`.
     pub(crate) async fn run(&mut self) {
+        let mut is_first_run = true;
         loop {
-            sleep(Duration::from_secs(3)).await;
+            if !is_first_run {
+                sleep(Duration::from_millis(500)).await;
+            } else {
+                is_first_run = false;
+            }
 
             let mut buf = vec![0; 1504];
             let res = self.file.read(&mut buf).await;

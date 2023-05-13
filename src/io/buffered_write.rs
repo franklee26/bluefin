@@ -1,4 +1,4 @@
-use std::{os::fd::AsRawFd, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use tokio::{
     fs::File,
@@ -87,6 +87,16 @@ impl BufferedWrite {
             ))),
             tx: None,
         }
+    }
+
+    pub(crate) fn into_inner(&mut self) -> Option<Sender<WriteCommand>> {
+        if self.tx.is_none() {
+            return None;
+        }
+
+        let inner = self.tx.as_ref().unwrap();
+
+        Some(inner.clone())
     }
 
     /// Send a `WriteCommand` to the write buffer.

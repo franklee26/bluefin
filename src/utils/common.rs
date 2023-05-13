@@ -23,11 +23,13 @@ pub(crate) fn build_connection_from_packet(
     buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
     read_stream_manager: Arc<tokio::sync::Mutex<ReadStreamManager>>,
     file: File,
+    next_send_packet_number: u64,
 ) -> Connection {
     let mut conn = Connection::new(
         // The destination id must be whatever the src is calling its src id
         packet.payload.header.source_connection_id as u32,
-        packet.payload.header.packet_number,
+        packet.payload.header.packet_number + 1,
+        next_send_packet_number,
         packet.dst_ip,
         packet.dst_port,
         packet.src_ip,

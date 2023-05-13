@@ -56,55 +56,6 @@ impl BluefinPacket {
             payload: None,
         }
     }
-
-    /// Validates incoming packet bytes against the connection, sets/updates relevant header
-    /// fields and returns the deserialised Bluefin packet, if possible. This func should
-    /// be invoked as part of every incoming read operation EXCEPT the very first
-    /// handshake operations. This is becasue in the handshake, we are still setting
-    /// the correct src/dst connection id's and other context metadata.
-    ///
-    /// Otherwise this func errors.
-    pub fn validate(&self, conn: &mut Connection) -> Result<(), BluefinError> {
-        let header = self.header;
-
-        // Validate the header
-        // Verify that the connection id is correct (the packet's dst conn id should be our src id)
-        if header.destination_connection_id != conn.source_id {
-            return Err(BluefinError::InvalidHeaderError(format!(
-                "Expecting incoming packet's dst conn id ({:#08x}) to be equal to ({:#08x})",
-                header.destination_connection_id, conn.source_id
-            )));
-        }
-
-        // Verify that the packet's src conn id is our expected dst conn id
-        if header.source_connection_id != conn.dest_id {
-            return Err(BluefinError::InvalidHeaderError(format!(
-                "Expected packet w/ conn id {}, but found {} instead.",
-                conn.dest_id, header.source_connection_id
-            )));
-        }
-
-        // Verify that the packet number is as expected
-        if header.packet_number != conn.context.packet_number + 1 {
-            return Err(BluefinError::InvalidHeaderError(format!(
-                "Received packet number {:#016x}, was expecting {:#016x}",
-                header.packet_number,
-                conn.context.packet_number + 1
-            )));
-        }
-
-        // Bluefin payloads must be at most 1492 bytes
-        if self.payload.len() > 1492 {
-            return Err(BluefinError::LargePayloadError(
-                self.payload.len().to_string(),
-            ));
-        }
-
-        // Increment packet number
-        conn.context.packet_number += 2;
-
-        Ok(())
-    }
 }
 
 impl BluefinPacketBuilder {

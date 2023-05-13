@@ -138,6 +138,7 @@ impl BluefinClient {
         let buffer = Arc::new(std::sync::Mutex::new(ConnectionBuffer::new()));
         let mut conn = Connection::new(
             0x0,
+            0x0,
             packet_number,
             src_ip.try_into().unwrap(),
             self.src_port.unwrap(),
@@ -166,7 +167,7 @@ impl BluefinClient {
 
         // Wait for pack-leader response. (This read will delete our first-read entry). Be generous with this read.
         let packet = conn
-            .read_with_timeout_and_retries(Duration::from_secs(5), 3)
+            .first_read_with_timeout_and_retries(Duration::from_secs(5), 3)
             .await?;
         let key = format!(
             "{}_{}",
@@ -174,6 +175,8 @@ impl BluefinClient {
             packet.payload.header.destination_connection_id
         );
         conn.dest_id = packet.payload.header.source_connection_id;
+        conn.context.next_recv_packet_number = packet.payload.header.packet_number + 1;
+        conn.context.next_send_packet_number = packet_number + 1;
 
         // register our 'real' connection
         // Lock acquired

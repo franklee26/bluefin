@@ -1,5 +1,5 @@
 use std::{
-    fmt::{self, Debug},
+    fmt::{self, format, Debug},
     sync::Arc,
     time::Duration,
 };
@@ -73,7 +73,8 @@ impl Connection {
     /// TODO: we might need to be stricter with this and return a Result<> instead
     pub(crate) fn new(
         dest_id: u32,
-        packet_number: u64,
+        next_recv_packet_number: u64,
+        next_send_packet_number: u64,
         source_ip: [u8; 4],
         source_port: u16,
         destination_ip: [u8; 4],
@@ -102,7 +103,8 @@ impl Connection {
             context: Context {
                 host_type,
                 state: State::Handshake,
-                packet_number,
+                next_recv_packet_number,
+                next_send_packet_number,
             },
         }
     }
@@ -125,7 +127,7 @@ impl Connection {
 
     /// Identical to `read` but with a specified timeout `duration`
     pub async fn read_with_timeout(&mut self, duration: Duration) -> Result<Packet> {
-        self.read_impl(Some(duration), None).await
+        self.read_impl(Some(duration), None, false).await
     }
 
     /// Identical to `read` but with a specified timeout `duration` and an `max_number_of_tries` retries
@@ -134,7 +136,18 @@ impl Connection {
         duration: Duration,
         max_number_of_tries: usize,
     ) -> Result<Packet> {
-        self.read_impl(Some(duration), Some(max_number_of_tries))
+        self.read_impl(Some(duration), Some(max_number_of_tries), false)
+            .await
+    }
+
+    /// Identical to `read_with_timeout_and_retries` but it skips packet number validation. This should only be used
+    /// for the first read handshake read scenario
+    pub async fn first_read_with_timeout_and_retries(
+        &mut self,
+        duration: Duration,
+        max_number_of_tries: usize,
+    ) -> Result<Packet> {
+        self.read_impl(Some(duration), Some(max_number_of_tries), true)
             .await
     }
 
@@ -148,16 +161,26 @@ impl Connection {
     /// shared across all connection's per device. This is why `Stream` reads are recommended; they
     /// are less blocking than this as this can block the `accept()` process.
     pub async fn read(&mut self) -> Result<Packet> {
-        self.read_impl(None, None).await
+        self.read_impl(None, None, false).await
     }
 
     async fn read_impl(
         &mut self,
         timeout: Option<Duration>,
         max_number_of_tries: Option<usize>,
+        skip_packet_number_validation: bool,
     ) -> Result<Packet> {
         let buffered_read = BufferedRead::new(Arc::clone(&self.buffer));
         if let Some(packet) = buffered_read.read(timeout, max_number_of_tries).await {
+            if !skip_packet_number_validation
+                && (packet.payload.header.packet_number != self.context.next_recv_packet_number)
+            {
+                return Err(BluefinError::InvalidHeaderError(format!(
+                    "Received unexpected packet number {:#08x} but expected {:#08x}",
+                    packet.payload.header.packet_number, self.context.next_recv_packet_number
+                )));
+            }
+            self.context.next_recv_packet_number += 1;
             return Ok(packet);
         }
 
@@ -189,7 +212,10 @@ impl Connection {
         let timeout = wrapped.unwrap();
 
         match timeout {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.context.next_send_packet_number += 1;
+                Ok(())
+            }
             Err(e) => Err(BluefinError::WriteError(format!("Failed to write. {}", e))),
         }
     }
@@ -214,7 +240,7 @@ impl Connection {
             0x0,
             security_fields,
         );
-        header.with_packet_number(self.context.packet_number);
+        header.with_packet_number(self.context.next_send_packet_number);
         if payload.is_some() {
             let packet = BluefinPacket::builder()
                 .header(header)

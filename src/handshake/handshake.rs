@@ -53,9 +53,6 @@ impl<'a> HandshakeHandler<'a> {
         }
         self.conn.dest_id = dest_id;
 
-        // Set packet_number for context
-        self.conn.context.packet_number = header.packet_number + 1;
-
         let security_fields = BluefinSecurityFields::new(true, 0b000_1111);
 
         let mut header = BluefinHeader::new(
@@ -65,7 +62,7 @@ impl<'a> HandshakeHandler<'a> {
             0x0,
             security_fields,
         );
-        header.with_packet_number(self.conn.context.packet_number);
+        header.with_packet_number(self.conn.context.next_send_packet_number);
 
         // Build and send packet
         let packet = BluefinPacket::builder().header(header).build();
@@ -78,17 +75,14 @@ impl<'a> HandshakeHandler<'a> {
         }
 
         // Read and validate client-ack. Let's keep this short so that we don't keep blocking the `Accept` thread
-        if let Err(e) = self
+        match self
             .conn
             .read_with_timeout_and_retries(Duration::from_secs(2), 2)
             .await
         {
-            eprintln!("Failed to read client ack.");
-            return Err(e);
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
         }
-        // conn_read_result.packet.validate(conn)?;
-
-        Ok(())
     }
 
     /// Pre-condition:
@@ -110,16 +104,6 @@ impl<'a> HandshakeHandler<'a> {
                 header.destination_connection_id, self.conn.source_id
             )));
         }
-
-        // Verify that the packet number is as expected
-        if header.packet_number != self.conn.context.packet_number + 1 {
-            return Err(BluefinError::InvalidHeaderError(format!(
-                "Pack-leader has incorrect packet number {:#016x}, was expecting {:#016x}",
-                header.packet_number, self.conn.context.packet_number
-            )));
-        }
-
-        self.conn.context.packet_number += 2;
 
         // The source (pack-leader) is our destination. Conenction id's can never be zero.
         let dest_id = header.source_connection_id as u32;

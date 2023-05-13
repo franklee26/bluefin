@@ -157,7 +157,7 @@ impl ReadWorker {
     /// performs simple validations and tries to buffer the packet via the `ConnectionManager`.
     pub(crate) async fn run(&mut self) {
         loop {
-            sleep(Duration::from_secs(3)).await;
+            sleep(Duration::from_secs(1)).await;
 
             let mut buf = vec![0; 1504];
             let res = self.file.read(&mut buf).await;

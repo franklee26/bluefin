@@ -109,7 +109,39 @@ impl Connection {
         }
     }
 
-    pub async fn request_stream(&mut self) -> Result<Stream> {
+    pub async fn open_stream(&mut self) -> Result<Stream> {
+        // Connection must be in the `Ready` state
+        if self.context.state != State::Ready {
+            return Err(BluefinError::CannotOpenStreamError);
+        }
+
+        // Type specific payload is 16 bits; the two MSE bits must be zero in a open stream request.
+        // The next 14 bits is the stream id.
+        let type_specific_payload: u16 = rand::thread_rng().gen_range(0..2_u16.pow(14));
+
+        // Deriving the starting stream packet number
+        let stream_packet_number =
+            (self.source_id ^ self.dest_id ^ type_specific_payload as u32) as u64;
+        // Create open stream header
+        let mut header = BluefinHeader::new(
+            self.source_id,
+            self.dest_id,
+            PacketType::StreamHello,
+            type_specific_payload,
+            BluefinSecurityFields::new(false, 0x0),
+        );
+        header.with_packet_number(stream_packet_number);
+
+        // Lock acquired
+        {
+            // Register new stream
+            let mut manager = self.read_stream_manager.lock().await;
+            let _ = manager.register_new_stream(type_specific_payload, stream_packet_number + 1);
+        }
+        // Lock released
+
+        // create packet
+        let packet = BluefinPacket::builder().header(header).build();
         todo!()
     }
 

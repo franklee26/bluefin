@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::{sync::Arc, time::Duration};
 
 use etherparse::{Ipv4Header, PacketHeaders};
@@ -10,7 +11,10 @@ use crate::core::serialisable::Serialisable;
 use crate::core::{error::BluefinError, packet::BluefinPacket, packet::Packet};
 
 use super::manager::ConnectionManager;
+use super::stream_manager::StreamManager;
 use super::Result;
+
+pub(crate) enum UpdateCommand {}
 
 /// Essentially a read-worker thread. Each worker attempts to read in bytes from the wire. Then,
 /// the worker determiens if the packet is a valid bluefin packet. If so, the worker will attempt
@@ -21,6 +25,7 @@ pub(crate) struct ReadWorker {
     file: File,
     need_ip_and_udp_headers: bool,
     host_type: BluefinHost,
+    connection_to_stream_manager_map: HashMap<String, StreamManager>,
 }
 
 /// Worker thread that occasionally wakes up and peeks into any possible matches between outstanding

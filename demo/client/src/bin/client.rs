@@ -1,9 +1,6 @@
-use std::time::Duration;
-
 use rand::Rng;
 
 use bluefin::hosts::client::BluefinClient;
-use tokio::time::sleep;
 
 const NUMBER_OF_CONNECTIONS: usize = 25;
 
@@ -41,8 +38,6 @@ async fn main() -> std::io::Result<()> {
                 Err(e) => eprintln!("{i}: {e}"),
             }
         });
-
-        sleep(Duration::from_millis(250)).await;
     }
 
     Ok(())

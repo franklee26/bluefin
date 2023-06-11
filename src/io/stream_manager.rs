@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     ops::Deref,
+    sync::Arc,
     task::Waker,
     vec,
 };
@@ -15,6 +16,10 @@ use crate::{
 };
 
 use super::{Buffer, Result};
+
+pub(crate) struct StreamManager {
+    inner: HashMap<u16, ReadStreamManager>,
+}
 
 /// The buffered stream data
 #[derive(Debug)]
@@ -54,6 +59,8 @@ impl ConsumedIter {
     }
 }
 
+/// Each unique stream gets its own unique `StreamReadBuffer`. This manager is used to organise and return
+/// readable, in-order bytes from the sender.
 #[derive(Debug)]
 pub(crate) struct StreamReadBuffer {
     /// The smallest sequence number that we are expecting to have non-empty data for. This means that each
@@ -300,7 +307,9 @@ impl Iterator for SegmentBufferIter {
     }
 }
 
-/// Manages stream write buffering.
+/// Manages stream write buffering. Each unique stream gets its own unique `WriteStreamManager`. Ultimately,
+/// a separate asynchronous pub-sub worker will use this manager to fetch in-order writeable packets to be
+/// sent over the wire.
 #[derive(Debug)]
 pub(crate) struct WriteStreamManager {
     /// The stream id for this stream manager.

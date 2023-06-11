@@ -9,7 +9,8 @@ pub enum PacketType {
     Warning = 0x03,
     DiscoveryProbe = 0x04,
     Broadcast = 0x05,
-    Stream = 0x06,
+    StreamHello = 0x06,
+    Stream = 0x07,
 }
 
 impl PacketType {
@@ -21,29 +22,9 @@ impl PacketType {
             0x03 => Self::Warning,
             0x04 => Self::DiscoveryProbe,
             0x05 => Self::Broadcast,
-            0x06 => Self::Stream,
-            _ => panic!("Unknown packet type {}", value),
-        }
-    }
-}
-
-/// 4 bits reserved for StreamPacketType => 16 possible stream packets
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamPacketType {
-    OpenRequest = 0x00,
-    CloseRequest = 0x01,
-    Data = 0x02,
-    Error = 0x03,
-}
-
-impl StreamPacketType {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0x00 => Self::OpenRequest,
-            0x01 => Self::CloseRequest,
-            0x02 => Self::Data,
-            0x03 => Self::Error,
-            _ => panic!("Unknown stream packet type {}", value),
+            0x06 => Self::StreamHello,
+            0x07 => Self::Stream,
+            _ => panic!("Unknown packet type: {}", value),
         }
     }
 }

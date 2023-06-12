@@ -1,8 +1,10 @@
 use std::collections::HashMap;
+use std::sync::RwLock;
 use std::{sync::Arc, time::Duration};
 
 use etherparse::{Ipv4Header, PacketHeaders};
 use rand::distributions::{Alphanumeric, DistString};
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::{fs::File, io::AsyncReadExt, time::sleep};
 
 use crate::core::context::BluefinHost;
@@ -14,7 +16,25 @@ use super::manager::ConnectionManager;
 use super::stream_manager::StreamManager;
 use super::Result;
 
-pub(crate) enum UpdateCommand {}
+pub(crate) enum ReadWorkerResponse {
+    Success,
+    Error,
+}
+
+pub(crate) enum ReadWorkerCommand {
+    InsertNewStreamManagerForConnection {
+        conn_id: String,
+        stream_manager: Arc<RwLock<StreamManager>>,
+        responder: Responder<ReadWorkerResponse>,
+    },
+    DeleteStreamManager {
+        conn_id: String,
+        responder: Responder<ReadWorkerResponse>,
+    },
+}
+
+/// Channel used to send reponse back to the invoker.
+pub(crate) type Responder<T> = tokio::sync::oneshot::Sender<T>;
 
 /// Essentially a read-worker thread. Each worker attempts to read in bytes from the wire. Then,
 /// the worker determiens if the packet is a valid bluefin packet. If so, the worker will attempt
@@ -25,7 +45,9 @@ pub(crate) struct ReadWorker {
     file: File,
     need_ip_and_udp_headers: bool,
     host_type: BluefinHost,
-    connection_to_stream_manager_map: HashMap<String, StreamManager>,
+    connection_to_stream_manager_map:
+        Arc<tokio::sync::Mutex<HashMap<String, RwLock<StreamManager>>>>,
+    tx: Option<Sender<ReadWorkerCommand>>,
 }
 
 /// Worker thread that occasionally wakes up and peeks into any possible matches between outstanding
@@ -80,12 +102,15 @@ impl ReadWorker {
         host_type: BluefinHost,
     ) -> Self {
         let id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+        let connection_to_stream_manager_map = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         Self {
             id,
             manager,
             file,
             need_ip_and_udp_headers,
             host_type,
+            connection_to_stream_manager_map,
+            tx: None,
         }
     }
 
@@ -161,10 +186,66 @@ impl ReadWorker {
         })
     }
 
+    /// Send a command to the read worker
+    pub(crate) async fn send(&self, cmd: ReadWorkerCommand) -> Result<()> {
+        if self.tx.is_none() {
+            return Err(BluefinError::WriteError("No tx available".to_string()));
+        }
+
+        if let Err(e) = self.tx.as_ref().unwrap().send(cmd).await {
+            return Err(BluefinError::WriteError(format!(
+                "Failed to issue command: {}",
+                e
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn run_worker_update_job(
+        mut rx: Receiver<ReadWorkerCommand>,
+        conn_to_stream_manager: Arc<tokio::sync::Mutex<HashMap<String, RwLock<StreamManager>>>>,
+    ) {
+        while let Some(cmd) = rx.recv().await {
+            use crate::io::worker::ReadWorkerCommand::*;
+
+            let mut guard = conn_to_stream_manager.lock().await;
+
+            match cmd {
+                InsertNewStreamManagerForConnection {
+                    conn_id,
+                    stream_manager,
+                    responder,
+                } => {
+                    if guard.contains_key(&conn_id) {
+                        let _ = responder.send(ReadWorkerResponse::Error);
+                        continue;
+                    }
+
+                    let _ = responder.send(ReadWorkerResponse::Success);
+                }
+                DeleteStreamManager { conn_id, responder } => {
+                    todo!();
+                }
+            }
+        }
+    }
+
     /// Run a single, infinite loop. This continuously reads from the network, verifies if it is an Bluefin packet,
     /// performs simple validations and tries to buffer the packet via the `ConnectionManager`.
     pub(crate) async fn run(&mut self) {
         let mut is_first_run = true;
+
+        // Set transmitter & receiver
+        let (tx, rx) = mpsc::channel(10);
+        self.tx = Some(tx);
+        let cloned_map = Arc::clone(&self.connection_to_stream_manager_map);
+
+        // Spawn one update job
+        tokio::spawn(async move {
+            Self::run_worker_update_job(rx, cloned_map).await;
+        });
+
         loop {
             if !is_first_run {
                 sleep(Duration::from_millis(500)).await;

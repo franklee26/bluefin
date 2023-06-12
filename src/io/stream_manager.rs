@@ -21,6 +21,14 @@ pub(crate) struct StreamManager {
     inner: HashMap<u16, ReadStreamManager>,
 }
 
+impl StreamManager {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: HashMap::new(),
+        }
+    }
+}
+
 /// The buffered stream data
 #[derive(Debug)]
 pub struct StreamBuffer {

@@ -1,48 +1,18 @@
-use std::sync::Arc;
-
 use etherparse::PacketBuilder;
-use tokio::fs::File;
 
-use crate::{
-    core::{context::BluefinHost, packet::Packet},
-    io::{manager::ConnectionBuffer, stream_manager::ReadStreamManager},
-    network::connection::Connection,
-};
+use crate::core::error::BluefinError;
 
-/// Synchronously locked - mutuably shared ConnectionBuffer reference
-pub(crate) type SyncConnBufferRef = Arc<std::sync::Mutex<ConnectionBuffer>>;
+pub type BluefinResult<T> = Result<T, BluefinError>;
 
-/// Builds a connection from an client-hello packet. Note that this function does not actually validate
-/// whether `packet` is in fact an valid client-hello. This is up to the invoker.
-#[inline]
-pub(crate) fn build_connection_from_packet(
-    packet: &Packet,
-    source_id: u32,
-    host_type: BluefinHost,
-    need_ip_and_udp_headers: bool,
-    buffer: Arc<std::sync::Mutex<ConnectionBuffer>>,
-    read_stream_manager: Arc<tokio::sync::Mutex<ReadStreamManager>>,
-    file: File,
-    next_send_packet_number: u64,
-) -> Connection {
-    let mut conn = Connection::new(
-        // The destination id must be whatever the src is calling its src id
-        packet.payload.header.source_connection_id as u32,
-        packet.payload.header.packet_number + 1,
-        next_send_packet_number,
-        packet.dst_ip,
-        packet.dst_port,
-        packet.src_ip,
-        packet.src_port,
-        host_type,
-        need_ip_and_udp_headers,
-        file,
-        buffer,
-        read_stream_manager,
-    );
-    conn.source_id = source_id;
-
-    conn
+#[macro_export]
+macro_rules! set_some_builder_field {
+    ($field_name:ident,$field_type:ident) => {
+        #[inline]
+        pub fn $field_name(mut self, $field_name: $field_type) -> Self {
+            self.$field_name = Some($field_name);
+            self
+        }
+    };
 }
 
 /// Converts a string representation of an ip address to a byte-vector representation

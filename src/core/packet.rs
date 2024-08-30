@@ -1,6 +1,6 @@
-use crate::{core::header::BluefinHeader, network::connection::Connection};
+use crate::core::header::BluefinHeader;
 
-use super::{error::BluefinError, serialisable::Serialisable};
+use super::{error::BluefinError, Serialisable};
 
 #[derive(Clone, Debug)]
 pub struct BluefinPacket {

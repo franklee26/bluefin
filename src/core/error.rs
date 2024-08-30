@@ -8,6 +8,9 @@ pub enum BluefinError {
     #[error("`{0}`")]
     DeserialiseError(String),
 
+    #[error("Connection buffer does not exist")]
+    BufferDoesNotExist,
+
     #[error("Current buffer is full.")]
     BufferFullError,
 
@@ -61,4 +64,18 @@ pub enum BluefinError {
 
     #[error("No such stream buffered")]
     NoSuchStreamError,
+
+    #[error("std::io::Error: `{0}`")]
+    StdIoError(String),
+
+    #[error("`{0}`")]
+    Unexpected(String),
+}
+
+/// Allows us to convert from std::io::Error to Bluefin errors. This is mostly a quality
+/// of life requirement since this let's use the `?` operator with greater ease.
+impl From<std::io::Error> for BluefinError {
+    fn from(error: std::io::Error) -> Self {
+        BluefinError::StdIoError(error.to_string())
+    }
 }

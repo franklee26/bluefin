@@ -1,4 +1,4 @@
-use super::{error::BluefinError, serialisable::Serialisable};
+use super::{error::BluefinError, Serialisable};
 
 /// 4 bits reserved for PacketType => 16 possible packet types
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -205,7 +205,7 @@ impl Serialisable for BluefinHeader {
 mod tests {
     use crate::core::{
         header::{BluefinSecurityFields, PacketType},
-        serialisable::Serialisable,
+        Serialisable,
     };
 
     use super::BluefinHeader;

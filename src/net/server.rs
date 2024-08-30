@@ -1,57 +1,59 @@
 use std::{
-    io::Write,
     net::SocketAddr,
     sync::{Arc, Mutex},
 };
 
-use tokio::{net::UdpSocket, spawn};
+use rand::Rng;
+use tokio::{net::UdpSocket, spawn, sync::RwLock};
 
 use crate::{
     core::{
-        error::BluefinError,
+        context::BluefinHost,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
         Serialisable,
     },
+    net::connection::HandshakeConnectionBuffer,
     utils::common::BluefinResult,
-    worker::reader::{ReaderChannel, RxChannel},
+    worker::reader::TxChannel,
 };
 
-use super::connection::ConnectionBuffer;
+use super::connection::{BluefinConnection, ConnectionBuffer, ConnectionManager};
 
+#[derive(Clone)]
 pub struct BluefinServer {
     socket: Option<Arc<UdpSocket>>,
     bind_called: bool,
     src_addr: SocketAddr,
     dst_addr: Option<SocketAddr>,
-    rx: Option<RxChannel>,
     client_hello_handled: bool,
+    conn_manager: Arc<RwLock<ConnectionManager>>,
+    pending_accept_ids: Arc<Mutex<Vec<u32>>>,
 }
 
 impl BluefinServer {
     pub fn new(src_addr: SocketAddr) -> Self {
         Self {
             socket: None,
-            rx: None,
             dst_addr: None,
             bind_called: false,
             client_hello_handled: false,
+            conn_manager: Arc::new(RwLock::new(ConnectionManager::new())),
+            pending_accept_ids: Arc::new(Mutex::new(Vec::new())),
             src_addr,
         }
     }
 
     pub async fn bind(&mut self) -> BluefinResult<()> {
-        let buffer = ConnectionBuffer::new();
-
         let socket = UdpSocket::bind(self.src_addr).await?;
         self.socket = Some(Arc::new(socket));
 
-        let (tx, rx) = ReaderChannel::new(
+        let tx = TxChannel::new(
             Arc::clone(self.socket.as_ref().unwrap()),
-            Arc::new(Mutex::new(buffer)),
+            Arc::clone(&self.conn_manager),
+            Arc::clone(&self.pending_accept_ids),
+            BluefinHost::PackLeader,
         );
-
-        self.rx = Some(rx);
 
         for i in 0..10 {
             let mut tx_clone = tx.clone();
@@ -65,58 +67,54 @@ impl BluefinServer {
         Ok(())
     }
 
-    pub async fn recv(&mut self, buf: &mut [u8]) -> BluefinResult<usize> {
-        if !self.bind_called {
-            return Err(BluefinError::InvalidSocketError);
-        }
+    pub async fn accept(&mut self) -> BluefinResult<BluefinConnection> {
+        // generate random conn id and insert buffer
+        let src_conn_id: u32 = rand::thread_rng().gen();
+        eprintln!("src_conn_id: {}", src_conn_id);
+        let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new()));
+        let hello_key = format!("{}_0", src_conn_id);
+        let _ = self
+            .conn_manager
+            .write()
+            .await
+            .insert(&hello_key, Arc::clone(&conn_buffer));
+        self.pending_accept_ids.lock().unwrap().push(src_conn_id);
 
-        if self.rx.is_none() {
-            return Err(BluefinError::BufferDoesNotExist);
-        }
+        let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
+        let (packet, addr) = handshake_buf.read().await;
+        let dst_conn_id = packet.header.source_connection_id;
+        let key = format!("{}_{}", src_conn_id, dst_conn_id);
 
-        let (bytes, addr) = self.rx.as_ref().unwrap().read().await;
+        // delete the old hello entry and insert the new connection entry
+        let mut guard = self.conn_manager.write().await;
+        let _ = guard.remove(&hello_key);
+        let _ = guard.insert(&key, Arc::clone(&conn_buffer));
+        drop(guard);
 
-        // Need to set the destination address
-        if !self.client_hello_handled {
-            self.dst_addr = Some(addr);
-            self.socket
-                .as_ref()
-                .unwrap()
-                .connect(self.dst_addr.unwrap())
-                .await?;
-            self.client_hello_handled = true;
-        }
-
-        let size = buf.as_mut().write(&bytes)?;
-
-        return Ok(size);
-    }
-
-    pub async fn send(&self, buf: &[u8]) -> BluefinResult<usize> {
-        if !self.bind_called {
-            return Err(BluefinError::InvalidSocketError);
-        }
-
-        if !self.client_hello_handled {
-            return Err(BluefinError::WriteError(
-                "Cannot send bytes across socket as client hello has not completed".to_string(),
-            ));
-        }
-
-        // create bluefine packet and send
+        // send server hello
         let security_fields = BluefinSecurityFields::new(false, 0x0);
-        let header = BluefinHeader::new(0x0, 0x0, PacketType::Data, 0x0, security_fields);
-        let packet = BluefinPacket::builder()
-            .header(header)
-            .payload(buf.to_vec())
-            .build();
-        let bytes = self
-            .socket
+        let header = BluefinHeader::new(
+            src_conn_id,
+            dst_conn_id,
+            PacketType::UnencryptedServerHello,
+            0x0,
+            security_fields,
+        );
+        let packet = BluefinPacket::builder().header(header).build();
+        self.socket
             .as_ref()
             .unwrap()
-            .send(&packet.serialise())
+            .send_to(&packet.serialise(), addr)
             .await?;
 
-        Ok(bytes)
+        // Wait for client ack
+        let client_ack_packet = handshake_buf.read().await;
+
+        Ok(BluefinConnection::new(
+            src_conn_id,
+            dst_conn_id,
+            Arc::clone(&conn_buffer),
+            Arc::clone(self.socket.as_ref().unwrap()),
+        ))
     }
 }

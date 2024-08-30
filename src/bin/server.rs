@@ -4,7 +4,7 @@ use std::{
 };
 
 use bluefin::{net::server::BluefinServer, utils::common::BluefinResult};
-use tokio::time::sleep;
+use tokio::{spawn, time::sleep};
 
 #[tokio::main]
 async fn main() -> BluefinResult<()> {
@@ -14,11 +14,36 @@ async fn main() -> BluefinResult<()> {
     )));
     server.bind().await?;
 
-    loop {
-        let mut recv_bytes = [0u8; 1024];
-        let size = server.recv(&mut recv_bytes).await?;
+    const MAX_NUM_CONNECTIONS: usize = 5;
+    for _ in 0..MAX_NUM_CONNECTIONS {
+        let mut s = server.clone();
+        let _ = spawn(async move {
+            loop {
+                let _conn = s.accept().await;
 
-        println!(">>> Received: {:?}", &recv_bytes[..size]);
-        sleep(Duration::from_secs(1)).await;
+                if let Ok(mut conn) = _conn {
+                    spawn(async move {
+                        loop {
+                            let mut recv_bytes = [0u8; 1024];
+                            let size = conn.recv(&mut recv_bytes).await.unwrap();
+
+                            println!(
+                                "({}_{}) >>> Received: {:?}",
+                                conn.src_conn_id,
+                                conn.dst_conn_id,
+                                &recv_bytes[..size],
+                            );
+                            sleep(Duration::from_secs(1)).await;
+                        }
+                    });
+                }
+
+                sleep(Duration::from_secs(1)).await;
+            }
+        });
     }
+
+    // The spawned tasks are looping forever. This infinite loop will keep the
+    // process up forever.
+    loop {}
 }

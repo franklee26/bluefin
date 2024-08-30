@@ -70,6 +70,9 @@ pub enum BluefinError {
 
     #[error("`{0}`")]
     Unexpected(String),
+
+    #[error("`{0}`")]
+    TimedOut(String),
 }
 
 /// Allows us to convert from std::io::Error to Bluefin errors. This is mostly a quality

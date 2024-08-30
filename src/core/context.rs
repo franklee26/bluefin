@@ -1,5 +1,5 @@
 /// The endpoint host type
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BluefinHost {
     PackLeader,
     PackFollower,

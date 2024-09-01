@@ -15,11 +15,3 @@ pub enum State {
     Error,
     Ready,
 }
-
-#[derive(Debug)]
-pub(crate) struct Context {
-    pub host_type: BluefinHost,
-    pub state: State,
-    pub next_recv_packet_number: u64,
-    pub next_send_packet_number: u64,
-}

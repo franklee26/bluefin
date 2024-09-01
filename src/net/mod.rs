@@ -1,4 +1,8 @@
-use crate::core::{context::BluefinHost, header::PacketType, packet::BluefinPacket};
+use crate::core::{
+    context::BluefinHost,
+    header::{BluefinHeader, BluefinSecurityFields, PacketType},
+    packet::BluefinPacket,
+};
 
 pub mod client;
 pub mod connection;
@@ -55,4 +59,15 @@ pub(crate) fn is_client_ack_packet(host_type: BluefinHost, packet: &BluefinPacke
         return true;
     }
     false
+}
+
+#[inline]
+pub(crate) fn build_empty_encrypted_packet(
+    src_conn_id: u32,
+    dst_conn_id: u32,
+    packet_type: PacketType,
+) -> BluefinPacket {
+    let security_fields = BluefinSecurityFields::new(false, 0x0);
+    let header = BluefinHeader::new(src_conn_id, dst_conn_id, packet_type, 0x0, security_fields);
+    BluefinPacket::builder().header(header).build()
 }

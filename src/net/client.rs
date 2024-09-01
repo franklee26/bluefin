@@ -8,14 +8,8 @@ use rand::Rng;
 use tokio::{net::UdpSocket, spawn, sync::RwLock, time::timeout};
 
 use crate::{
-    core::{
-        context::BluefinHost,
-        error::BluefinError,
-        header::{BluefinHeader, BluefinSecurityFields, PacketType},
-        packet::BluefinPacket,
-        Serialisable,
-    },
-    net::connection::HandshakeConnectionBuffer,
+    core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
+    net::{build_empty_encrypted_packet, connection::HandshakeConnectionBuffer},
     utils::common::BluefinResult,
     worker::reader::TxChannel,
 };
@@ -70,15 +64,8 @@ impl BluefinClient {
             .insert(&hello_key, Arc::clone(&conn_buffer))?;
 
         // send the client hello
-        let security_fields = BluefinSecurityFields::new(false, 0x0);
-        let header = BluefinHeader::new(
-            src_conn_id,
-            0,
-            PacketType::UnencryptedClientHello,
-            0x0,
-            security_fields,
-        );
-        let packet = BluefinPacket::builder().header(header).build();
+        let packet =
+            build_empty_encrypted_packet(src_conn_id, 0x0, PacketType::UnencryptedClientHello);
         self.socket
             .as_ref()
             .unwrap()
@@ -90,7 +77,7 @@ impl BluefinClient {
         let res = timeout(server_hello_timeout, handshake_buf.read()).await;
         if let Err(_) = res {
             return Err(BluefinError::TimedOut(
-                "Did not receive server hello within time constraint".to_string(),
+                "Did not receive server hello in time".to_string(),
             ));
         }
         let (packet, _) = res.unwrap();
@@ -104,15 +91,7 @@ impl BluefinClient {
         drop(guard);
 
         // send the client ack
-        let security_fields = BluefinSecurityFields::new(false, 0x0);
-        let header = BluefinHeader::new(
-            src_conn_id,
-            dst_conn_id,
-            PacketType::Ack,
-            0x0,
-            security_fields,
-        );
-        let packet = BluefinPacket::builder().header(header).build();
+        let packet = build_empty_encrypted_packet(src_conn_id, dst_conn_id, PacketType::Ack);
         self.socket
             .as_ref()
             .unwrap()

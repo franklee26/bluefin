@@ -21,11 +21,14 @@ use crate::{
     worker::reader::RxChannel,
 };
 
-const MAX_BUFFER_SIZE: usize = 2000;
-pub(crate) const MAX_BUFFER_CONSUME: usize = 1000;
+pub const MAX_BUFFER_SIZE: usize = 2000;
+pub const MAX_BUFFER_CONSUME: usize = 1000;
 
-/// A `ConnectionBuffer` is a future of buffered packets. For now, the buffer only
-/// holds at most 2000 bytes.
+/// ConnectionBuffer as the name suggests is a buffer allocated per connection. This buffer
+/// is shared between reader jobs and the actual owning connection. For usual connection
+/// usage, we are usually interested in the bytes buffered in the `bytes` field, which is
+/// limited by the [MAX_BUFFER_SIZE]. For a handshake scenario, we are interested in the
+/// actual Bluefin [packet](Self::packet), which contains important information for the handshake.
 #[derive(Clone)]
 pub(crate) struct ConnectionBuffer {
     bytes: Vec<u8>,
@@ -35,6 +38,11 @@ pub(crate) struct ConnectionBuffer {
     dst_conn_id: u32,
 }
 
+/// HandshakeConnectionBuffer is a wrapper around the shared ConnectionBuffer. We need this
+/// wrapper as it serves as a special future for handling handshake scenarios.
+/// [HandshakeConnectionBuffer::read] this future yields a single bluefin packet and socket
+/// address information. The bluefin packet is guaranteed to be an UnencryptedClientHello,
+/// UnencryptedServerHello or Ack from the client (signalling the completion of the handshake).
 #[derive(Clone)]
 pub(crate) struct HandshakeConnectionBuffer {
     conn_buff: Arc<Mutex<ConnectionBuffer>>,
@@ -45,6 +53,8 @@ impl HandshakeConnectionBuffer {
         Self { conn_buff }
     }
 
+    #[inline]
+    /// Awaits the future for a handshake-related packet stored in the [HandshakeConnectionBuffer::conn_buff].
     pub(crate) async fn read(&self) -> (BluefinPacket, SocketAddr) {
         self.clone().await
     }
@@ -85,11 +95,6 @@ impl ConnectionBuffer {
     }
 
     #[inline]
-    pub(crate) fn len(&self) -> usize {
-        self.bytes.len()
-    }
-
-    #[inline]
     pub(crate) fn is_full(&self) -> bool {
         self.bytes.len() >= MAX_BUFFER_SIZE
     }
@@ -97,11 +102,6 @@ impl ConnectionBuffer {
     #[inline]
     pub(crate) fn set_dst_conn_id(&mut self, dst_conn_id: u32) {
         self.dst_conn_id = dst_conn_id;
-    }
-
-    #[inline]
-    pub(crate) fn get_dst_conn_id(&self) -> u32 {
-        self.dst_conn_id
     }
 
     #[inline]
@@ -128,12 +128,12 @@ impl ConnectionBuffer {
     }
 
     #[inline]
-    pub(crate) fn buffer_in_packet(&mut self, packet: BluefinPacket) -> BluefinResult<()> {
+    pub(crate) fn buffer_in_packet(&mut self, packet: &BluefinPacket) -> BluefinResult<()> {
         if self.packet.is_some() {
             return Err(BluefinError::BufferFullError);
         }
 
-        self.packet = Some(packet);
+        self.packet = Some(packet.clone());
 
         Ok(())
     }
@@ -142,15 +142,6 @@ impl ConnectionBuffer {
     pub(crate) fn consume(&mut self) -> BluefinResult<(Vec<u8>, SocketAddr)> {
         if !self.have_bytes() {
             return Err(BluefinError::BufferEmptyError);
-        }
-
-        if self.addr.is_none() {
-            eprintln!("Consume: empty addr");
-            /*
-            return Err(BluefinError::Unexpected(
-                "Address not found, could not consume".to_string(),
-            ));
-            */
         }
 
         let num_bytes_to_consume = min(MAX_BUFFER_CONSUME, self.bytes.len());
@@ -174,6 +165,14 @@ impl ConnectionBuffer {
     }
 }
 
+/// ConnectionManager is what allows a single bluefin server to maintain multiple connections.
+/// This struct is essentially a [mapping](Self::map) between a unique bidirectional connection key and its
+/// connection buffer, which contains any bytes received during the connection. The unique key
+/// has the form `{src_conn_id}_{dst_conn_id}`. If we are a client attempting to connect to a
+/// server, then we do not know the dst_conn_id key. By protocol, the client must set the dst
+/// id to 0x0.
+/// This structure is used by all bluefin hosts to 'register' any new connections and is also
+/// used by the reader TX worker to determine where to buffer a newly received packet.
 pub(crate) struct ConnectionManager {
     /// Key: {src_conn_id}_{dst_conn_id}
     /// Value: The connectino buffer
@@ -187,6 +186,7 @@ impl ConnectionManager {
         }
     }
 
+    #[inline]
     pub(crate) fn insert(
         &mut self,
         key: &str,
@@ -201,20 +201,28 @@ impl ConnectionManager {
         Ok(())
     }
 
+    #[inline]
     pub(crate) fn get(&self, key: &str) -> Option<Arc<Mutex<ConnectionBuffer>>> {
         self.map.get(key).cloned()
     }
 
+    #[inline]
     pub(crate) fn remove(&mut self, key: &str) -> BluefinResult<()> {
+        if self.map.remove(key).is_none() {
+            return Err(BluefinError::NoSuchConnectionError);
+        }
         Ok(())
     }
 }
 
+/// BluefinConnection represents a successful bluefin connection i.e. a bidirectional
+/// connection established between a client and server after the handshake process
+/// has completed successfully. A bluefin connection allows users to [receive](BluefinConnection::recv)
+/// and to [send](BluefinConnection::send) bytes across the wire.
 pub struct BluefinConnection {
     pub src_conn_id: u32,
     pub dst_conn_id: u32,
     socket: Arc<UdpSocket>,
-    conn_buffer: Arc<Mutex<ConnectionBuffer>>,
     rx: RxChannel,
 }
 
@@ -225,22 +233,23 @@ impl BluefinConnection {
         conn_buffer: Arc<Mutex<ConnectionBuffer>>,
         socket: Arc<UdpSocket>,
     ) -> Self {
-        let rx = RxChannel::new(src_conn_id, Arc::clone(&conn_buffer));
+        let rx = RxChannel::new(Arc::clone(&conn_buffer));
         Self {
             src_conn_id,
             dst_conn_id,
             rx,
             socket,
-            conn_buffer: Arc::clone(&conn_buffer),
         }
     }
 
+    #[inline]
     pub async fn recv(&mut self, buf: &mut [u8]) -> BluefinResult<usize> {
-        let (bytes, addr) = self.rx.read().await;
+        let (bytes, _) = self.rx.read().await;
         let size = buf.as_mut().write(&bytes)?;
         return Ok(size);
     }
 
+    #[inline]
     pub async fn send(&self, buf: &[u8]) -> BluefinResult<usize> {
         // create bluefin packet and send
         let security_fields = BluefinSecurityFields::new(false, 0x0);

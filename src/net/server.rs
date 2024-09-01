@@ -7,13 +7,8 @@ use rand::Rng;
 use tokio::{net::UdpSocket, spawn, sync::RwLock};
 
 use crate::{
-    core::{
-        context::BluefinHost,
-        header::{BluefinHeader, BluefinSecurityFields, PacketType},
-        packet::BluefinPacket,
-        Serialisable,
-    },
-    net::connection::HandshakeConnectionBuffer,
+    core::{context::BluefinHost, header::PacketType, Serialisable},
+    net::{build_empty_encrypted_packet, connection::HandshakeConnectionBuffer},
     utils::common::BluefinResult,
     worker::reader::TxChannel,
 };
@@ -25,8 +20,6 @@ pub struct BluefinServer {
     socket: Option<Arc<UdpSocket>>,
     bind_called: bool,
     src_addr: SocketAddr,
-    dst_addr: Option<SocketAddr>,
-    client_hello_handled: bool,
     conn_manager: Arc<RwLock<ConnectionManager>>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
 }
@@ -35,9 +28,7 @@ impl BluefinServer {
     pub fn new(src_addr: SocketAddr) -> Self {
         Self {
             socket: None,
-            dst_addr: None,
             bind_called: false,
-            client_hello_handled: false,
             conn_manager: Arc::new(RwLock::new(ConnectionManager::new())),
             pending_accept_ids: Arc::new(Mutex::new(Vec::new())),
             src_addr,
@@ -92,15 +83,11 @@ impl BluefinServer {
         drop(guard);
 
         // send server hello
-        let security_fields = BluefinSecurityFields::new(false, 0x0);
-        let header = BluefinHeader::new(
+        let packet = build_empty_encrypted_packet(
             src_conn_id,
             dst_conn_id,
             PacketType::UnencryptedServerHello,
-            0x0,
-            security_fields,
         );
-        let packet = BluefinPacket::builder().header(header).build();
         self.socket
             .as_ref()
             .unwrap()
@@ -108,7 +95,7 @@ impl BluefinServer {
             .await?;
 
         // Wait for client ack
-        let client_ack_packet = handshake_buf.read().await;
+        let _ = handshake_buf.read().await;
 
         Ok(BluefinConnection::new(
             src_conn_id,

@@ -21,27 +21,6 @@ impl PacketType {
     }
 }
 
-/// 4 bits reserved for StreamPacketType => 16 possible stream packets
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StreamPacketType {
-    OpenRequest = 0x00,
-    CloseRequest = 0x01,
-    Data = 0x02,
-    Error = 0x03,
-}
-
-impl StreamPacketType {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0x00 => Self::OpenRequest,
-            0x01 => Self::CloseRequest,
-            0x02 => Self::Data,
-            0x03 => Self::Error,
-            _ => panic!("Unknown stream packet type {}", value),
-        }
-    }
-}
-
 /// This struct contains the encryption flag and header-protection fields for a total of 8 bits
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BluefinSecurityFields {

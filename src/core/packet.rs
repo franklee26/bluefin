@@ -1,6 +1,6 @@
-use crate::{core::header::BluefinHeader, network::connection::Connection};
+use crate::core::header::BluefinHeader;
 
-use super::{error::BluefinError, serialisable::Serialisable};
+use super::{error::BluefinError, Serialisable};
 
 #[derive(Clone, Debug)]
 pub struct BluefinPacket {
@@ -25,6 +25,7 @@ pub struct Packet {
 }
 
 impl Serialisable for BluefinPacket {
+    #[inline]
     fn serialise(&self) -> Vec<u8> {
         let mut header_bytes = self.header.serialise();
         let mut payload_bytes = self.payload.clone();
@@ -33,6 +34,7 @@ impl Serialisable for BluefinPacket {
         header_bytes
     }
 
+    #[inline]
     fn deserialise(bytes: &[u8]) -> Result<Self, BluefinError>
     where
         Self: Sized,
@@ -50,6 +52,7 @@ impl Serialisable for BluefinPacket {
 }
 
 impl BluefinPacket {
+    #[inline]
     pub fn builder() -> BluefinPacketBuilder {
         BluefinPacketBuilder {
             header: None,
@@ -59,16 +62,19 @@ impl BluefinPacket {
 }
 
 impl BluefinPacketBuilder {
+    #[inline]
     pub fn header(mut self, header: BluefinHeader) -> Self {
         self.header = Some(header);
         self
     }
 
+    #[inline]
     pub fn payload(mut self, payload: Vec<u8>) -> Self {
         self.payload = Some(payload);
         self
     }
 
+    #[inline]
     pub fn build(self) -> BluefinPacket {
         BluefinPacket {
             header: self.header.unwrap(),

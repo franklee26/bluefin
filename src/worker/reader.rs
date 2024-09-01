@@ -18,7 +18,12 @@ use crate::{
 };
 
 #[derive(Clone)]
-/// TxChannel
+/// [TxChannel] is the transmission channel for the receiving [RxChannel]. This channel will when
+/// [run](Self::run), asynchronously read from the udp socket and upon receiving a packet, the channel
+/// attempts to serialise it to a bluefin packet. If a bluefin packet is found then the channel will
+/// use the [conn_manager](Self::conn_manager) to identify the correct connection buffer and attempt
+/// to buffer in the bytes/packet. In other words, this channel *transmits* bytes *into* the buffer
+/// and signals any awaiters that data is ready.
 pub(crate) struct TxChannel {
     pub(crate) id: u8,
     socket: Arc<UdpSocket>,
@@ -28,6 +33,9 @@ pub(crate) struct TxChannel {
 }
 
 #[derive(Clone)]
+/// [RxChannel] is the receiving channel for the transmitting [RxChannel]. This channel will when
+/// [read](Self::read), asynchronously peek into [Self::buffer] and retrieve any buffered contents.
+/// This channel *receives* bytes *from* the buffer.
 pub(crate) struct RxChannel {
     buffer: Arc<Mutex<ConnectionBuffer>>,
 }
@@ -169,6 +177,8 @@ impl TxChannel {
         Ok(())
     }
 
+    /// The [TxChannel]'s engine runner. This method will run forever and is responsible for reading bytes
+    /// from the udp socket into a connection buffer. This method should be run its own asynchronous task.
     pub(crate) async fn run(&mut self) -> BluefinResult<()> {
         let mut encountered_err = false;
 

@@ -1,3 +1,5 @@
+use crate::utils::common::BluefinResult;
+
 use super::{error::BluefinError, Serialisable};
 
 /// 4 bits reserved for PacketType => 16 possible packet types
@@ -120,12 +122,14 @@ impl BluefinHeader {
         }
     }
 
+    #[inline]
     pub fn with_packet_number(&mut self, packet_number: u64) {
         self.packet_number = packet_number;
     }
 }
 
 impl Serialisable for BluefinHeader {
+    #[inline]
     fn serialise(&self) -> Vec<u8> {
         let first_byte = (self.version << 4) | self.type_field as u8;
         [
@@ -139,7 +143,8 @@ impl Serialisable for BluefinHeader {
         .concat()
     }
 
-    fn deserialise(bytes: &[u8]) -> Result<Self, BluefinError> {
+    #[inline]
+    fn deserialise(bytes: &[u8]) -> BluefinResult<Self> {
         if bytes.len() != 20 {
             return Err(BluefinError::DeserialiseError(
                 "Bluefin header must be exactly 20 bytes".to_string(),

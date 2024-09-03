@@ -87,7 +87,6 @@ impl TxChannel {
     #[inline]
     async fn run_sleep(encountered_err: &mut bool) {
         if !*encountered_err {
-            sleep(Duration::from_millis(50)).await;
             return;
         }
         sleep(Duration::from_millis(100)).await;
@@ -145,7 +144,7 @@ impl TxChannel {
     fn buffer_in_data(
         is_hello: bool,
         is_client_ack: bool,
-        packet: &mut BluefinPacket,
+        packet: &BluefinPacket,
         addr: SocketAddr,
         buffer: Arc<Mutex<ConnectionBuffer>>,
     ) -> BluefinResult<()> {
@@ -197,7 +196,7 @@ impl TxChannel {
             }
 
             // Acquire lock and buffer in data
-            let mut packet = packet_res.unwrap();
+            let packet = packet_res.unwrap();
             let mut src_conn_id = packet.header.destination_connection_id;
             let dst_conn_id = packet.header.source_connection_id;
             let mut is_hello = false;
@@ -230,7 +229,7 @@ impl TxChannel {
 
             let buffer = _conn_buf.unwrap();
             if let Err(e) =
-                TxChannel::buffer_in_data(is_hello, is_client_ack, &mut packet, addr, buffer)
+                TxChannel::buffer_in_data(is_hello, is_client_ack, &packet, addr, buffer)
             {
                 eprintln!("Failed to buffer in data: {}", e);
                 encountered_err = true;

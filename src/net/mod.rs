@@ -6,6 +6,7 @@ use crate::core::{
 
 pub mod client;
 pub mod connection;
+pub mod ordered_bytes;
 pub mod server;
 
 /// Helper to determine whether a given `packet` is a valid hello packet eg. client-hello or pack-leader-hello
@@ -65,9 +66,12 @@ pub(crate) fn is_client_ack_packet(host_type: BluefinHost, packet: &BluefinPacke
 pub(crate) fn build_empty_encrypted_packet(
     src_conn_id: u32,
     dst_conn_id: u32,
+    packet_number: u64,
     packet_type: PacketType,
 ) -> BluefinPacket {
     let security_fields = BluefinSecurityFields::new(false, 0x0);
-    let header = BluefinHeader::new(src_conn_id, dst_conn_id, packet_type, 0x0, security_fields);
+    let mut header =
+        BluefinHeader::new(src_conn_id, dst_conn_id, packet_type, 0x0, security_fields);
+    header.with_packet_number(packet_number);
     BluefinPacket::builder().header(header).build()
 }

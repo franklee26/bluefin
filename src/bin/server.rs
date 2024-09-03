@@ -19,6 +19,7 @@ async fn main() -> BluefinResult<()> {
         let mut s = server.clone();
         let _ = spawn(async move {
             loop {
+                println!();
                 let _conn = s.accept().await;
 
                 if let Ok(mut conn) = _conn {

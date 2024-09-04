@@ -38,6 +38,7 @@ pub(crate) struct TxChannel {
 /// This channel *receives* bytes *from* the buffer.
 pub(crate) struct RxChannel {
     buffer: Arc<Mutex<ConnectionBuffer>>,
+    bytes_to_read: usize,
 }
 
 impl Future for RxChannel {
@@ -48,7 +49,7 @@ impl Future for RxChannel {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let mut guard = self.buffer.lock().unwrap();
-        if let Ok((bytes, addr)) = guard.consume() {
+        if let Ok((bytes, addr)) = guard.consume(self.bytes_to_read) {
             return Poll::Ready((bytes, addr));
         }
 
@@ -59,7 +60,15 @@ impl Future for RxChannel {
 
 impl RxChannel {
     pub(crate) fn new(buffer: Arc<Mutex<ConnectionBuffer>>) -> Self {
-        Self { buffer }
+        Self {
+            buffer,
+            bytes_to_read: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_bytes_to_read(&mut self, bytes_to_read: usize) {
+        self.bytes_to_read = bytes_to_read;
     }
 
     #[inline]

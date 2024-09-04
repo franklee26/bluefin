@@ -12,7 +12,7 @@ use tokio::{spawn, time::sleep};
 async fn main() -> BluefinResult<()> {
     let ports = [1320, 1322];
     let mut tasks = vec![];
-    for ix in 0..2 {
+    for ix in 0..1 {
         // sleep(Duration::from_secs(3)).await;
         let task = spawn(async move {
             let mut client = BluefinClient::new(std::net::SocketAddr::V4(SocketAddrV4::new(

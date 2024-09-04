@@ -61,7 +61,7 @@ impl BluefinServer {
     pub async fn accept(&mut self) -> BluefinResult<BluefinConnection> {
         // generate random conn id and insert buffer
         let src_conn_id: u32 = rand::thread_rng().gen();
-        eprintln!("src_conn_id: {}", src_conn_id);
+        eprintln!("src_conn_id: 0x{:x}", src_conn_id);
         let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new(
             src_conn_id,
             BluefinHost::PackLeader,

@@ -6,13 +6,18 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, sync::RwLock, time::sleep};
+use tokio::{net::UdpSocket, spawn, sync::RwLock, time::sleep};
 
 use crate::{
-    core::{context::BluefinHost, error::BluefinError, packet::BluefinPacket, Serialisable},
+    core::{
+        context::BluefinHost, error::BluefinError, header::PacketType, packet::BluefinPacket,
+        Serialisable,
+    },
     net::{
+        build_ack_packet,
         connection::{ConnectionBuffer, ConnectionManager},
         is_client_ack_packet, is_hello_packet,
+        ordered_bytes::ConsumeResult,
     },
     utils::common::BluefinResult,
 };
@@ -34,22 +39,27 @@ pub(crate) struct TxChannel {
 
 #[derive(Clone)]
 /// [RxChannel] is the receiving channel for the transmitting [RxChannel]. This channel will when
-/// [read](Self::read), asynchronously peek into [Self::buffer] and retrieve any buffered contents.
-/// This channel *receives* bytes *from* the buffer.
+/// [read](Self::read), asynchronously peek into [Self::buffer] and will eventually return the
+/// buffered tuple contents ([ConsumeResult], [SocketAddr]). In other words, this channel
+/// *receives* bytes *from* the buffer.
 pub(crate) struct RxChannel {
+    socket: Arc<UdpSocket>,
     buffer: Arc<Mutex<ConnectionBuffer>>,
+    bytes_to_read: usize,
+    src_conn_id: u32,
+    dst_conn_id: u32,
 }
 
 impl Future for RxChannel {
-    type Output = (Vec<u8>, SocketAddr);
+    type Output = (ConsumeResult, SocketAddr);
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let mut guard = self.buffer.lock().unwrap();
-        if let Ok((bytes, addr)) = guard.consume() {
-            return Poll::Ready((bytes, addr));
+        if let Ok((consume_res, addr)) = guard.consume(self.bytes_to_read) {
+            return Poll::Ready((consume_res, addr));
         }
 
         guard.set_waker(cx.waker().clone());
@@ -58,13 +68,45 @@ impl Future for RxChannel {
 }
 
 impl RxChannel {
-    pub(crate) fn new(buffer: Arc<Mutex<ConnectionBuffer>>) -> Self {
-        Self { buffer }
+    pub(crate) fn new(
+        buffer: Arc<Mutex<ConnectionBuffer>>,
+        socket: Arc<UdpSocket>,
+        src_conn_id: u32,
+        dst_conn_id: u32,
+    ) -> Self {
+        Self {
+            buffer,
+            socket,
+            src_conn_id,
+            dst_conn_id,
+            bytes_to_read: 0,
+        }
     }
 
     #[inline]
-    pub(crate) async fn read(&self) -> (Vec<u8>, SocketAddr) {
-        self.clone().await
+    pub(crate) fn set_bytes_to_read(&mut self, bytes_to_read: usize) {
+        self.bytes_to_read = bytes_to_read;
+    }
+
+    #[inline]
+    pub(crate) async fn read(&self) -> BluefinResult<(Vec<u8>, SocketAddr)> {
+        let (consume_res, addr) = self.clone().await;
+        let num_packets_consumed = consume_res.get_num_packets_consumed();
+        let base_packet_num = consume_res.get_base_packet_number();
+
+        // We need to send an ack.
+        if num_packets_consumed > 0 {
+            let ack_packet = build_ack_packet(
+                self.src_conn_id,
+                self.dst_conn_id,
+                base_packet_num,
+                num_packets_consumed as u16,
+            );
+            let s = Arc::clone(&self.socket);
+            spawn(async move { s.send_to(&ack_packet.serialise(), addr).await });
+        }
+
+        Ok((consume_res.take_bytes(), addr))
     }
 }
 
@@ -87,7 +129,6 @@ impl TxChannel {
     #[inline]
     async fn run_sleep(encountered_err: &mut bool) {
         if !*encountered_err {
-            sleep(Duration::from_millis(50)).await;
             return;
         }
         sleep(Duration::from_millis(100)).await;
@@ -145,14 +186,19 @@ impl TxChannel {
     fn buffer_in_data(
         is_hello: bool,
         is_client_ack: bool,
-        packet: &mut BluefinPacket,
+        packet: &BluefinPacket,
         addr: SocketAddr,
         buffer: Arc<Mutex<ConnectionBuffer>>,
     ) -> BluefinResult<()> {
         let mut buffer_guard = buffer.lock().unwrap();
 
-        // If not hello, we buffer in the bytes
-        if !is_hello && !is_client_ack {
+        // Ack packets are buffered differently
+        if !is_client_ack && !is_hello && packet.header.type_field == PacketType::Ack {
+            if let Err(e) = buffer_guard.buffer_in_ack_packet(&packet) {
+                return Err(e);
+            }
+        } else if !is_hello && !is_client_ack {
+            // If not hello, we buffer in the bytes
             // Could not buffer in packet... buffer is likely full. We will have to discard the
             // packet.
             if let Err(e) = buffer_guard.buffer_in_bytes(packet) {
@@ -197,7 +243,7 @@ impl TxChannel {
             }
 
             // Acquire lock and buffer in data
-            let mut packet = packet_res.unwrap();
+            let packet = packet_res.unwrap();
             let mut src_conn_id = packet.header.destination_connection_id;
             let dst_conn_id = packet.header.source_connection_id;
             let mut is_hello = false;
@@ -230,7 +276,7 @@ impl TxChannel {
 
             let buffer = _conn_buf.unwrap();
             if let Err(e) =
-                TxChannel::buffer_in_data(is_hello, is_client_ack, &mut packet, addr, buffer)
+                TxChannel::buffer_in_data(is_hello, is_client_ack, &packet, addr, buffer)
             {
                 eprintln!("Failed to buffer in data: {}", e);
                 encountered_err = true;

@@ -19,7 +19,7 @@ async fn main() -> BluefinResult<()> {
                 Ipv4Addr::new(10, 0, 0, 31),
                 ports[ix],
             )));
-            let conn = client
+            let mut conn = client
                 .connect(std::net::SocketAddr::V4(SocketAddrV4::new(
                     Ipv4Addr::new(10, 0, 0, 31),
                     1318,
@@ -40,7 +40,44 @@ async fn main() -> BluefinResult<()> {
                 size = conn.send(&[3; 8]).await?;
                 println!("Sent {} bytes", size);
 
-                sleep(Duration::from_secs(2)).await;
+                size = conn.send(&[100; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[101; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[102; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[103; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[104; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[105; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[106; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[107; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[108; 10]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[109; 50]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[110; 50]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[111; 50]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[112; 50]).await?;
+                println!("Sent {} bytes", size);
 
                 size = conn.send(&[12, 12, 12, 12, 12, 12]).await?;
                 println!("Sent {} bytes", size);
@@ -54,6 +91,9 @@ async fn main() -> BluefinResult<()> {
                 let mut size = conn.send(&bytes).await?;
                 println!("Sent {} bytes", size);
 
+                size = conn.send(&[5; 20]).await?;
+                println!("Sent {} bytes", size);
+
                 size = conn.send(&[6; 10]).await?;
                 println!("Sent {} bytes", size);
 
@@ -63,9 +103,12 @@ async fn main() -> BluefinResult<()> {
                 size = conn.send(&[9; 8]).await?;
                 println!("Sent {} bytes", size);
 
+                size = conn.send(&[13, 13, 13, 13, 13, 13]).await?;
+                println!("Sent {} bytes", size);
+
                 sleep(Duration::from_secs(3)).await;
 
-                size = conn.send(&[13, 13, 13, 13, 13, 13]).await?;
+                size = conn.send(&[15, 15, 15]).await?;
                 println!("Sent {} bytes", size);
             }
 

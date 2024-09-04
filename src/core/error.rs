@@ -56,8 +56,8 @@ pub enum BluefinError {
     #[error("Socket is not valid.")]
     InvalidSocketError,
 
-    #[error("Encountered segment with unexpected segment number.")]
-    UnexpectedSegmentError,
+    #[error("Encountered packet with unexpected packet number.")]
+    UnexpectedPacketNumberError,
 
     #[error("Could not buffer data: `{0}`")]
     CannotBufferError(String),

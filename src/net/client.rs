@@ -52,8 +52,11 @@ impl BluefinClient {
         self.dst_addr = Some(dst_addr);
 
         let src_conn_id: u32 = rand::thread_rng().gen();
-        eprintln!("client src id: {}", src_conn_id);
-        let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new()));
+        eprintln!("client src id: 0x{:x}", src_conn_id);
+        let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new(
+            src_conn_id,
+            BluefinHost::Client,
+        )));
         let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
 
         // Register the connection
@@ -64,8 +67,13 @@ impl BluefinClient {
             .insert(&hello_key, Arc::clone(&conn_buffer))?;
 
         // send the client hello
-        let packet =
-            build_empty_encrypted_packet(src_conn_id, 0x0, PacketType::UnencryptedClientHello);
+        let packet_number: u64 = rand::thread_rng().gen();
+        let packet = build_empty_encrypted_packet(
+            src_conn_id,
+            0x0,
+            packet_number,
+            PacketType::UnencryptedClientHello,
+        );
         self.socket
             .as_ref()
             .unwrap()
@@ -80,9 +88,14 @@ impl BluefinClient {
                 "Did not receive server hello in time".to_string(),
             ));
         }
-        let (packet, _) = res.unwrap();
-        let dst_conn_id = packet.header.source_connection_id;
+        let (server_hello, _) = res.unwrap();
+        let dst_conn_id = server_hello.header.source_connection_id;
         let key = format!("{}_{}", src_conn_id, dst_conn_id);
+        let server_packet_number = server_hello.header.packet_number;
+        // Bluefin handshake asserts that the initial packet numbers cannot be zero
+        if server_packet_number == 0x0 {
+            return Err(BluefinError::UnexpectedPacketNumberError);
+        }
 
         // delete the old hello entry and insert the new connection entry
         let mut guard = self.conn_manager.write().await;
@@ -91,7 +104,12 @@ impl BluefinClient {
         drop(guard);
 
         // send the client ack
-        let packet = build_empty_encrypted_packet(src_conn_id, dst_conn_id, PacketType::Ack);
+        let packet = build_empty_encrypted_packet(
+            src_conn_id,
+            dst_conn_id,
+            packet_number + 1,
+            PacketType::Ack,
+        );
         self.socket
             .as_ref()
             .unwrap()
@@ -101,6 +119,7 @@ impl BluefinClient {
         Ok(BluefinConnection::new(
             src_conn_id,
             dst_conn_id,
+            packet_number + 2,
             Arc::clone(&conn_buffer),
             Arc::clone(self.socket.as_ref().unwrap()),
         ))

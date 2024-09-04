@@ -19,16 +19,17 @@ async fn main() -> BluefinResult<()> {
         let mut s = server.clone();
         let _ = spawn(async move {
             loop {
+                println!();
                 let _conn = s.accept().await;
 
                 if let Ok(mut conn) = _conn {
                     spawn(async move {
                         loop {
                             let mut recv_bytes = [0u8; 1024];
-                            let size = conn.recv(&mut recv_bytes).await.unwrap();
+                            let size = conn.recv(&mut recv_bytes, 100).await.unwrap();
 
                             println!(
-                                "({}_{}) >>> Received: {:?}",
+                                "({:x}_{:x}) >>> Received: {:?}",
                                 conn.src_conn_id,
                                 conn.dst_conn_id,
                                 &recv_bytes[..size],

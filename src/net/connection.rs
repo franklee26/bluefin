@@ -1,5 +1,4 @@
 use std::{
-    cmp::min,
     collections::HashMap,
     future::Future,
     io::Write,
@@ -12,6 +11,7 @@ use tokio::net::UdpSocket;
 
 use crate::{
     core::{
+        context::BluefinHost,
         error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
@@ -21,22 +21,10 @@ use crate::{
     worker::reader::RxChannel,
 };
 
+use super::ordered_bytes::{ConsumeResult, OrderedBytes};
+
 pub const MAX_BUFFER_SIZE: usize = 2000;
 pub const MAX_BUFFER_CONSUME: usize = 1000;
-
-/// ConnectionBuffer as the name suggests is a buffer allocated per connection. This buffer
-/// is shared between reader jobs and the actual owning connection. For usual connection
-/// usage, we are usually interested in the bytes buffered in the `bytes` field, which is
-/// limited by the [MAX_BUFFER_SIZE]. For a handshake scenario, we are interested in the
-/// actual Bluefin [packet](Self::packet), which contains important information for the handshake.
-#[derive(Clone)]
-pub(crate) struct ConnectionBuffer {
-    bytes: Vec<u8>,
-    addr: Option<SocketAddr>,
-    waker: Option<Waker>,
-    packet: Option<BluefinPacket>,
-    dst_conn_id: u32,
-}
 
 /// HandshakeConnectionBuffer is a wrapper around the shared ConnectionBuffer. We need this
 /// wrapper as it serves as a special future for handling handshake scenarios.
@@ -78,25 +66,33 @@ impl Future for HandshakeConnectionBuffer {
     }
 }
 
+/// ConnectionBuffer as the name suggests is a buffer allocated per connection. This buffer
+/// is shared between reader jobs and the actual owning connection. For usual connection
+/// usage, we are usually interested in the bytes buffered in the `bytes` field, which is
+/// limited by the [MAX_BUFFER_SIZE]. For a handshake scenario, we are interested in the
+/// actual Bluefin [packet](Self::packet), which contains important information for the handshake.
+#[derive(Clone)]
+pub(crate) struct ConnectionBuffer {
+    ordered_bytes: OrderedBytes,
+    addr: Option<SocketAddr>,
+    waker: Option<Waker>,
+    packet: Option<BluefinPacket>,
+    dst_conn_id: u32,
+    host_type: BluefinHost,
+    set_start_packet_number: bool,
+}
+
 impl ConnectionBuffer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(src_conn_id: u32, host_type: BluefinHost) -> Self {
         Self {
-            bytes: Vec::new(),
+            ordered_bytes: OrderedBytes::new(src_conn_id, 0x0),
             addr: None,
             waker: None,
             packet: None,
             dst_conn_id: 0,
+            host_type,
+            set_start_packet_number: false,
         }
-    }
-
-    #[inline]
-    pub(crate) fn have_bytes(&self) -> bool {
-        !self.bytes.is_empty()
-    }
-
-    #[inline]
-    pub(crate) fn is_full(&self) -> bool {
-        self.bytes.len() >= MAX_BUFFER_SIZE
     }
 
     #[inline]
@@ -117,14 +113,8 @@ impl ConnectionBuffer {
     }
 
     #[inline]
-    pub(crate) fn buffer_in_bytes(&mut self, packet: &mut BluefinPacket) -> BluefinResult<()> {
-        if self.is_full() {
-            return Err(BluefinError::BufferFullError);
-        }
-
-        self.bytes.append(&mut packet.payload);
-
-        Ok(())
+    pub(crate) fn buffer_in_bytes(&mut self, packet: &BluefinPacket) -> BluefinResult<()> {
+        self.ordered_bytes.buffer_in_packet(packet)
     }
 
     #[inline]
@@ -135,23 +125,47 @@ impl ConnectionBuffer {
 
         self.packet = Some(packet.clone());
 
+        // We always set the start packet numbers once. For servers, we set in advance
+        // that the start number is the first client hello we get + 2. (There is an ack)
+        // For the client, we set it to + 1 (the next message we get should be data)
+        if !self.set_start_packet_number {
+            if self.host_type == BluefinHost::PackLeader {
+                self.ordered_bytes
+                    .set_start_packet_number(packet.header.packet_number + 2);
+            } else if self.host_type == BluefinHost::Client {
+                self.ordered_bytes
+                    .set_start_packet_number(packet.header.packet_number + 1);
+            }
+            self.set_start_packet_number = true;
+        }
+
         Ok(())
     }
 
     #[inline]
-    pub(crate) fn consume(&mut self) -> BluefinResult<(Vec<u8>, SocketAddr)> {
-        if !self.have_bytes() {
-            return Err(BluefinError::BufferEmptyError);
+    pub(crate) fn buffer_in_ack_packet(&mut self, _packet: &BluefinPacket) -> BluefinResult<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn consume(
+        &mut self,
+        bytes_to_read: usize,
+    ) -> BluefinResult<(ConsumeResult, SocketAddr)> {
+        if self.addr.is_none() {
+            return Err(BluefinError::Unexpected(
+                "Cannot consume buffer because addr is field is none".to_string(),
+            ));
         }
 
-        let num_bytes_to_consume = min(MAX_BUFFER_CONSUME, self.bytes.len());
+        let consume_res = self.ordered_bytes.consume(bytes_to_read)?;
+        if consume_res.get_bytes().len() > bytes_to_read {
+            return Err(BluefinError::Unexpected(
+                "Consumed more bytes than specified".to_string(),
+            ));
+        }
 
-        let ans = (
-            self.bytes.drain(..num_bytes_to_consume).collect(),
-            self.addr.unwrap(),
-        );
-
-        return Ok(ans);
+        Ok((consume_res, self.addr.unwrap()))
     }
 
     #[inline]
@@ -222,6 +236,8 @@ impl ConnectionManager {
 pub struct BluefinConnection {
     pub src_conn_id: u32,
     pub dst_conn_id: u32,
+    // This is the *next* packet number we must use
+    packet_num: u64,
     socket: Arc<UdpSocket>,
     rx: RxChannel,
 }
@@ -230,41 +246,52 @@ impl BluefinConnection {
     pub(crate) fn new(
         src_conn_id: u32,
         dst_conn_id: u32,
+        packet_num: u64,
         conn_buffer: Arc<Mutex<ConnectionBuffer>>,
         socket: Arc<UdpSocket>,
     ) -> Self {
-        let rx = RxChannel::new(Arc::clone(&conn_buffer));
+        let rx = RxChannel::new(
+            Arc::clone(&conn_buffer),
+            Arc::clone(&socket),
+            src_conn_id,
+            dst_conn_id,
+        );
         Self {
             src_conn_id,
             dst_conn_id,
+            packet_num,
             rx,
             socket,
         }
     }
 
     #[inline]
-    pub async fn recv(&mut self, buf: &mut [u8]) -> BluefinResult<usize> {
-        let (bytes, _) = self.rx.read().await;
+    pub async fn recv(&mut self, buf: &mut [u8], len: usize) -> BluefinResult<usize> {
+        self.rx.set_bytes_to_read(len);
+        let (bytes, _) = self.rx.read().await?;
         let size = buf.as_mut().write(&bytes)?;
         return Ok(size);
     }
 
     #[inline]
-    pub async fn send(&self, buf: &[u8]) -> BluefinResult<usize> {
+    pub async fn send(&mut self, buf: &[u8]) -> BluefinResult<usize> {
         // create bluefin packet and send
         let security_fields = BluefinSecurityFields::new(false, 0x0);
-        let header = BluefinHeader::new(
+        let mut header = BluefinHeader::new(
             self.src_conn_id,
             self.dst_conn_id,
             PacketType::UnencryptedData,
             0x0,
             security_fields,
         );
+        header.with_packet_number(self.packet_num);
         let packet = BluefinPacket::builder()
             .header(header)
             .payload(buf.to_vec())
             .build();
         let bytes = self.socket.send(&packet.serialise()).await?;
+
+        self.packet_num += 1;
 
         Ok(bytes)
     }

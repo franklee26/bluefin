@@ -98,11 +98,6 @@ impl OrderedBytes {
 
     #[inline]
     pub(crate) fn consume(&mut self, len: usize) -> BluefinResult<Vec<u8>> {
-        // We are still waiting for a packet
-        if self.packets[self.smallest_packet_number_index].is_none() {
-            return Err(BluefinError::BufferEmptyError);
-        }
-
         let mut bytes: Vec<u8> = vec![];
         let mut num_bytes = 0;
 
@@ -153,6 +148,11 @@ impl OrderedBytes {
                 (self.smallest_packet_number_index + 1) % MAX_BUFFER_SIZE;
 
             ix += 1;
+        }
+
+        // Nothing to consume, including any potential carry-over bytes
+        if bytes.len() == 0 {
+            return Err(BluefinError::BufferEmptyError);
         }
 
         Ok(bytes)

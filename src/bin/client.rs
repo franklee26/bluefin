@@ -55,6 +55,30 @@ async fn main() -> BluefinResult<()> {
                 size = conn.send(&[104; 8]).await?;
                 println!("Sent {} bytes", size);
 
+                size = conn.send(&[105; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[106; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[107; 8]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[108; 10]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[109; 50]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[110; 50]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[111; 50]).await?;
+                println!("Sent {} bytes", size);
+
+                size = conn.send(&[112; 50]).await?;
+                println!("Sent {} bytes", size);
+
                 size = conn.send(&[12, 12, 12, 12, 12, 12]).await?;
                 println!("Sent {} bytes", size);
 

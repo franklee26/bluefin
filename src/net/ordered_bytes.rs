@@ -7,7 +7,7 @@ use crate::{
 
 /// Represents the maximum number of *packets* we can buffer in memory. When bytes are consumed
 /// via [OrderedBytes::consume()], we can only consume at most [MAX_BUFFER_SIZE] number of packets.
-pub const MAX_BUFFER_SIZE: usize = 10;
+pub const MAX_BUFFER_SIZE: usize = 25;
 
 /// [OrderedBytes] represents the connection's buffered packets. OrderedBytes stores at most
 /// [MAX_BUFFER_SIZE] number of bluefin packets and maintains their intended consumption
@@ -116,6 +116,9 @@ impl OrderedBytes {
     /// Attempts buffer in the packet. An `Ok(())` indicates a successful in-order buffering.
     /// Else, the packet was unabled to be buffered and the operation can possibly succceed
     /// in the future (for example, the buffer could be currently full).
+    ///
+    /// If [MAX_BUFFER_SIZE] or more number of packets are already buffered, then we cannot
+    /// buffer any more packets and will drop packets from the network.
     #[inline]
     pub(crate) fn buffer_in_packet(&mut self, packet: &BluefinPacket) -> BluefinResult<()> {
         let packet_num = packet.header.packet_number;
@@ -155,7 +158,8 @@ impl OrderedBytes {
     /// [ConsumeResult].
     ///
     /// Otherwise, we place the buffered bytes into the output [ConsumeResult] until we have
-    /// either exhausted the buffer or we have consumed `len` bytes.
+    /// either exhausted the buffer or we have consumed `len` bytes. This can consume at most
+    /// [MAX_BUFFER_SIZE] number of packets.
     ///
     /// [OrderedBytes::consume()] will return [BluefinError::BufferEmptyError] if no bytes can be
     /// consumed.

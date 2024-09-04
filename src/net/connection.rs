@@ -21,7 +21,7 @@ use crate::{
     worker::reader::RxChannel,
 };
 
-use super::ordered_bytes::OrderedBytes;
+use super::ordered_bytes::{ConsumeResult, OrderedBytes};
 
 pub const MAX_BUFFER_SIZE: usize = 2000;
 pub const MAX_BUFFER_CONSUME: usize = 1000;
@@ -143,21 +143,29 @@ impl ConnectionBuffer {
     }
 
     #[inline]
-    pub(crate) fn consume(&mut self, bytes_to_read: usize) -> BluefinResult<(Vec<u8>, SocketAddr)> {
+    pub(crate) fn buffer_in_ack_packet(&mut self, _packet: &BluefinPacket) -> BluefinResult<()> {
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn consume(
+        &mut self,
+        bytes_to_read: usize,
+    ) -> BluefinResult<(ConsumeResult, SocketAddr)> {
         if self.addr.is_none() {
             return Err(BluefinError::Unexpected(
                 "Cannot consume buffer because addr is field is none".to_string(),
             ));
         }
 
-        let bytes = self.ordered_bytes.consume(bytes_to_read)?;
-        if bytes.len() > bytes_to_read {
+        let consume_res = self.ordered_bytes.consume(bytes_to_read)?;
+        if consume_res.get_bytes().len() > bytes_to_read {
             return Err(BluefinError::Unexpected(
                 "Consumed more bytes than specified".to_string(),
             ));
         }
-        let ans = (bytes, self.addr.unwrap());
-        return Ok(ans);
+
+        Ok((consume_res, self.addr.unwrap()))
     }
 
     #[inline]
@@ -242,7 +250,12 @@ impl BluefinConnection {
         conn_buffer: Arc<Mutex<ConnectionBuffer>>,
         socket: Arc<UdpSocket>,
     ) -> Self {
-        let rx = RxChannel::new(Arc::clone(&conn_buffer));
+        let rx = RxChannel::new(
+            Arc::clone(&conn_buffer),
+            Arc::clone(&socket),
+            src_conn_id,
+            dst_conn_id,
+        );
         Self {
             src_conn_id,
             dst_conn_id,
@@ -255,7 +268,7 @@ impl BluefinConnection {
     #[inline]
     pub async fn recv(&mut self, buf: &mut [u8], len: usize) -> BluefinResult<usize> {
         self.rx.set_bytes_to_read(len);
-        let (bytes, _) = self.rx.read().await;
+        let (bytes, _) = self.rx.read().await?;
         let size = buf.as_mut().write(&bytes)?;
         return Ok(size);
     }

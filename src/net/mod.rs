@@ -75,3 +75,22 @@ pub(crate) fn build_empty_encrypted_packet(
     header.with_packet_number(packet_number);
     BluefinPacket::builder().header(header).build()
 }
+
+#[inline]
+pub(crate) fn build_ack_packet(
+    src_conn_id: u32,
+    dst_conn_id: u32,
+    base_packet_number_ack: u64,
+    number_packets_to_ack: u16,
+) -> BluefinPacket {
+    let security_fields = BluefinSecurityFields::new(false, 0x0);
+    let mut header = BluefinHeader::new(
+        src_conn_id,
+        dst_conn_id,
+        PacketType::Ack,
+        number_packets_to_ack,
+        security_fields,
+    );
+    header.with_packet_number(base_packet_number_ack);
+    BluefinPacket::builder().header(header).build()
+}

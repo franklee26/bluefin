@@ -26,7 +26,7 @@ async fn main() -> BluefinResult<()> {
                     spawn(async move {
                         loop {
                             let mut recv_bytes = [0u8; 1024];
-                            let size = conn.recv(&mut recv_bytes, 2).await.unwrap();
+                            let size = conn.recv(&mut recv_bytes, 10).await.unwrap();
 
                             println!(
                                 "({:x}_{:x}) >>> Received: {:?}",

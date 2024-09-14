@@ -1,13 +1,41 @@
-use crate::core::{
-    context::BluefinHost,
-    header::{BluefinHeader, BluefinSecurityFields, PacketType},
-    packet::BluefinPacket,
+use std::sync::{Arc, Mutex};
+
+use connection::ConnectionManager;
+use tokio::{net::UdpSocket, spawn, sync::RwLock};
+
+use crate::{
+    core::{
+        context::BluefinHost,
+        header::{BluefinHeader, BluefinSecurityFields, PacketType},
+        packet::BluefinPacket,
+    },
+    worker::reader::TxChannel,
 };
 
 pub mod client;
 pub mod connection;
 pub mod ordered_bytes;
 pub mod server;
+
+/// Helper to build `num_tx_workers` number of tx workers to run.
+#[inline]
+fn build_and_start_tx(
+    num_tx_workers: u8,
+    socket: Arc<UdpSocket>,
+    conn_manager: Arc<RwLock<ConnectionManager>>,
+    pending_accept_ids: Arc<Mutex<Vec<u32>>>,
+    host_type: BluefinHost,
+) {
+    let tx = TxChannel::new(socket, conn_manager, pending_accept_ids, host_type);
+
+    for id in 0..num_tx_workers {
+        let mut tx_clone = tx.clone();
+        tx_clone.id = id;
+        spawn(async move {
+            let _ = tx_clone.run().await;
+        });
+    }
+}
 
 /// Helper to determine whether a given `packet` is a valid hello packet eg. client-hello or pack-leader-hello
 #[inline]
@@ -53,7 +81,7 @@ pub(crate) fn is_client_ack_packet(host_type: BluefinHost, packet: &BluefinPacke
     let this_id = packet.header.destination_connection_id;
 
     if host_type == BluefinHost::PackLeader
-        && packet.header.type_field == PacketType::Ack
+        && packet.header.type_field == PacketType::ClientAck
         && other_id != 0x0
         && this_id != 0x0
     {

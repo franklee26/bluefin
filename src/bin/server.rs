@@ -9,7 +9,7 @@ use tokio::{spawn, time::sleep};
 #[tokio::main]
 async fn main() -> BluefinResult<()> {
     let mut server = BluefinServer::new(std::net::SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::new(10, 0, 0, 31),
+        Ipv4Addr::new(192, 168, 1, 38),
         1318,
     )));
     server.bind().await?;
@@ -22,21 +22,26 @@ async fn main() -> BluefinResult<()> {
                 println!();
                 let _conn = s.accept().await;
 
-                if let Ok(mut conn) = _conn {
-                    spawn(async move {
-                        loop {
-                            let mut recv_bytes = [0u8; 1024];
-                            let size = conn.recv(&mut recv_bytes, 100).await.unwrap();
+                match _conn {
+                    Ok(mut conn) => {
+                        spawn(async move {
+                            loop {
+                                let mut recv_bytes = [0u8; 1024];
+                                let size = conn.recv(&mut recv_bytes, 100).await.unwrap();
 
-                            println!(
-                                "({:x}_{:x}) >>> Received: {:?}",
-                                conn.src_conn_id,
-                                conn.dst_conn_id,
-                                &recv_bytes[..size],
-                            );
-                            sleep(Duration::from_secs(1)).await;
-                        }
-                    });
+                                println!(
+                                    "({:x}_{:x}) >>> Received: {:?}",
+                                    conn.src_conn_id,
+                                    conn.dst_conn_id,
+                                    &recv_bytes[..size],
+                                );
+                                sleep(Duration::from_secs(1)).await;
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("Could not accept connection due to error: {:?}", e);
+                    }
                 }
 
                 sleep(Duration::from_secs(1)).await;

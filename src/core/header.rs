@@ -7,8 +7,9 @@ use super::{error::BluefinError, Serialisable};
 pub enum PacketType {
     UnencryptedClientHello = 0x00,
     UnencryptedServerHello = 0x01,
-    Ack = 0x02,
+    ClientAck = 0x02,
     UnencryptedData = 0x03,
+    Ack = 0x04,
 }
 
 impl PacketType {
@@ -16,8 +17,9 @@ impl PacketType {
         match value {
             0x00 => Self::UnencryptedClientHello,
             0x01 => Self::UnencryptedServerHello,
-            0x02 => Self::Ack,
+            0x02 => Self::ClientAck,
             0x03 => Self::UnencryptedData,
+            0x04 => Self::Ack,
             _ => panic!("Unknown packet type {}", value),
         }
     }

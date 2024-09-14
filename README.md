@@ -10,49 +10,75 @@
 ### Example
 #### Pack-leader
 ```rust
-use bluefin::hosts::pack_leader::BluefinPackLeaderBuilder;
-
 #[tokio::main]
-async fn main() {
-    // Bind and construct a pack-leader over an TUN device
-    let mut pack_leader = BluefinPackLeader::builder()
-        .name("utun3".to_string())
-        .bind_address("192.168.55.2".to_string())
-        .netmask("255.255.255.0".to_string())
-        .build();
+async fn main() -> BluefinResult<()> {
+    let mut server = BluefinServer::new(std::net::SocketAddr::V4(SocketAddrV4::new(
+        Ipv4Addr::new(192, 168, 1, 38),
+        1235,
+    )));
+    server.bind().await?;
 
-    loop {
-        let connection_res = pack_leader.accept().await;
+    const MAX_NUM_CONNECTIONS: usize = 5;
+    for _ in 0..MAX_NUM_CONNECTIONS {
+        let mut s = server.clone();
+        let _ = spawn(async move {
+            loop {
+                let _conn = s.accept().await;
 
-        tokio::spawn(async move {
-            match connection_res {
-                Ok(conn) => println!("Conn ready! {conn})"),
-                Err(err) => eprintln!("\nConnection attempt failed: {:?}", err),
+                match _conn {
+                    Ok(mut conn) => {
+                        spawn(async move {
+                            loop {
+                                let mut recv_bytes = [0u8; 1024];
+                                let size = conn.recv(&mut recv_bytes, 100).await.unwrap();
+
+                                println!(
+                                    "({:x}_{:x}) >>> Received: {:?}",
+                                    conn.src_conn_id,
+                                    conn.dst_conn_id,
+                                    &recv_bytes[..size],
+                                );
+                                sleep(Duration::from_secs(1)).await;
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("Could not accept connection due to error: {:?}", e);
+                    }
+                }
+
+                sleep(Duration::from_secs(1)).await;
             }
         });
-
-        sleep(Duration::from_secs(1)).await;
     }
+
+    // The spawned tasks are looping forever. This infinite loop will keep the
+    // process up forever.
+    loop {}
 }
 ```
 #### Client
 ```rust
 #[tokio::main]
-async fn main() -> std::io::Result<()> {
-    let mut client = BluefinClient::builder()
-        .name("test_client".to_string())
-        .build();
+async fn main() -> BluefinResult<()> {
+    let task = spawn(async move {
+        let mut client = BluefinClient::new(std::net::SocketAddr::V4(SocketAddrV4::new(
+            Ipv4Addr::new(192, 168, 1, 38),
+            1234,
+        )));
+        let mut conn = client
+            .connect(std::net::SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::new(192, 168, 1, 38),
+                1235,
+            )))
+            .await?;
 
-    let port = rand::thread_rng().gen_range(10000..50000);
-    client
-        .bind("0.0.0.0", port)
-        .expect("Failed to bind client socket");
-    let mut conn = client
-        .connect("192.168.55.2", 31416)
-        .await
-        .expect("Failed to connect to host");
+        let bytes = [1, 2, 3, 4];
+        let mut size = conn.send(&bytes).await?;
+        println!("Sent {} bytes", size);
 
-    eprintln!("Conn ready! {conn}");
+        Ok::<(), BluefinError>(())
+    });
     Ok(())
 }
 ```

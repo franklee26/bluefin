@@ -16,12 +16,12 @@ async fn main() -> BluefinResult<()> {
         // sleep(Duration::from_secs(3)).await;
         let task = spawn(async move {
             let mut client = BluefinClient::new(std::net::SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::new(10, 0, 0, 31),
+                Ipv4Addr::new(192, 168, 1, 38),
                 ports[ix],
             )));
             let mut conn = client
                 .connect(std::net::SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::new(10, 0, 0, 31),
+                    Ipv4Addr::new(192, 168, 1, 38),
                     1318,
                 )))
                 .await?;

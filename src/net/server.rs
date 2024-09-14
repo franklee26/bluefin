@@ -1,24 +1,28 @@
 use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use rand::Rng;
-use tokio::{net::UdpSocket, spawn, sync::RwLock};
+use tokio::{net::UdpSocket, sync::RwLock};
 
 use crate::{
     core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
     net::{build_empty_encrypted_packet, connection::HandshakeConnectionBuffer},
     utils::common::BluefinResult,
-    worker::reader::TxChannel,
 };
 
-use super::connection::{BluefinConnection, ConnectionBuffer, ConnectionManager};
+use super::{
+    build_and_start_tx,
+    connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
+};
+
+const NUM_TX_WORKERS_FOR_SERVER: u8 = 5;
 
 #[derive(Clone)]
 pub struct BluefinServer {
     socket: Option<Arc<UdpSocket>>,
-    bind_called: bool,
     src_addr: SocketAddr,
     conn_manager: Arc<RwLock<ConnectionManager>>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
@@ -28,7 +32,6 @@ impl BluefinServer {
     pub fn new(src_addr: SocketAddr) -> Self {
         Self {
             socket: None,
-            bind_called: false,
             conn_manager: Arc::new(RwLock::new(ConnectionManager::new())),
             pending_accept_ids: Arc::new(Mutex::new(Vec::new())),
             src_addr,
@@ -39,22 +42,14 @@ impl BluefinServer {
         let socket = UdpSocket::bind(self.src_addr).await?;
         self.socket = Some(Arc::new(socket));
 
-        let tx = TxChannel::new(
+        build_and_start_tx(
+            NUM_TX_WORKERS_FOR_SERVER,
             Arc::clone(self.socket.as_ref().unwrap()),
             Arc::clone(&self.conn_manager),
             Arc::clone(&self.pending_accept_ids),
             BluefinHost::PackLeader,
         );
 
-        for i in 0..10 {
-            let mut tx_clone = tx.clone();
-            tx_clone.id = i;
-            spawn(async move {
-                let _ = tx_clone.run().await;
-            });
-        }
-
-        self.bind_called = true;
         Ok(())
     }
 
@@ -106,8 +101,9 @@ impl BluefinServer {
             .send_to(&packet.serialise(), addr)
             .await?;
 
-        // Wait for client ack
-        let (client_ack, _) = handshake_buf.read().await;
+        // Wait for client ack. This will timeout after 3s
+        let client_ack_timeout = Duration::from_secs(3);
+        let (client_ack, _) = handshake_buf.read_with_timeout(client_ack_timeout).await?;
         // Expect the client ack correctly returns the packet number
         if client_ack.header.packet_number != client_packet_num + 1 {
             return Err(BluefinError::UnexpectedPacketNumberError);

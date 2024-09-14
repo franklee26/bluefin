@@ -5,16 +5,19 @@ use std::{
 };
 
 use rand::Rng;
-use tokio::{net::UdpSocket, spawn, sync::RwLock, time::timeout};
+use tokio::{net::UdpSocket, sync::RwLock};
 
 use crate::{
     core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
-    net::{build_empty_encrypted_packet, connection::HandshakeConnectionBuffer},
+    net::{
+        build_and_start_tx, build_empty_encrypted_packet, connection::HandshakeConnectionBuffer,
+    },
     utils::common::BluefinResult,
-    worker::reader::TxChannel,
 };
 
 use super::connection::{BluefinConnection, ConnectionBuffer, ConnectionManager};
+
+const NUM_TX_WORKERS_FOR_CLIENT: u8 = 5;
 
 pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
@@ -37,19 +40,15 @@ impl BluefinClient {
         let socket = Arc::new(UdpSocket::bind(self.src_addr).await?);
         socket.connect(dst_addr).await?;
         self.socket = Some(Arc::clone(&socket));
+        self.dst_addr = Some(dst_addr);
 
-        let mut tx = TxChannel::new(
+        build_and_start_tx(
+            NUM_TX_WORKERS_FOR_CLIENT,
             Arc::clone(self.socket.as_ref().unwrap()),
             Arc::clone(&self.conn_manager),
             Arc::new(Mutex::new(Vec::new())),
             BluefinHost::Client,
         );
-
-        spawn(async move {
-            let _ = tx.run().await;
-        });
-
-        self.dst_addr = Some(dst_addr);
 
         let src_conn_id: u32 = rand::thread_rng().gen();
         eprintln!("client src id: 0x{:x}", src_conn_id);
@@ -82,13 +81,9 @@ impl BluefinClient {
 
         // Wait for server hello. This will timeout after 3s.
         let server_hello_timeout = Duration::from_secs(3);
-        let res = timeout(server_hello_timeout, handshake_buf.read()).await;
-        if let Err(_) = res {
-            return Err(BluefinError::TimedOut(
-                "Did not receive server hello in time".to_string(),
-            ));
-        }
-        let (server_hello, _) = res.unwrap();
+        let (server_hello, _) = handshake_buf
+            .read_with_timeout(server_hello_timeout)
+            .await?;
         let dst_conn_id = server_hello.header.source_connection_id;
         let key = format!("{}_{}", src_conn_id, dst_conn_id);
         let server_packet_number = server_hello.header.packet_number;
@@ -108,7 +103,7 @@ impl BluefinClient {
             src_conn_id,
             dst_conn_id,
             packet_number + 1,
-            PacketType::Ack,
+            PacketType::ClientAck,
         );
         self.socket
             .as_ref()

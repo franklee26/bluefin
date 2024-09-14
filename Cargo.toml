@@ -9,7 +9,7 @@ repository = "https://github.com/franklee26/bluefin"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-etherparse = "0.13.0"
+etherparse = "0.15.0"
 rand = "0.8.5"
 thiserror = "1.0.39"
 tokio = { version = "1", features = ["full"] }

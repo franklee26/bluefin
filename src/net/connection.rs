@@ -5,9 +5,10 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::{Poll, Waker},
+    time::Duration,
 };
 
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, time::timeout};
 
 use crate::{
     core::{
@@ -41,10 +42,28 @@ impl HandshakeConnectionBuffer {
         Self { conn_buff }
     }
 
-    #[inline]
     /// Awaits the future for a handshake-related packet stored in the [HandshakeConnectionBuffer::conn_buff].
+    #[inline]
     pub(crate) async fn read(&self) -> (BluefinPacket, SocketAddr) {
         self.clone().await
+    }
+
+    /// Awaits the future for a handshake-related packet stored in the [HandshakeConnectionBuffer::conn_buff].
+    /// This does the same thing as [read](Self::read) but this will return a timeout error if the future does
+    /// not yield a result after the specified duration.
+    #[inline]
+    pub(crate) async fn read_with_timeout(
+        &self,
+        timeout_duration: Duration,
+    ) -> BluefinResult<(BluefinPacket, SocketAddr)> {
+        if let Ok(res) = timeout(timeout_duration, self.clone()).await {
+            return Ok(res);
+        }
+
+        return Err(BluefinError::TimedOut(format!(
+            "Failed to read from handshake connection buffer after {:?}",
+            timeout_duration
+        )));
     }
 }
 

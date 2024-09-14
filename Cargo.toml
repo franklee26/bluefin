@@ -1,6 +1,6 @@
 [package]
 name = "bluefin"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "An experimental, secure, P2P, transport-layer protocol."
 license = "MIT"

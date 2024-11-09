@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     core::{error::BluefinError, packet::BluefinPacket},
-    utils::common::BluefinResult,
+    utils::{common::BluefinResult, window::SlidingWindow},
 };
 
 /// Represents the maximum number of *packets* we can buffer in memory. When bytes are consumed
@@ -27,6 +27,8 @@ pub(crate) struct OrderedBytes {
     /// Stores any potential carry over bytes from a previous consume. These bytes belong to
     /// a packet we have already consumed.
     carry_over_bytes: Option<Vec<u8>>,
+    /// Holds all of the packet numbers for which we have received acks for.
+    received_acks: SlidingWindow,
 }
 
 /// The result returned when [OrderedBytes are consumed](OrderedBytes::consume()). This result
@@ -100,6 +102,7 @@ impl OrderedBytes {
             smallest_packet_number_index: 0,
             smallest_packet_number: start_packet_number,
             carry_over_bytes: None,
+            received_acks: SlidingWindow::new(start_packet_number),
         }
     }
 
@@ -147,6 +150,10 @@ impl OrderedBytes {
         }
 
         self.packets[index] = Some(packet.clone());
+        Ok(())
+    }
+
+    pub(crate) fn buffer_in_ack_packet(&mut self, packet: &BluefinPacket) -> BluefinResult<()> {
         Ok(())
     }
 

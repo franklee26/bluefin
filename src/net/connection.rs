@@ -19,7 +19,7 @@ use crate::{
         Serialisable,
     },
     utils::common::BluefinResult,
-    worker::reader::RxChannel,
+    worker::{reader::ReaderRxChannel, writer::WriterTxChannel},
 };
 
 use super::ordered_bytes::{ConsumeResult, OrderedBytes};
@@ -163,7 +163,7 @@ impl ConnectionBuffer {
 
     #[inline]
     pub(crate) fn buffer_in_ack_packet(&mut self, _packet: &BluefinPacket) -> BluefinResult<()> {
-        Ok(())
+        self.ordered_bytes.buffer_in_ack_packet(_packet)
     }
 
     #[inline]
@@ -208,7 +208,7 @@ impl ConnectionBuffer {
 /// used by the reader TX worker to determine where to buffer a newly received packet.
 pub(crate) struct ConnectionManager {
     /// Key: {src_conn_id}_{dst_conn_id}
-    /// Value: The connectino buffer
+    /// Value: The connection buffer
     map: HashMap<String, Arc<Mutex<ConnectionBuffer>>>,
 }
 
@@ -256,9 +256,10 @@ pub struct BluefinConnection {
     pub src_conn_id: u32,
     pub dst_conn_id: u32,
     // This is the *next* packet number we must use
-    packet_num: u64,
+    packet_num: Arc<tokio::sync::Mutex<u64>>,
     socket: Arc<UdpSocket>,
-    rx: RxChannel,
+    reader_rx: ReaderRxChannel,
+    writer_tx: WriterTxChannel,
 }
 
 impl BluefinConnection {
@@ -269,25 +270,27 @@ impl BluefinConnection {
         conn_buffer: Arc<Mutex<ConnectionBuffer>>,
         socket: Arc<UdpSocket>,
     ) -> Self {
-        let rx = RxChannel::new(
+        let shared_packet_num = Arc::new(tokio::sync::Mutex::new(packet_num));
+        let reader_rx = ReaderRxChannel::new(
             Arc::clone(&conn_buffer),
             Arc::clone(&socket),
             src_conn_id,
             dst_conn_id,
+            Arc::clone(&shared_packet_num),
         );
         Self {
             src_conn_id,
             dst_conn_id,
-            packet_num,
-            rx,
+            packet_num: Arc::clone(&shared_packet_num),
+            reader_rx,
             socket,
         }
     }
 
     #[inline]
     pub async fn recv(&mut self, buf: &mut [u8], len: usize) -> BluefinResult<usize> {
-        self.rx.set_bytes_to_read(len);
-        let (bytes, _) = self.rx.read().await?;
+        self.reader_rx.set_bytes_to_read(len);
+        let (bytes, _) = self.reader_rx.read().await?;
         let size = buf.as_mut().write(&bytes)?;
         return Ok(size);
     }
@@ -303,14 +306,15 @@ impl BluefinConnection {
             0x0,
             security_fields,
         );
-        header.with_packet_number(self.packet_num);
+        let mut packet_num = self.packet_num.lock().await;
+        header.with_packet_number(*packet_num);
         let packet = BluefinPacket::builder()
             .header(header)
             .payload(buf.to_vec())
             .build();
         let bytes = self.socket.send(&packet.serialise()).await?;
 
-        self.packet_num += 1;
+        *packet_num += 1;
 
         Ok(bytes)
     }

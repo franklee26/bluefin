@@ -11,7 +11,7 @@ use crate::{
     },
     worker::{
         reader::ReaderTxChannel,
-        writer::{WriteQueue, WriterRxChannel},
+        writer::{WriterQueue, WriterRxChannel},
     },
 };
 
@@ -41,7 +41,7 @@ fn build_and_start_tx(
 }
 
 fn build_and_start_writer_rx_channel(
-    queue: Arc<Mutex<WriteQueue>>,
+    queue: Arc<Mutex<WriterQueue>>,
     socket: Arc<UdpSocket>,
     num_rx_workers: u8,
 ) {

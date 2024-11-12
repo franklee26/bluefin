@@ -13,22 +13,32 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-pub(crate) struct WriteQueue {
+pub(crate) struct WriterQueue {
     queue: VecDeque<BluefinPacket>,
     waker: Option<Waker>,
 }
 
+impl WriterQueue {
+    pub(crate) fn new() -> Self {
+        Self {
+            queue: VecDeque::new(),
+            waker: None,
+        }
+    }
+}
+
 /// Queues write requests to be sent
 pub(crate) struct WriterTxChannel {
-    queue: Arc<Mutex<WriteQueue>>,
+    queue: Arc<Mutex<WriterQueue>>,
 }
 
 impl WriterTxChannel {
-    pub(crate) fn new(queue: Arc<Mutex<WriteQueue>>) -> Self {
+    pub(crate) fn new(queue: Arc<Mutex<WriterQueue>>) -> Self {
         Self { queue }
     }
 
-    pub(crate) async fn send(&mut self, packet: BluefinPacket) -> BluefinResult<()> {
+    pub(crate) async fn send(&mut self, packet: BluefinPacket) -> BluefinResult<usize> {
+        let bytes = packet.len();
         let mut guard = self.queue.lock().unwrap();
         guard.queue.push_back(packet);
 
@@ -36,7 +46,7 @@ impl WriterTxChannel {
         if let Some(ref waker) = guard.waker {
             waker.wake_by_ref();
         }
-        Ok(())
+        Ok(bytes)
     }
 }
 
@@ -44,7 +54,7 @@ impl WriterTxChannel {
 #[derive(Clone)]
 pub(crate) struct WriterRxChannel {
     socket: Arc<UdpSocket>,
-    queue: Arc<Mutex<WriteQueue>>,
+    queue: Arc<Mutex<WriterQueue>>,
 }
 
 impl Future for WriterRxChannel {
@@ -65,7 +75,7 @@ impl Future for WriterRxChannel {
 }
 
 impl WriterRxChannel {
-    pub(crate) fn new(queue: Arc<Mutex<WriteQueue>>, socket: Arc<UdpSocket>) -> Self {
+    pub(crate) fn new(queue: Arc<Mutex<WriterQueue>>, socket: Arc<UdpSocket>) -> Self {
         Self { queue, socket }
     }
 

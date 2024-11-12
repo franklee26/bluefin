@@ -9,7 +9,7 @@ use tokio::{spawn, time::sleep};
 #[tokio::main]
 async fn main() -> BluefinResult<()> {
     let mut server = BluefinServer::new(std::net::SocketAddr::V4(SocketAddrV4::new(
-        Ipv4Addr::new(192, 168, 1, 38),
+        Ipv4Addr::new(127, 0, 0, 38),
         1318,
     )));
     server.bind().await?;

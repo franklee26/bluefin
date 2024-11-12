@@ -22,7 +22,11 @@ use crate::{
     worker::{reader::ReaderRxChannel, writer::WriterTxChannel},
 };
 
-use super::ordered_bytes::{ConsumeResult, OrderedBytes};
+use super::{
+    build_and_start_writer_rx_channel,
+    ordered_bytes::{ConsumeResult, OrderedBytes},
+    WriterQueue, WriterRxChannel,
+};
 
 pub const MAX_BUFFER_SIZE: usize = 2000;
 pub const MAX_BUFFER_CONSUME: usize = 1000;
@@ -278,12 +282,19 @@ impl BluefinConnection {
             dst_conn_id,
             Arc::clone(&shared_packet_num),
         );
+
+        let writer_queue = Arc::new(Mutex::new(WriterQueue::new()));
+        let writer_tx = WriterTxChannel::new(Arc::clone(&writer_queue));
+
+        build_and_start_writer_rx_channel(Arc::clone(&writer_queue), Arc::clone(&socket), 2);
+
         Self {
             src_conn_id,
             dst_conn_id,
             packet_num: Arc::clone(&shared_packet_num),
             reader_rx,
             socket,
+            writer_tx,
         }
     }
 
@@ -312,10 +323,13 @@ impl BluefinConnection {
             .header(header)
             .payload(buf.to_vec())
             .build();
-        let bytes = self.socket.send(&packet.serialise()).await?;
+        // TODO!
+        // let _ = self.socket.send(&packet.serialise()).await?;
+        let _ = self.writer_tx.send(packet).await?;
 
+        // HANDLE THIS!
         *packet_num += 1;
 
-        Ok(bytes)
+        Ok(buf.len())
     }
 }

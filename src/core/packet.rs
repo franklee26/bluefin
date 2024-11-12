@@ -59,6 +59,13 @@ impl BluefinPacket {
             payload: None,
         }
     }
+
+    /// Length of the packet in bytes
+    #[inline]
+    pub fn len(&self) -> usize {
+        // Header is always 20 bytes
+        self.payload.len() + 20
+    }
 }
 
 impl BluefinPacketBuilder {

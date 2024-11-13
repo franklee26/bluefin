@@ -1,17 +1,37 @@
 use std::{
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{IpAddr, Ipv4Addr, SocketAddrV4},
     time::Duration,
 };
 
 use bluefin::net::{client::BluefinClient, server::BluefinServer};
-use rstest::rstest;
+use local_ip_address::list_afinet_netifas;
+use rstest::{fixture, rstest};
 use tokio::{
     task::JoinSet,
     time::{sleep, timeout},
 };
 
-const SERVER_IPV4_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 38);
-const CLIENT_IPV4_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 37);
+#[fixture]
+#[once]
+fn loopback_ip_addr() -> Ipv4Addr {
+    let network_interfaces = list_afinet_netifas().unwrap();
+
+    let mut ip_addr: Option<IpAddr> = None;
+    for (name, ip) in network_interfaces.iter() {
+        if name == "lo0" {
+            ip_addr = Some(*ip);
+            break;
+        }
+    }
+    if ip_addr.is_none() {
+        panic!("Could not find loopback address");
+    }
+
+    match ip_addr.unwrap() {
+        IpAddr::V4(v4) => v4,
+        IpAddr::V6(_) => panic!("Uh oh"),
+    }
+}
 
 #[rstest]
 #[timeout(Duration::from_secs(3))]
@@ -21,12 +41,13 @@ const CLIENT_IPV4_ADDR: Ipv4Addr = Ipv4Addr::new(127, 0, 0, 37);
 #[case(1324, 1325, 500)]
 #[tokio::test]
 async fn basic_server_client_connection_send_recv(
+    loopback_ip_addr: &Ipv4Addr,
     #[case] client_port: u16,
     #[case] server_port: u16,
     #[case] server_read_size: usize,
 ) {
     let mut server = BluefinServer::new(std::net::SocketAddr::V4(SocketAddrV4::new(
-        SERVER_IPV4_ADDR,
+        *loopback_ip_addr,
         server_port,
     )));
     server
@@ -35,7 +56,7 @@ async fn basic_server_client_connection_send_recv(
         .expect("Encountered error while binding server");
 
     let mut client = BluefinClient::new(std::net::SocketAddr::V4(SocketAddrV4::new(
-        CLIENT_IPV4_ADDR,
+        *loopback_ip_addr,
         client_port,
     )));
 
@@ -101,10 +122,11 @@ async fn basic_server_client_connection_send_recv(
         }
     });
 
+    let loopback_cloned = loopback_ip_addr.clone();
     join_set.spawn(async move {
         let mut conn = client
             .connect(std::net::SocketAddr::V4(SocketAddrV4::new(
-                SERVER_IPV4_ADDR,
+                loopback_cloned,
                 server_port,
             )))
             .await

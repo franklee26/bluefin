@@ -18,7 +18,7 @@ fn loopback_interface_name() -> &'static str {
 
 #[cfg(target_os = "linux")]
 fn loopback_interface_name() -> &'static str {
-    "lo0"
+    "lo"
 }
 
 #[fixture]

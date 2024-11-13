@@ -11,6 +11,16 @@ use tokio::{
     time::{sleep, timeout},
 };
 
+#[cfg(target_os = "macos")]
+fn loopback_interface_name() -> &'static str {
+    "lo0"
+}
+
+#[cfg(target_os = "linux")]
+fn loopback_interface_name() -> &'static str {
+    "lo0"
+}
+
 #[fixture]
 #[once]
 fn loopback_ip_addr() -> Ipv4Addr {
@@ -18,7 +28,7 @@ fn loopback_ip_addr() -> Ipv4Addr {
 
     let mut ip_addr: Option<IpAddr> = None;
     for (name, ip) in network_interfaces.iter() {
-        if name == "lo0" {
+        if name == loopback_interface_name() {
             ip_addr = Some(*ip);
             break;
         }
@@ -29,7 +39,7 @@ fn loopback_ip_addr() -> Ipv4Addr {
 
     match ip_addr.unwrap() {
         IpAddr::V4(v4) => v4,
-        IpAddr::V6(_) => panic!("Uh oh"),
+        IpAddr::V6(_) => panic!("Unexpectedly received ipv6"),
     }
 }
 

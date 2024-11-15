@@ -7,7 +7,7 @@ use crate::{
 
 /// Represents the maximum number of *packets* we can buffer in memory. When bytes are consumed
 /// via [OrderedBytes::consume()], we can only consume at most [MAX_BUFFER_SIZE] number of packets.
-pub const MAX_BUFFER_SIZE: usize = 25;
+pub const MAX_BUFFER_SIZE: usize = 2500;
 
 /// [OrderedBytes] represents the connection's buffered packets. OrderedBytes stores at most
 /// [MAX_BUFFER_SIZE] number of bluefin packets and maintains their intended consumption

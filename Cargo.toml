@@ -35,3 +35,4 @@ path = "src/bin/server.rs"
 opt-level = 3 
 codegen-units = 1
 lto = "fat"
+debug = true

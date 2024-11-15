@@ -18,7 +18,7 @@ use super::{
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
 };
 
-const NUM_TX_WORKERS_FOR_SERVER: u8 = 5;
+const NUM_TX_WORKERS_FOR_SERVER: u8 = 10;
 
 #[derive(Clone)]
 pub struct BluefinServer {

@@ -1,7 +1,6 @@
-use core::{num, str};
+use core::str;
 use std::{
     collections::HashMap,
-    fmt::format,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     time::Duration,
 };
@@ -134,6 +133,13 @@ async fn basic_server_client_connection_send_recv(
             );
             base += 250;
         }
+
+        // Now flip around and let the server send 5 bytes
+        let size = timeout(Duration::from_secs(1), conn.send(&[5, 4, 3, 2, 1]))
+            .await
+            .expect("Server timed out while trying to send five bytes")
+            .expect("Server encountered error while trying to send bytes");
+        assert_eq!(size, 5);
     });
 
     let loopback_cloned = loopback_ip_addr.clone();
@@ -230,7 +236,16 @@ async fn basic_server_client_connection_send_recv(
         }
 
         assert_eq!(total_num_bytes_sent, TOTAL_NUM_BYTES_SENT);
+
+        let mut buf = [0u8; 10];
+        let size = timeout(Duration::from_secs(5), conn.recv(&mut buf, 10))
+            .await
+            .expect("Client timed out waiting to recv bytes")
+            .expect("Client encountered error while calling recv");
+        assert_eq!(size, 5);
+        assert_eq!(buf[..size], [5, 4, 3, 2, 1]);
     });
+
     join_set.join_all().await;
 }
 
@@ -325,9 +340,6 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
                     conn_num
                 ));
 
-            // Wait for 100 ms for the server to be ready
-            sleep(Duration::from_millis(100)).await;
-
             // Tell the server who we are by sending the key. Key is five bytes.
             let key = format!("key_{}", conn_num);
             let size = timeout(Duration::from_secs(1), conn.send(key.as_bytes()))
@@ -335,6 +347,8 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
                 .expect("Client timed out after sending key")
                 .expect("Client encountered error while sending");
             assert_eq!(size, 5);
+
+            sleep(Duration::from_millis(50)).await;
 
             // Now begin sending the actual data in batches of 32 bytes
             let mut total_bytes_sent = 5;

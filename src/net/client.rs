@@ -38,7 +38,7 @@ impl BluefinClient {
 
     pub async fn connect(&mut self, dst_addr: SocketAddr) -> BluefinResult<BluefinConnection> {
         let socket = Arc::new(UdpSocket::bind(self.src_addr).await?);
-        socket.connect(dst_addr).await?;
+        // socket.connect(dst_addr).await?;
         self.socket = Some(Arc::clone(&socket));
         self.dst_addr = Some(dst_addr);
 
@@ -76,7 +76,7 @@ impl BluefinClient {
         self.socket
             .as_ref()
             .unwrap()
-            .send(&packet.serialise())
+            .send_to(&packet.serialise(), dst_addr)
             .await?;
 
         // Wait for server hello. This will timeout after 3s.
@@ -108,7 +108,7 @@ impl BluefinClient {
         self.socket
             .as_ref()
             .unwrap()
-            .send(&packet.serialise())
+            .send_to(&packet.serialise(), dst_addr)
             .await?;
 
         Ok(BluefinConnection::new(
@@ -117,6 +117,7 @@ impl BluefinClient {
             packet_number + 2,
             Arc::clone(&conn_buffer),
             Arc::clone(self.socket.as_ref().unwrap()),
+            self.dst_addr.unwrap(),
         ))
     }
 }

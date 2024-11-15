@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use connection::ConnectionManager;
 use tokio::{net::UdpSocket, spawn, sync::RwLock};
@@ -44,8 +47,9 @@ fn build_and_start_writer_rx_channel(
     queue: Arc<Mutex<WriterQueue>>,
     socket: Arc<UdpSocket>,
     num_rx_workers: u8,
+    dst_addr: SocketAddr,
 ) {
-    let rx = WriterRxChannel::new(queue, socket);
+    let rx = WriterRxChannel::new(queue, socket, dst_addr);
     for _ in 0..num_rx_workers {
         let rx_clone = rx.clone();
         spawn(async move {

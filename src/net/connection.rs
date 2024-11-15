@@ -16,7 +16,6 @@ use crate::{
         error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
-        Serialisable,
     },
     utils::common::BluefinResult,
     worker::{reader::ReaderRxChannel, writer::WriterTxChannel},
@@ -25,7 +24,7 @@ use crate::{
 use super::{
     build_and_start_writer_rx_channel,
     ordered_bytes::{ConsumeResult, OrderedBytes},
-    WriterQueue, WriterRxChannel,
+    WriterQueue,
 };
 
 pub const MAX_BUFFER_SIZE: usize = 2000;
@@ -264,6 +263,7 @@ pub struct BluefinConnection {
     socket: Arc<UdpSocket>,
     reader_rx: ReaderRxChannel,
     writer_tx: WriterTxChannel,
+    dst_addr: SocketAddr,
 }
 
 impl BluefinConnection {
@@ -273,6 +273,7 @@ impl BluefinConnection {
         packet_num: u64,
         conn_buffer: Arc<Mutex<ConnectionBuffer>>,
         socket: Arc<UdpSocket>,
+        dst_addr: SocketAddr,
     ) -> Self {
         let shared_packet_num = Arc::new(tokio::sync::Mutex::new(packet_num));
         let reader_rx = ReaderRxChannel::new(
@@ -286,7 +287,12 @@ impl BluefinConnection {
         let writer_queue = Arc::new(Mutex::new(WriterQueue::new()));
         let writer_tx = WriterTxChannel::new(Arc::clone(&writer_queue));
 
-        build_and_start_writer_rx_channel(Arc::clone(&writer_queue), Arc::clone(&socket), 2);
+        build_and_start_writer_rx_channel(
+            Arc::clone(&writer_queue),
+            Arc::clone(&socket),
+            2,
+            dst_addr,
+        );
 
         Self {
             src_conn_id,
@@ -295,6 +301,7 @@ impl BluefinConnection {
             reader_rx,
             socket,
             writer_tx,
+            dst_addr,
         }
     }
 

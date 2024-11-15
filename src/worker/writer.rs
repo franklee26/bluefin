@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     fmt::Write,
     future::Future,
+    net::SocketAddr,
     sync::{Arc, Mutex},
     task::{Poll, Waker},
 };
@@ -55,6 +56,7 @@ impl WriterTxChannel {
 pub(crate) struct WriterRxChannel {
     socket: Arc<UdpSocket>,
     queue: Arc<Mutex<WriterQueue>>,
+    dst_addr: SocketAddr,
 }
 
 impl Future for WriterRxChannel {
@@ -75,8 +77,16 @@ impl Future for WriterRxChannel {
 }
 
 impl WriterRxChannel {
-    pub(crate) fn new(queue: Arc<Mutex<WriterQueue>>, socket: Arc<UdpSocket>) -> Self {
-        Self { queue, socket }
+    pub(crate) fn new(
+        queue: Arc<Mutex<WriterQueue>>,
+        socket: Arc<UdpSocket>,
+        dst_addr: SocketAddr,
+    ) -> Self {
+        Self {
+            queue,
+            socket,
+            dst_addr,
+        }
     }
 
     pub(crate) async fn run(&self) {
@@ -85,7 +95,7 @@ impl WriterRxChannel {
             let mut guard = self.queue.lock().unwrap();
             while num_packets_to_send > 0 && !guard.queue.is_empty() {
                 let packet = guard.queue.pop_front().unwrap();
-                if let Err(e) = self.socket.try_send(&packet.serialise()) {
+                if let Err(e) = self.socket.try_send_to(&packet.serialise(), self.dst_addr) {
                     eprintln!("Encountered error {} while sending packet across wire", e);
                     guard.queue.push_front(packet);
                     break;

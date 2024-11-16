@@ -140,6 +140,16 @@ async fn basic_server_client_connection_send_recv(
             .expect("Server timed out while trying to send five bytes")
             .expect("Server encountered error while trying to send bytes");
         assert_eq!(size, 5);
+
+        // Send another 10 bytes
+        let size = timeout(
+            Duration::from_secs(1),
+            conn.send(&[2, 4, 6, 8, 10, 12, 14, 16, 18, 20]),
+        )
+        .await
+        .expect("Server timed out while trying to send ten bytes")
+        .expect("Server encountered error while trying to send bytes");
+        assert_eq!(size, 10);
     });
 
     let loopback_cloned = loopback_ip_addr.clone();
@@ -237,13 +247,17 @@ async fn basic_server_client_connection_send_recv(
 
         assert_eq!(total_num_bytes_sent, TOTAL_NUM_BYTES_SENT);
 
-        let mut buf = [0u8; 10];
-        let size = timeout(Duration::from_secs(5), conn.recv(&mut buf, 10))
+        sleep(Duration::from_millis(100)).await;
+        let mut buf = [0u8; 30];
+        let size = timeout(Duration::from_secs(5), conn.recv(&mut buf, 20))
             .await
             .expect("Client timed out waiting to recv bytes")
             .expect("Client encountered error while calling recv");
-        assert_eq!(size, 5);
-        assert_eq!(buf[..size], [5, 4, 3, 2, 1]);
+        assert_eq!(size, 15);
+        assert_eq!(
+            buf[..size],
+            [5, 4, 3, 2, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+        );
     });
 
     join_set.join_all().await;

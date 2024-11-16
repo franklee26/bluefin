@@ -51,7 +51,6 @@ impl BluefinClient {
         );
 
         let src_conn_id: u32 = rand::thread_rng().gen();
-        eprintln!("client src id: 0x{:x}", src_conn_id);
         let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new(
             src_conn_id,
             BluefinHost::Client,

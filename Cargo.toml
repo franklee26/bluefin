@@ -10,9 +10,15 @@ repository = "https://github.com/franklee26/bluefin"
 
 [dependencies]
 etherparse = "0.15.0"
+local-ip-address = "0.6.3"
 rand = "0.8.5"
+rstest = "0.23.0"
 thiserror = "1.0.39"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.41.1", features = ["full"] }
+
+[dev-dependencies]
+local-ip-address = "0.6.3"
+rstest = "0.23.0"
 
 [lib]
 name = "bluefin"
@@ -29,3 +35,4 @@ path = "src/bin/server.rs"
 opt-level = 3 
 codegen-units = 1
 lto = "fat"
+debug = true

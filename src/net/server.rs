@@ -18,7 +18,7 @@ use super::{
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
 };
 
-const NUM_TX_WORKERS_FOR_SERVER: u8 = 5;
+const NUM_TX_WORKERS_FOR_SERVER: u8 = 10;
 
 #[derive(Clone)]
 pub struct BluefinServer {
@@ -56,7 +56,6 @@ impl BluefinServer {
     pub async fn accept(&mut self) -> BluefinResult<BluefinConnection> {
         // generate random conn id and insert buffer
         let src_conn_id: u32 = rand::thread_rng().gen();
-        eprintln!("src_conn_id: 0x{:x}", src_conn_id);
         let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new(
             src_conn_id,
             BluefinHost::PackLeader,
@@ -115,6 +114,7 @@ impl BluefinServer {
             packet_number + 1,
             Arc::clone(&conn_buffer),
             Arc::clone(self.socket.as_ref().unwrap()),
+            addr,
         ))
     }
 }

@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+};
 
 use connection::ConnectionManager;
 use tokio::{net::UdpSocket, spawn, sync::RwLock};
@@ -9,7 +12,10 @@ use crate::{
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
     },
-    worker::reader::TxChannel,
+    worker::{
+        reader::ReaderTxChannel,
+        writer::{WriterQueue, WriterRxChannel},
+    },
 };
 
 pub mod client;
@@ -26,13 +32,28 @@ fn build_and_start_tx(
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     host_type: BluefinHost,
 ) {
-    let tx = TxChannel::new(socket, conn_manager, pending_accept_ids, host_type);
+    let tx = ReaderTxChannel::new(socket, conn_manager, pending_accept_ids, host_type);
 
     for id in 0..num_tx_workers {
         let mut tx_clone = tx.clone();
         tx_clone.id = id;
         spawn(async move {
             let _ = tx_clone.run().await;
+        });
+    }
+}
+
+fn build_and_start_writer_rx_channel(
+    queue: Arc<Mutex<WriterQueue>>,
+    socket: Arc<UdpSocket>,
+    num_rx_workers: u8,
+    dst_addr: SocketAddr,
+) {
+    let rx = WriterRxChannel::new(queue, socket, dst_addr);
+    for _ in 0..num_rx_workers {
+        let rx_clone = rx.clone();
+        spawn(async move {
+            let _ = rx_clone.run().await;
         });
     }
 }
@@ -105,11 +126,14 @@ pub(crate) fn build_empty_encrypted_packet(
 }
 
 #[inline]
+// Type-specific payload contains the # of packets we acked.
+// The actual payload contains the base packet number.
 pub(crate) fn build_ack_packet(
     src_conn_id: u32,
     dst_conn_id: u32,
     base_packet_number_ack: u64,
     number_packets_to_ack: u16,
+    packet_number: u64,
 ) -> BluefinPacket {
     let security_fields = BluefinSecurityFields::new(false, 0x0);
     let mut header = BluefinHeader::new(
@@ -119,6 +143,9 @@ pub(crate) fn build_ack_packet(
         number_packets_to_ack,
         security_fields,
     );
-    header.with_packet_number(base_packet_number_ack);
-    BluefinPacket::builder().header(header).build()
+    header.with_packet_number(packet_number);
+    BluefinPacket::builder()
+        .header(header)
+        .payload(base_packet_number_ack.to_ne_bytes().to_vec())
+        .build()
 }

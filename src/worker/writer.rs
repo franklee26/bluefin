@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    fmt::Write,
     future::Future,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -29,6 +28,7 @@ impl WriterQueue {
 }
 
 /// Queues write requests to be sent
+#[derive(Clone)]
 pub(crate) struct WriterTxChannel {
     queue: Arc<Mutex<WriterQueue>>,
 }
@@ -38,7 +38,7 @@ impl WriterTxChannel {
         Self { queue }
     }
 
-    pub(crate) async fn send(&mut self, packet: BluefinPacket) -> BluefinResult<usize> {
+    pub(crate) async fn send(&self, packet: BluefinPacket) -> BluefinResult<usize> {
         let bytes = packet.len();
         let mut guard = self.queue.lock().unwrap();
         guard.queue.push_back(packet);

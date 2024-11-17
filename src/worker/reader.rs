@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, spawn, sync::RwLock, time::sleep};
+use tokio::{net::UdpSocket, sync::RwLock, time::sleep};
 
 use crate::{
     core::{
@@ -21,6 +21,8 @@ use crate::{
     },
     utils::common::BluefinResult,
 };
+
+use super::writer::WriterTxChannel;
 
 #[derive(Clone)]
 /// [ReaderTxChannel] is the transmission channel for the receiving [ReaderRxChannel]. This channel will when
@@ -44,14 +46,20 @@ pub(crate) struct ReaderTxChannel {
 /// *receives* bytes *from* the buffer.
 pub(crate) struct ReaderRxChannel {
     socket: Arc<UdpSocket>,
-    buffer: Arc<Mutex<ConnectionBuffer>>,
-    bytes_to_read: usize,
+    future: ReaderRxChannelFuture,
     src_conn_id: u32,
     dst_conn_id: u32,
+    writer_tx_channel: WriterTxChannel,
     packet_num: Arc<tokio::sync::Mutex<u64>>,
 }
 
-impl Future for ReaderRxChannel {
+#[derive(Clone)]
+struct ReaderRxChannelFuture {
+    buffer: Arc<Mutex<ConnectionBuffer>>,
+    bytes_to_read: usize,
+}
+
+impl Future for ReaderRxChannelFuture {
     type Output = (ConsumeResult, SocketAddr);
 
     fn poll(
@@ -74,26 +82,31 @@ impl ReaderRxChannel {
         socket: Arc<UdpSocket>,
         src_conn_id: u32,
         dst_conn_id: u32,
+        writer_tx_channel: WriterTxChannel,
         packet_num: Arc<tokio::sync::Mutex<u64>>,
     ) -> Self {
-        Self {
+        let future = ReaderRxChannelFuture {
             buffer,
+            bytes_to_read: 0,
+        };
+        Self {
             socket,
+            future,
             src_conn_id,
             dst_conn_id,
-            bytes_to_read: 0,
             packet_num,
+            writer_tx_channel,
         }
     }
 
     #[inline]
     pub(crate) fn set_bytes_to_read(&mut self, bytes_to_read: usize) {
-        self.bytes_to_read = bytes_to_read;
+        self.future.bytes_to_read = bytes_to_read;
     }
 
     #[inline]
     pub(crate) async fn read(&self) -> BluefinResult<(Vec<u8>, SocketAddr)> {
-        let (consume_res, addr) = self.clone().await;
+        let (consume_res, addr) = self.future.clone().await;
         let num_packets_consumed = consume_res.get_num_packets_consumed();
         let base_packet_num = consume_res.get_base_packet_number();
         // TODO: Handle packet numbers for sending acks. For now, use zero.
@@ -107,8 +120,12 @@ impl ReaderRxChannel {
                 num_packets_consumed as u16,
                 0,
             );
-            let s = Arc::clone(&self.socket);
-            spawn(async move { s.send_to(&ack_packet.serialise(), addr).await });
+            if let Err(e) = self.writer_tx_channel.send(ack_packet).await {
+                eprintln!(
+                    "Failed to send ack packet after reads due to error: {:?}",
+                    e
+                );
+            }
         }
 
         Ok((consume_res.take_bytes(), addr))

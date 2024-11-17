@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::core::{error::BluefinError, packet};
+use crate::core::error::BluefinError;
 
 use super::common::BluefinResult;
 

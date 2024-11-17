@@ -260,10 +260,8 @@ pub struct BluefinConnection {
     pub dst_conn_id: u32,
     // This is the *next* packet number we must use
     packet_num: Arc<tokio::sync::Mutex<u64>>,
-    socket: Arc<UdpSocket>,
     reader_rx: ReaderRxChannel,
     writer_tx: WriterTxChannel,
-    dst_addr: SocketAddr,
 }
 
 impl BluefinConnection {
@@ -276,14 +274,6 @@ impl BluefinConnection {
         dst_addr: SocketAddr,
     ) -> Self {
         let shared_packet_num = Arc::new(tokio::sync::Mutex::new(packet_num));
-        let reader_rx = ReaderRxChannel::new(
-            Arc::clone(&conn_buffer),
-            Arc::clone(&socket),
-            src_conn_id,
-            dst_conn_id,
-            Arc::clone(&shared_packet_num),
-        );
-
         let writer_queue = Arc::new(Mutex::new(WriterQueue::new()));
         let writer_tx = WriterTxChannel::new(Arc::clone(&writer_queue));
 
@@ -294,14 +284,21 @@ impl BluefinConnection {
             dst_addr,
         );
 
+        let reader_rx = ReaderRxChannel::new(
+            Arc::clone(&conn_buffer),
+            Arc::clone(&socket),
+            src_conn_id,
+            dst_conn_id,
+            writer_tx.clone(),
+            Arc::clone(&shared_packet_num),
+        );
+
         Self {
             src_conn_id,
             dst_conn_id,
             packet_num: Arc::clone(&shared_packet_num),
             reader_rx,
-            socket,
             writer_tx,
-            dst_addr,
         }
     }
 
@@ -330,8 +327,8 @@ impl BluefinConnection {
             .header(header)
             .payload(buf.to_vec())
             .build();
-        // TODO!
-        // let _ = self.socket.send(&packet.serialise()).await?;
+        // TODO! This returns the total bytes sent (including bluefin payload). This
+        // really should only return the total payload bytes
         let _ = self.writer_tx.send(packet).await?;
 
         // HANDLE THIS!

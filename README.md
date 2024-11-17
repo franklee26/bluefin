@@ -6,6 +6,7 @@
 [![Documentation]][docs.rs]
 ![Github Workflow](https://github.com/franklee26/bluefin/actions/workflows/bluefin.yml/badge.svg)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![codecov](https://codecov.io/github/franklee26/bluefin/graph/badge.svg?token=U0XPUZVE0I)](https://codecov.io/github/franklee26/bluefin)
 
 ### Example
 #### Pack-leader

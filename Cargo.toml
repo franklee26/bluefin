@@ -31,6 +31,9 @@ path = "src/bin/client.rs"
 name = "server"
 path = "src/bin/server.rs"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }
+
 [profile.release]
 opt-level = 3 
 codegen-units = 1

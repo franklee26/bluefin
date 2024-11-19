@@ -1,3 +1,4 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     time::Duration,
@@ -8,6 +9,7 @@ use bluefin::{
 };
 use tokio::{spawn, time::sleep};
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[tokio::main]
 async fn main() -> BluefinResult<()> {
     let ports = [1320, 1322];

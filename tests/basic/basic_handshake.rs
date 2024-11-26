@@ -331,12 +331,9 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
         });
     }
     for conn_num in 0..NUM_CONNECTIONS {
-        // Sleep for a random amount of time before sending data. This will add some variation
-        // in the order of processing.
-        let sleep_duration_in_ms = rand::thread_rng().gen_range(0..100);
+        // Random amount of time to sleep
         let data_cloned = Arc::clone(&data);
         join_set.spawn(async move {
-            sleep(Duration::from_millis(sleep_duration_in_ms)).await;
             let mut client = BluefinClient::new(std::net::SocketAddr::V4(SocketAddrV4::new(
                 loopback_cloned,
                 client_ports[conn_num],

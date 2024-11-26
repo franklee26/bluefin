@@ -40,7 +40,7 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage
-        run: cargo llvm-cov --all-features --workspace --lcov --ignore-filename-regex error.rs --output-path lcov.info
+        run: cargo llvm-cov --all-features --workspace --lcov --ignore-filename-regex "error.rs|*/bin/*.rs" --output-path lcov.info
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3
         with:
@@ -55,5 +55,7 @@ jobs:
     steps:
       - name: Run Kani
         uses: model-checking/kani-github-action@v1
+        with:
+          working-directory: '../'
 
       

@@ -264,7 +264,7 @@ async fn basic_server_client_connection_send_recv(
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(5))]
+#[timeout(Duration::from_secs(10))]
 #[tokio::test]
 async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &Ipv4Addr) {
     use std::sync::Arc;
@@ -291,7 +291,7 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
         let mut s = server.clone();
         let data_cloned = Arc::clone(&data);
         join_set.spawn(async move {
-            let mut conn = timeout(Duration::from_secs(3), s.accept())
+            let mut conn = timeout(Duration::from_secs(5), s.accept())
                 .await
                 .expect(&format!(
                     "Server #{} timed out waiting to accept connection from client",

@@ -53,6 +53,10 @@ jobs:
     strategy:
       fail-fast: false
     steps:
+      - name: FRANK PWD
+        run: pwd
+      - name: FRANK LS
+        run: ls
       - name: Run Kani
         uses: model-checking/kani-github-action@v1.1
       

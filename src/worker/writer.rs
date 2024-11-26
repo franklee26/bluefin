@@ -409,11 +409,7 @@ impl WriterRxChannel {
 
 #[cfg(kani)]
 mod verification_tests {
-    use crate::{
-        core::packet::BluefinPacket,
-        net::{MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM, MAX_BLUEFIN_PAYLOAD_SIZE_BYTES},
-        worker::writer::{WriterQueue, WriterQueueData},
-    };
+    use crate::worker::writer::WriterQueue;
 
     #[kani::proof]
     fn kani_writer_queue_consume_empty_data_behaves_as_expected() {

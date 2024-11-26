@@ -6,7 +6,6 @@ use std::{
 };
 
 use rand::Rng;
-use sysctl::Sysctl;
 use tokio::{net::UdpSocket, sync::RwLock};
 
 use crate::{
@@ -60,12 +59,15 @@ impl BluefinServer {
         self.socket = Some(Arc::new(socket));
 
         #[cfg(target_os = "macos")]
-        if let Ok(ctl) = sysctl::Ctl::new("net.inet.udp.maxdgram") {
-            match ctl.set_value_string("16000") {
-                Ok(s) => {
-                    println!("Successfully set net.inet.udp.maxdgram to {}", s)
+        {
+            use sysctl::Sysctl;
+            if let Ok(ctl) = sysctl::Ctl::new("net.inet.udp.maxdgram") {
+                match ctl.set_value_string("16000") {
+                    Ok(s) => {
+                        println!("Successfully set net.inet.udp.maxdgram to {}", s)
+                    }
+                    Err(e) => eprintln!("Failed to set net.inet.udp.maxdgram due to err: {:?}", e),
                 }
-                Err(e) => eprintln!("Failed to set net.inet.udp.maxdgram due to err: {:?}", e),
             }
         }
 

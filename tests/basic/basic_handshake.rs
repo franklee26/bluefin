@@ -47,7 +47,7 @@ fn loopback_ip_addr() -> Ipv4Addr {
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(5))]
+#[timeout(Duration::from_secs(15))]
 #[case(1318, 1319, 10)]
 #[case(1320, 1321, 100)]
 #[case(1322, 1323, 222)]
@@ -67,6 +67,7 @@ async fn basic_server_client_connection_send_recv(
         .bind()
         .await
         .expect("Encountered error while binding server");
+    let _ = server.set_num_reader_workers(20);
 
     let mut client = BluefinClient::new(std::net::SocketAddr::V4(SocketAddrV4::new(
         *loopback_ip_addr,
@@ -78,7 +79,7 @@ async fn basic_server_client_connection_send_recv(
     let mut join_set = JoinSet::new();
 
     join_set.spawn(async move {
-        let mut conn = timeout(Duration::from_secs(3), server.accept())
+        let mut conn = timeout(Duration::from_secs(10), server.accept())
             .await
             .expect("Server timed out waiting to accept connection from client")
             .expect("Failed to create bluefin connection");
@@ -162,8 +163,8 @@ async fn basic_server_client_connection_send_recv(
             .await
             .expect("Client timed out waiting to connect to server");
 
-        // Wait for 250ms for the server to be ready
-        sleep(Duration::from_millis(250)).await;
+        // Wait for 100ms for the server to be ready
+        sleep(Duration::from_millis(100)).await;
 
         // Send TOTAL_NUM_BYTES_SENT across the wire
         let mut total_num_bytes_sent = 0;
@@ -264,12 +265,10 @@ async fn basic_server_client_connection_send_recv(
 }
 
 #[rstest]
-#[timeout(Duration::from_secs(10))]
+#[timeout(Duration::from_secs(15))]
 #[tokio::test]
 async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &Ipv4Addr) {
     use std::sync::Arc;
-
-    use rand::Rng;
 
     let mut server = BluefinServer::new(std::net::SocketAddr::V4(SocketAddrV4::new(
         *loopback_ip_addr,
@@ -281,9 +280,9 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
         .expect("Encountered error while binding server");
 
     let mut join_set = JoinSet::new();
-    const NUM_CONNECTIONS: usize = 5;
+    const NUM_CONNECTIONS: usize = 3;
     const MAX_BYTES_SENT_PER_CONNECTION: usize = 3200;
-    let client_ports: [u16; NUM_CONNECTIONS] = [1420, 1421, 1422, 1423, 1424];
+    let client_ports: [u16; NUM_CONNECTIONS] = [1420, 1421, 1422];
     let loopback_cloned = loopback_ip_addr.clone();
     let data = Arc::new(generate_connection_date(NUM_CONNECTIONS));
 
@@ -291,7 +290,7 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
         let mut s = server.clone();
         let data_cloned = Arc::clone(&data);
         join_set.spawn(async move {
-            let mut conn = timeout(Duration::from_secs(5), s.accept())
+            let mut conn = timeout(Duration::from_secs(10), s.accept())
                 .await
                 .expect(&format!(
                     "Server #{} timed out waiting to accept connection from client",

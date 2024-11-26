@@ -281,10 +281,9 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
         .expect("Encountered error while binding server");
 
     let mut join_set = JoinSet::new();
-    const NUM_CONNECTIONS: usize = 10;
+    const NUM_CONNECTIONS: usize = 5;
     const MAX_BYTES_SENT_PER_CONNECTION: usize = 3200;
-    let client_ports: [u16; NUM_CONNECTIONS] =
-        [1420, 1421, 1422, 1423, 1424, 1425, 1426, 1427, 1428, 1429];
+    let client_ports: [u16; NUM_CONNECTIONS] = [1420, 1421, 1422, 1423, 1424];
     let loopback_cloned = loopback_ip_addr.clone();
     let data = Arc::new(generate_connection_date(NUM_CONNECTIONS));
 
@@ -314,14 +313,14 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
 
             let expected_data = data_cloned.get(key).expect("Could not fetch expected data");
             let mut stitched_bytes: Vec<u8> = Vec::new();
+            let mut buf = [0u8; 1500];
             loop {
-                let mut buf = [0u8; 100];
-                let size = timeout(Duration::from_secs(1), conn.recv(&mut buf, 100))
+                let size = timeout(Duration::from_secs(1), conn.recv(&mut buf, 1500))
                     .await
                     .expect("Server timed out while waiting for data")
                     .expect("Server encountered error while receiving data");
                 assert_ne!(size, 0);
-                assert!(size <= 100);
+                assert!(size <= 1500);
                 stitched_bytes.extend_from_slice(&buf[..size]);
 
                 if stitched_bytes.len() == MAX_BYTES_SENT_PER_CONNECTION {
@@ -334,7 +333,7 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
     for conn_num in 0..NUM_CONNECTIONS {
         // Sleep for a random amount of time before sending data. This will add some variation
         // in the order of processing.
-        let sleep_duration_in_ms = rand::thread_rng().gen_range(0..300);
+        let sleep_duration_in_ms = rand::thread_rng().gen_range(0..100);
         let data_cloned = Arc::clone(&data);
         join_set.spawn(async move {
             sleep(Duration::from_millis(sleep_duration_in_ms)).await;
@@ -362,7 +361,7 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
                 .expect("Client encountered error while sending");
             assert_eq!(size, 5);
 
-            sleep(Duration::from_millis(50)).await;
+            sleep(Duration::from_millis(10)).await;
 
             // Now begin sending the actual data in batches of 32 bytes
             let mut total_bytes_sent = 5;

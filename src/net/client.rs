@@ -20,7 +20,7 @@ use super::{
     AckBuffer, ConnectionManagedBuffers,
 };
 
-const NUM_TX_WORKERS_FOR_CLIENT: u16 = 100;
+const NUM_TX_WORKERS_FOR_CLIENT: u16 = 5;
 
 pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,

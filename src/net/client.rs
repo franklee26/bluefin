@@ -15,9 +15,12 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-use super::connection::{BluefinConnection, ConnectionBuffer, ConnectionManager};
+use super::{
+    connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
+    AckBuffer, ConnectionManagedBuffers,
+};
 
-const NUM_TX_WORKERS_FOR_CLIENT: u8 = 5;
+const NUM_TX_WORKERS_FOR_CLIENT: u16 = 100;
 
 pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
@@ -51,10 +54,16 @@ impl BluefinClient {
         );
 
         let src_conn_id: u32 = rand::thread_rng().gen();
+        let packet_number: u64 = rand::thread_rng().gen();
         let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new(
             src_conn_id,
             BluefinHost::Client,
         )));
+        let ack_buff = Arc::new(Mutex::new(AckBuffer::new(packet_number + 2)));
+        let conn_mgrs_buffs = ConnectionManagedBuffers {
+            conn_buff: Arc::clone(&conn_buffer),
+            ack_buff: Arc::clone(&ack_buff),
+        };
         let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
 
         // Register the connection
@@ -62,10 +71,9 @@ impl BluefinClient {
         self.conn_manager
             .write()
             .await
-            .insert(&hello_key, Arc::clone(&conn_buffer))?;
+            .insert(&hello_key, conn_mgrs_buffs.clone())?;
 
         // send the client hello
-        let packet_number: u64 = rand::thread_rng().gen();
         let packet = build_empty_encrypted_packet(
             src_conn_id,
             0x0,
@@ -94,7 +102,7 @@ impl BluefinClient {
         // delete the old hello entry and insert the new connection entry
         let mut guard = self.conn_manager.write().await;
         let _ = guard.remove(&hello_key);
-        let _ = guard.insert(&key, Arc::clone(&conn_buffer));
+        let _ = guard.insert(&key, conn_mgrs_buffs);
         drop(guard);
 
         // send the client ack
@@ -115,6 +123,7 @@ impl BluefinClient {
             dst_conn_id,
             packet_number + 2,
             Arc::clone(&conn_buffer),
+            Arc::clone(&ack_buff),
             Arc::clone(self.socket.as_ref().unwrap()),
             self.dst_addr.unwrap(),
         ))

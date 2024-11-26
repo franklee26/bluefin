@@ -1,15 +1,24 @@
-use std::{char::MAX, collections::VecDeque};
+use std::collections::VecDeque;
 
 use crate::core::error::BluefinError;
 
 use super::common::BluefinResult;
 
-pub const MAX_SLIDING_WINDOW_SIZE: usize = 10;
+pub const MAX_SLIDING_WINDOW_SIZE: usize = 20000;
 
 #[derive(Clone)]
 pub(crate) struct SlidingWindow {
     smallest_expected_packet_number: u64,
     ordered_packet_numbers: VecDeque<u64>,
+}
+
+#[derive(PartialEq, Debug)]
+pub(crate) struct SlidingWindowConsumeResult {
+    /// The largest packet number that we have contiguously buffered
+    pub(crate) largest_packet_number: u64,
+    /// The number of acks consumed. This means that this consume result represents
+    /// the accumulation of contiguous acks in the range of [largest_packet_number - num_acks_consumed - 1, largest_packet_number]
+    pub(crate) num_acks_consumed: u64,
 }
 
 impl SlidingWindow {
@@ -29,7 +38,9 @@ impl SlidingWindow {
         if packet_number - self.smallest_expected_packet_number
             >= MAX_SLIDING_WINDOW_SIZE.try_into().unwrap()
         {
-            return Err(BluefinError::BufferFullError);
+            return Err(BluefinError::BufferFullError(
+                "Sliding window buffer is full".to_string(),
+            ));
         }
 
         // Find the index to insert into our sorted vector.
@@ -48,7 +59,8 @@ impl SlidingWindow {
     /// If present, returns the largest packet number that we have contiguously buffered. For example,
     /// if Some(10) were returned, that means we have accounted for all packet numbers 10 and below.
     /// We may have packet numbers larger than 10 but they are disjointed from the contiguous set.
-    fn consume(&mut self) -> Option<u64> {
+    #[inline]
+    pub(crate) fn consume(&mut self) -> Option<SlidingWindowConsumeResult> {
         // Nothing in the vector. Done.
         if self.ordered_packet_numbers.is_empty() {
             return None;
@@ -76,8 +88,13 @@ impl SlidingWindow {
             }
         }
 
+        let prev = self.smallest_expected_packet_number;
         self.smallest_expected_packet_number = last_packet_number + 1;
-        Some(last_packet_number)
+
+        Some(SlidingWindowConsumeResult {
+            largest_packet_number: last_packet_number,
+            num_acks_consumed: last_packet_number - prev + 1,
+        })
     }
 }
 
@@ -113,6 +130,14 @@ mod tests {
         // Still nothing to consume since we are still missing packet #100
         assert_eq!(sliding_window.consume(), None);
 
+        // Cannot re-insert already inserted numbers
+        let insert_res = sliding_window.insert_packet_number(103);
+        assert!(insert_res.is_err());
+        assert_eq!(
+            insert_res.err().unwrap(),
+            BluefinError::UnexpectedPacketNumberError
+        );
+
         // Should not be able to insert above the window limit
         assert!(sliding_window
             .insert_packet_number(100 + u64::try_from(MAX_SLIDING_WINDOW_SIZE).unwrap())
@@ -122,7 +147,9 @@ mod tests {
         assert_eq!(sliding_window.insert_packet_number(100), Ok(()));
         let consume_res = sliding_window.consume();
         assert!(consume_res.is_some());
-        assert_eq!(consume_res.unwrap(), 104);
+        let consume_res_unwrapped = consume_res.unwrap();
+        assert_eq!(consume_res_unwrapped.largest_packet_number, 104);
+        assert_eq!(consume_res_unwrapped.num_acks_consumed, 5);
 
         // Consuming again returns none since we are missing #105
         assert!(sliding_window.consume().is_none());
@@ -136,7 +163,9 @@ mod tests {
         assert_eq!(sliding_window.insert_packet_number(105), Ok(()));
         let consume_res = sliding_window.consume();
         assert!(consume_res.is_some());
-        assert_eq!(consume_res.unwrap(), 107);
+        let consume_res_unwrapped = consume_res.unwrap();
+        assert_eq!(consume_res_unwrapped.largest_packet_number, 107);
+        assert_eq!(consume_res_unwrapped.num_acks_consumed, 3);
         assert!(sliding_window.consume().is_none());
 
         // Should not be able to insert above the window limit

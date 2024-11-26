@@ -28,6 +28,7 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+
   coverage:
     runs-on: ubuntu-latest
     env:
@@ -46,3 +47,13 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }} # not required for public repos
           files: lcov.info
           fail_ci_if_error: false
+
+  kani:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+    steps:
+      - name: Run Kani
+        uses: model-checking/kani-github-action@v1
+
+      

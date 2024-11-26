@@ -11,8 +11,8 @@ pub enum BluefinError {
     #[error("Connection buffer does not exist")]
     BufferDoesNotExist,
 
-    #[error("Current buffer is full.")]
-    BufferFullError,
+    #[error("Current buffer is full: `{0}`")]
+    BufferFullError(String),
 
     #[error("Current buffer is empty.")]
     BufferEmptyError,

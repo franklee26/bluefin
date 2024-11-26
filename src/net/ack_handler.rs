@@ -33,7 +33,6 @@ impl AckBuffer {
     pub(crate) fn buffer_in_ack_packet(&mut self, packet: BluefinPacket) -> BluefinResult<()> {
         let num_packets_to_ack = packet.header.type_specific_payload;
         let base_packet_num = packet.header.packet_number;
-        // let base_packet_num = u64::from_le_bytes(packet.payload.try_into().unwrap());
         for ix in 0..num_packets_to_ack {
             self.received_acks
                 .insert_packet_number(base_packet_num + ix as u64)?;

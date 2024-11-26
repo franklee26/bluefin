@@ -67,6 +67,9 @@ impl BluefinPacket {
         self.payload.len() + 20
     }
 
+    /// Converts an array of bytes into a vector of bluefin packets. The array of bytes must be
+    /// a valid stream of bluefin packet bytes. Otherwise, an error is returned.
+    #[inline]
     pub fn from_bytes(bytes: &[u8]) -> BluefinResult<Vec<BluefinPacket>> {
         if bytes.len() < 20 {
             return Err(BluefinError::ReadError(
@@ -139,11 +142,47 @@ impl BluefinPacketBuilder {
 #[cfg(test)]
 mod tests {
     use crate::core::{
+        error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         Serialisable,
     };
 
     use super::BluefinPacket;
+
+    #[test]
+    fn cannot_deserialise_invalid_bytes_into_bluefin_packets() {
+        let security_fields = BluefinSecurityFields::new(false, 0x0);
+
+        let mut header = BluefinHeader::new(0x0, 0x0, PacketType::Ack, 13, security_fields);
+        let payload: [u8; 32] = rand::random();
+        header.type_field = PacketType::UnencryptedData;
+        header.type_specific_payload = 32;
+        header.version = 13;
+        let mut packet = BluefinPacket::builder()
+            .header(header.clone())
+            .payload(payload.to_vec())
+            .build();
+        assert_eq!(packet.len(), 52);
+        assert!(BluefinPacket::from_bytes(&packet.serialise()).is_ok());
+
+        // Incorrectly specify the length to be 33 instead of 32
+        packet.header.type_specific_payload = (payload.len() + 1) as u16;
+        assert!(
+            BluefinPacket::from_bytes(&packet.serialise()).is_err_and(|e| e
+                == BluefinError::ReadError(
+                    "Cannot read all bytes specified by header".to_string()
+                ))
+        );
+
+        // Now test again but specify a payload length under the actual payload len
+        packet.header.type_specific_payload = (payload.len() - 1) as u16;
+        assert!(
+            BluefinPacket::from_bytes(&packet.serialise()).is_err_and(|e| e
+                == BluefinError::ReadError(
+                    "Was not able to read all bytes into bluefin packets. Likely indicates corrupted UDP datagram.".to_string()
+                ))
+        );
+    }
 
     #[test]
     fn able_to_deserialise_bytes_into_multiple_bluefin_packets_correctly() {

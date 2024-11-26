@@ -20,13 +20,14 @@ use super::{
     AckBuffer, ConnectionManagedBuffers,
 };
 
-const NUM_TX_WORKERS_FOR_CLIENT: u16 = 5;
+const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 5;
 
 pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
     src_addr: SocketAddr,
     dst_addr: Option<SocketAddr>,
     conn_manager: Arc<RwLock<ConnectionManager>>,
+    num_reader_workers: u16,
 }
 
 impl BluefinClient {
@@ -36,17 +37,17 @@ impl BluefinClient {
             dst_addr: None,
             conn_manager: Arc::new(RwLock::new(ConnectionManager::new())),
             src_addr,
+            num_reader_workers: NUM_TX_WORKERS_FOR_CLIENT_DEFAULT,
         }
     }
 
     pub async fn connect(&mut self, dst_addr: SocketAddr) -> BluefinResult<BluefinConnection> {
         let socket = Arc::new(UdpSocket::bind(self.src_addr).await?);
-        // socket.connect(dst_addr).await?;
         self.socket = Some(Arc::clone(&socket));
         self.dst_addr = Some(dst_addr);
 
         build_and_start_tx(
-            NUM_TX_WORKERS_FOR_CLIENT,
+            self.num_reader_workers,
             Arc::clone(self.socket.as_ref().unwrap()),
             Arc::clone(&self.conn_manager),
             Arc::new(Mutex::new(Vec::new())),
@@ -100,10 +101,11 @@ impl BluefinClient {
         }
 
         // delete the old hello entry and insert the new connection entry
-        let mut guard = self.conn_manager.write().await;
-        let _ = guard.remove(&hello_key);
-        let _ = guard.insert(&key, conn_mgrs_buffs);
-        drop(guard);
+        {
+            let mut guard = self.conn_manager.write().await;
+            let _ = guard.remove(&hello_key);
+            let _ = guard.insert(&key, conn_mgrs_buffs);
+        }
 
         // send the client ack
         let packet = build_empty_encrypted_packet(

@@ -20,6 +20,7 @@ use crate::{
     utils::common::BluefinResult,
 };
 
+/// Each writer queue holds a queue of `WriterQueueData`
 enum WriterQueueData {
     Payload(Vec<u8>),
     Ack {
@@ -41,6 +42,7 @@ impl WriterQueue {
         }
     }
 
+    #[inline]
     pub(crate) fn consume_data(
         &mut self,
         next_packet_num: &mut u64,
@@ -210,7 +212,7 @@ impl WriterQueue {
     }
 }
 
-/// Queues write requests to be sent
+/// Queues write requests to be sent. Each connection can have one or more [WriterTxChannel].
 #[derive(Clone)]
 pub(crate) struct WriterTxChannel {
     data_queue: Arc<Mutex<WriterQueue>>,
@@ -288,7 +290,11 @@ struct WriterRxChannelAckFuture {
     ack_queue: Arc<Mutex<WriterQueue>>,
 }
 
-/// Consumes queued requests and sends them across the wire
+/// Consumes queued requests and sends them across the wire. For now, each connection
+/// has one and only one [WriterRxChannel]. This channel must run two separate jobs:
+/// [WriterRxChannel::run_data], which reads out of the data queue and sends bluefin
+/// packets w/ payloads across the wire AND [WriterRxChannel::run_ack], which reads
+/// acks out of the ack queue and sends bluefin ack packets across the wire.
 #[derive(Clone)]
 pub(crate) struct WriterRxChannel {
     data_future: WriterRxChannelDataFuture,
@@ -414,9 +420,12 @@ mod verification_tests {
     #[kani::proof]
     fn kani_writer_queue_consume_empty_data_behaves_as_expected() {
         let mut writer_q = WriterQueue::new();
+        let mut next_packet_num = kani::any();
+        let prev = next_packet_num;
         assert!(writer_q
-            .consume_data(&mut 0, kani::any(), kani::any())
+            .consume_data(&mut next_packet_num, kani::any(), kani::any())
             .is_none());
+        assert_eq!(next_packet_num, prev);
     }
 
     #[kani::proof]
@@ -428,7 +437,6 @@ mod verification_tests {
 
 #[cfg(test)]
 mod tests {
-
     use rstest::rstest;
 
     use crate::{

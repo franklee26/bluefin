@@ -55,7 +55,4 @@ jobs:
     steps:
       - name: Run Kani
         uses: model-checking/kani-github-action@v1
-        with:
-          working-directory: '../'
-
       

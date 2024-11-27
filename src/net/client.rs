@@ -15,15 +15,19 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-use super::connection::{BluefinConnection, ConnectionBuffer, ConnectionManager};
+use super::{
+    connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
+    AckBuffer, ConnectionManagedBuffers,
+};
 
-const NUM_TX_WORKERS_FOR_CLIENT: u8 = 5;
+const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 5;
 
 pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
     src_addr: SocketAddr,
     dst_addr: Option<SocketAddr>,
     conn_manager: Arc<RwLock<ConnectionManager>>,
+    num_reader_workers: u16,
 }
 
 impl BluefinClient {
@@ -33,17 +37,17 @@ impl BluefinClient {
             dst_addr: None,
             conn_manager: Arc::new(RwLock::new(ConnectionManager::new())),
             src_addr,
+            num_reader_workers: NUM_TX_WORKERS_FOR_CLIENT_DEFAULT,
         }
     }
 
     pub async fn connect(&mut self, dst_addr: SocketAddr) -> BluefinResult<BluefinConnection> {
         let socket = Arc::new(UdpSocket::bind(self.src_addr).await?);
-        // socket.connect(dst_addr).await?;
         self.socket = Some(Arc::clone(&socket));
         self.dst_addr = Some(dst_addr);
 
         build_and_start_tx(
-            NUM_TX_WORKERS_FOR_CLIENT,
+            self.num_reader_workers,
             Arc::clone(self.socket.as_ref().unwrap()),
             Arc::clone(&self.conn_manager),
             Arc::new(Mutex::new(Vec::new())),
@@ -51,10 +55,16 @@ impl BluefinClient {
         );
 
         let src_conn_id: u32 = rand::thread_rng().gen();
+        let packet_number: u64 = rand::thread_rng().gen();
         let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new(
             src_conn_id,
             BluefinHost::Client,
         )));
+        let ack_buff = Arc::new(Mutex::new(AckBuffer::new(packet_number + 2)));
+        let conn_mgrs_buffs = ConnectionManagedBuffers {
+            conn_buff: Arc::clone(&conn_buffer),
+            ack_buff: Arc::clone(&ack_buff),
+        };
         let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
 
         // Register the connection
@@ -62,10 +72,9 @@ impl BluefinClient {
         self.conn_manager
             .write()
             .await
-            .insert(&hello_key, Arc::clone(&conn_buffer))?;
+            .insert(&hello_key, conn_mgrs_buffs.clone())?;
 
         // send the client hello
-        let packet_number: u64 = rand::thread_rng().gen();
         let packet = build_empty_encrypted_packet(
             src_conn_id,
             0x0,
@@ -92,10 +101,11 @@ impl BluefinClient {
         }
 
         // delete the old hello entry and insert the new connection entry
-        let mut guard = self.conn_manager.write().await;
-        let _ = guard.remove(&hello_key);
-        let _ = guard.insert(&key, Arc::clone(&conn_buffer));
-        drop(guard);
+        {
+            let mut guard = self.conn_manager.write().await;
+            let _ = guard.remove(&hello_key);
+            let _ = guard.insert(&key, conn_mgrs_buffs);
+        }
 
         // send the client ack
         let packet = build_empty_encrypted_packet(
@@ -115,6 +125,7 @@ impl BluefinClient {
             dst_conn_id,
             packet_number + 2,
             Arc::clone(&conn_buffer),
+            Arc::clone(&ack_buff),
             Arc::clone(self.socket.as_ref().unwrap()),
             self.dst_addr.unwrap(),
         ))

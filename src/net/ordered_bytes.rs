@@ -2,12 +2,12 @@ use std::fmt;
 
 use crate::{
     core::{error::BluefinError, packet::BluefinPacket},
-    utils::{common::BluefinResult, window::SlidingWindow},
+    utils::common::BluefinResult,
 };
 
 /// Represents the maximum number of *packets* we can buffer in memory. When bytes are consumed
 /// via [OrderedBytes::consume()], we can only consume at most [MAX_BUFFER_SIZE] number of packets.
-pub const MAX_BUFFER_SIZE: usize = 2500;
+pub const MAX_BUFFER_SIZE: usize = 10000000;
 
 /// [OrderedBytes] represents the connection's buffered packets. OrderedBytes stores at most
 /// [MAX_BUFFER_SIZE] number of bluefin packets and maintains their intended consumption
@@ -18,7 +18,7 @@ pub(crate) struct OrderedBytes {
     /// The connection id that owns the ordered bytes. Used for debugging.
     conn_id: u32,
     /// Represents the in-ordered buffer of packets. This is a circular buffer.
-    packets: [Option<BluefinPacket>; MAX_BUFFER_SIZE],
+    packets: Box<[Option<BluefinPacket>; MAX_BUFFER_SIZE]>,
     /// Pointer to the where the packet with the smallest packet number is buffered
     smallest_packet_number_index: usize,
     /// The packet number of the packet that *should* be buffered at packets\[start_index\] and
@@ -27,8 +27,6 @@ pub(crate) struct OrderedBytes {
     /// Stores any potential carry over bytes from a previous consume. These bytes belong to
     /// a packet we have already consumed.
     carry_over_bytes: Option<Vec<u8>>,
-    /// Holds all of the packet numbers for which we have received acks for.
-    received_acks: SlidingWindow,
 }
 
 /// The result returned when [OrderedBytes are consumed](OrderedBytes::consume()). This result
@@ -36,34 +34,34 @@ pub(crate) struct OrderedBytes {
 /// ack packets to the sender. Notice that once bytes are returned in a [ConsumeResult] then
 /// the bytes are no longer available in the [OrderedBytes] for consumption.
 pub(crate) struct ConsumeResult {
-    bytes: Vec<u8>,
     num_packets_consumed: usize,
     base_packet_number: u64,
+    bytes_consumed: u64,
 }
 
 impl ConsumeResult {
-    fn new(bytes: Vec<u8>, num_packets_consumed: usize, base_packet_number: u64) -> Self {
+    #[inline]
+    fn new(num_packets_consumed: usize, base_packet_number: u64, bytes_consumed: u64) -> Self {
         Self {
-            bytes,
             num_packets_consumed,
             base_packet_number,
+            bytes_consumed,
         }
     }
 
-    pub(crate) fn get_bytes(&self) -> &Vec<u8> {
-        return &self.bytes;
-    }
-
+    #[inline]
     pub(crate) fn get_num_packets_consumed(&self) -> usize {
         self.num_packets_consumed
     }
 
+    #[inline]
     pub(crate) fn get_base_packet_number(&self) -> u64 {
         self.base_packet_number
     }
 
-    pub(crate) fn take_bytes(self) -> Vec<u8> {
-        return self.bytes;
+    #[inline]
+    pub(crate) fn get_bytes_consumed(&self) -> u64 {
+        self.bytes_consumed
     }
 }
 
@@ -95,14 +93,15 @@ impl fmt::Display for OrderedBytes {
 impl OrderedBytes {
     pub(crate) fn new(conn_id: u32, start_packet_number: u64) -> Self {
         const ARRAY_REPEAT_VALUE: Option<BluefinPacket> = None;
-        let packets = [ARRAY_REPEAT_VALUE; MAX_BUFFER_SIZE];
+        let packets = vec![ARRAY_REPEAT_VALUE; MAX_BUFFER_SIZE]
+            .try_into()
+            .unwrap();
         Self {
             conn_id,
             packets,
             smallest_packet_number_index: 0,
             smallest_packet_number: start_packet_number,
             carry_over_bytes: None,
-            received_acks: SlidingWindow::new(start_packet_number),
         }
     }
 
@@ -123,7 +122,7 @@ impl OrderedBytes {
     /// If [MAX_BUFFER_SIZE] or more number of packets are already buffered, then we cannot
     /// buffer any more packets and will drop packets from the network.
     #[inline]
-    pub(crate) fn buffer_in_packet(&mut self, packet: &BluefinPacket) -> BluefinResult<()> {
+    pub(crate) fn buffer_in_packet(&mut self, packet: BluefinPacket) -> BluefinResult<()> {
         let packet_num = packet.header.packet_number;
 
         // We are expecting a packet with packet number >= start_packet_number
@@ -134,7 +133,9 @@ impl OrderedBytes {
         // We received a packet that cannot fit in the buffer
         let offset = (packet_num - self.smallest_packet_number) as usize;
         if offset >= MAX_BUFFER_SIZE {
-            return Err(BluefinError::BufferFullError);
+            return Err(BluefinError::BufferFullError(
+                "Ordered bytes buffer full".to_string(),
+            ));
         }
 
         let index = (self.smallest_packet_number_index + offset) % MAX_BUFFER_SIZE;
@@ -149,12 +150,23 @@ impl OrderedBytes {
             ));
         }
 
-        self.packets[index] = Some(packet.clone());
+        self.packets[index] = Some(packet);
         Ok(())
     }
 
-    pub(crate) fn buffer_in_ack_packet(&mut self, packet: &BluefinPacket) -> BluefinResult<()> {
-        Ok(())
+    /// Ok(()) indicates there are bytes to consume. Error otherwise.
+    pub(crate) fn peek(&self) -> BluefinResult<()> {
+        // There are at least carry over bytes to consume
+        if let Some(_) = self.carry_over_bytes.as_ref() {
+            return Ok(());
+        }
+
+        // We have at least one packet buffered
+        if let Some(_) = self.packets[self.smallest_packet_number_index] {
+            return Ok(());
+        }
+
+        Err(BluefinError::BufferEmptyError)
     }
 
     /// Consumes the buffer, which removes consumable bytes from the buffer in-order and places
@@ -171,22 +183,24 @@ impl OrderedBytes {
     /// [OrderedBytes::consume()] will return [BluefinError::BufferEmptyError] if no bytes can be
     /// consumed.
     #[inline]
-    pub(crate) fn consume(&mut self, len: usize) -> BluefinResult<ConsumeResult> {
-        let mut bytes: Vec<u8> = vec![];
+    pub(crate) fn consume(&mut self, len: usize, buf: &mut [u8]) -> BluefinResult<ConsumeResult> {
         let mut num_bytes = 0;
+        let mut writer_ix = 0;
 
         // peek into carry over bytes
-        if let Some(c_bytes) = self.carry_over_bytes.as_mut() {
+        if let Some(ref mut c_bytes) = self.carry_over_bytes {
             // We can take all of the carry over
             if c_bytes.len() <= len {
                 num_bytes += c_bytes.len();
-                bytes.append(c_bytes);
+                buf[writer_ix..writer_ix + c_bytes.len()].copy_from_slice(c_bytes);
+                writer_ix += c_bytes.len();
                 self.carry_over_bytes = None;
             // We still have some bytes left over in the carry over...
             } else {
-                bytes.append(&mut c_bytes[..len].to_vec());
-                self.carry_over_bytes = Some(c_bytes[len..].to_vec());
-                return Ok(ConsumeResult::new(bytes, 0, 0));
+                let drained = c_bytes.drain(len..).collect();
+                buf[writer_ix..writer_ix + len].copy_from_slice(&c_bytes);
+                self.carry_over_bytes = Some(drained);
+                return Ok(ConsumeResult::new(0, 0, len as u64));
             }
         }
 
@@ -214,12 +228,15 @@ impl OrderedBytes {
             // We cannot return all of the payload. We will partially consume the payload and
             // store the remaining in the carry over
             if payload_len > bytes_remaining {
-                bytes.append(&mut packet.payload[..bytes_remaining].to_vec());
+                buf[writer_ix..writer_ix + bytes_remaining]
+                    .copy_from_slice(&packet.payload[..bytes_remaining]);
+                writer_ix += bytes_remaining;
                 self.carry_over_bytes = Some(packet.payload[bytes_remaining..].to_vec());
-                num_bytes = len;
+                num_bytes += bytes_remaining;
             // We have enough space left to consume the entirity of this buffer
             } else {
-                bytes.append(&mut packet.payload);
+                buf[writer_ix..writer_ix + payload_len].copy_from_slice(&packet.payload);
+                writer_ix += payload_len;
                 num_bytes += payload_len;
             }
 
@@ -233,10 +250,10 @@ impl OrderedBytes {
         }
 
         // Nothing to consume, including any potential carry-over bytes
-        if bytes.len() == 0 {
+        if num_bytes == 0 {
             return Err(BluefinError::BufferEmptyError);
         }
 
-        Ok(ConsumeResult::new(bytes, ix, base_packet_number))
+        Ok(ConsumeResult::new(ix, base_packet_number, num_bytes as u64))
     }
 }

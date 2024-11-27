@@ -3,7 +3,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use connection::ConnectionManager;
+use ack_handler::{AckBuffer, AckConsumer};
+use connection::{ConnectionBuffer, ConnectionManager};
 use tokio::{net::UdpSocket, spawn, sync::RwLock};
 
 use crate::{
@@ -18,15 +19,28 @@ use crate::{
     },
 };
 
+pub mod ack_handler;
 pub mod client;
 pub mod connection;
 pub mod ordered_bytes;
 pub mod server;
 
+pub(crate) const BLUEFIN_HEADER_SIZE_BYTES: usize = 20;
+pub(crate) const MAX_BLUEFIN_PAYLOAD_SIZE_BYTES: usize = 1500;
+pub(crate) const MAX_BLUEFIN_PACKETS_IN_UDP_DATAGRAM: usize = 10;
+pub(crate) const MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM: usize = MAX_BLUEFIN_PACKETS_IN_UDP_DATAGRAM
+    * (BLUEFIN_HEADER_SIZE_BYTES + MAX_BLUEFIN_PAYLOAD_SIZE_BYTES);
+
+#[derive(Clone)]
+pub(crate) struct ConnectionManagedBuffers {
+    pub(crate) conn_buff: Arc<Mutex<ConnectionBuffer>>,
+    pub(crate) ack_buff: Arc<Mutex<AckBuffer>>,
+}
+
 /// Helper to build `num_tx_workers` number of tx workers to run.
 #[inline]
 fn build_and_start_tx(
-    num_tx_workers: u8,
+    num_tx_workers: u16,
     socket: Arc<UdpSocket>,
     conn_manager: Arc<RwLock<ConnectionManager>>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
@@ -44,16 +58,39 @@ fn build_and_start_tx(
 }
 
 fn build_and_start_writer_rx_channel(
-    queue: Arc<Mutex<WriterQueue>>,
+    data_queue: Arc<Mutex<WriterQueue>>,
+    ack_queue: Arc<Mutex<WriterQueue>>,
     socket: Arc<UdpSocket>,
-    num_rx_workers: u8,
+    num_ack_consumer_workers: u8,
     dst_addr: SocketAddr,
+    ack_buffer: Arc<Mutex<AckBuffer>>,
+    next_packet_num: u64,
+    src_conn_id: u32,
+    dst_conn_id: u32,
 ) {
-    let rx = WriterRxChannel::new(queue, socket, dst_addr);
-    for _ in 0..num_rx_workers {
-        let rx_clone = rx.clone();
+    let largest_recv_acked_packet_num = Arc::new(RwLock::new(0));
+    let mut rx = WriterRxChannel::new(
+        data_queue,
+        ack_queue,
+        socket,
+        dst_addr,
+        next_packet_num,
+        src_conn_id,
+        dst_conn_id,
+    );
+    let mut cloned = rx.clone();
+    spawn(async move {
+        cloned.run_data().await;
+    });
+    spawn(async move {
+        rx.run_ack().await;
+    });
+    let ack_consumer = AckConsumer::new(Arc::clone(&ack_buffer), largest_recv_acked_packet_num);
+
+    for _ in 0..num_ack_consumer_workers {
+        let ack_consumer_clone = ack_consumer.clone();
         spawn(async move {
-            let _ = rx_clone.run().await;
+            ack_consumer_clone.run().await;
         });
     }
 }
@@ -123,29 +160,4 @@ pub(crate) fn build_empty_encrypted_packet(
         BluefinHeader::new(src_conn_id, dst_conn_id, packet_type, 0x0, security_fields);
     header.with_packet_number(packet_number);
     BluefinPacket::builder().header(header).build()
-}
-
-#[inline]
-// Type-specific payload contains the # of packets we acked.
-// The actual payload contains the base packet number.
-pub(crate) fn build_ack_packet(
-    src_conn_id: u32,
-    dst_conn_id: u32,
-    base_packet_number_ack: u64,
-    number_packets_to_ack: u16,
-    packet_number: u64,
-) -> BluefinPacket {
-    let security_fields = BluefinSecurityFields::new(false, 0x0);
-    let mut header = BluefinHeader::new(
-        src_conn_id,
-        dst_conn_id,
-        PacketType::Ack,
-        number_packets_to_ack,
-        security_fields,
-    );
-    header.with_packet_number(packet_number);
-    BluefinPacket::builder()
-        .header(header)
-        .payload(base_packet_number_ack.to_ne_bytes().to_vec())
-        .build()
 }

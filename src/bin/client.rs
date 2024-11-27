@@ -1,3 +1,4 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 use std::{
     net::{Ipv4Addr, SocketAddrV4},
     time::Duration,
@@ -8,9 +9,11 @@ use bluefin::{
 };
 use tokio::{spawn, time::sleep};
 
+#[cfg_attr(coverage_nightly, coverage(off))]
 #[tokio::main]
 async fn main() -> BluefinResult<()> {
-    let ports = [1320, 1322];
+    // console_subscriber::init();
+    let ports = [1320, 1322, 1323, 1324, 1325];
     let mut tasks = vec![];
     for ix in 0..2 {
         // sleep(Duration::from_secs(3)).await;
@@ -40,21 +43,23 @@ async fn main() -> BluefinResult<()> {
             total_bytes += size;
             println!("Sent {} bytes", size);
 
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(1)).await;
 
             size = conn.send(&[14, 14, 14, 14, 14, 14]).await?;
             total_bytes += size;
             println!("Sent {} bytes", size);
 
-            for ix in 0..200000 {
-                let my_array: [u8; 32] = rand::random();
+            for ix in 0..5000000 {
+                // let my_array: [u8; 32] = rand::random();
+                let my_array = [0u8; 1500];
                 size = conn.send(&my_array).await?;
                 total_bytes += size;
-                if ix % 1250 == 0 {
-                    sleep(Duration::from_millis(10)).await;
+                if ix % 3000 == 0 {
+                    sleep(Duration::from_millis(3)).await;
                 }
             }
             println!("Sent {} bytes", total_bytes);
+            sleep(Duration::from_secs(2)).await;
 
             Ok::<(), BluefinError>(())
         });

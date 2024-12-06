@@ -232,11 +232,9 @@ impl ReaderTxChannel {
         if !is_client_ack && !is_hello && packet.header.type_field == PacketType::Ack {
             let mut ack_buff = buffers.ack_buff.lock().unwrap();
             Self::buffer_to_ack_buffer(&mut ack_buff, packet)?;
-            drop(ack_buff);
         } else {
             let mut conn_buff = buffers.conn_buff.lock().unwrap();
             Self::buffer_to_conn_buffer(&mut conn_buff, packet, addr, is_hello, is_client_ack)?;
-            drop(conn_buff);
         }
         Ok(())
     }

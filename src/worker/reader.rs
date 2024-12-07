@@ -95,7 +95,7 @@ impl ReaderRxChannel {
         let base_packet_num = consume_res.get_base_packet_number();
 
         // We need to send an ack.
-        if num_packets_consumed > 0 {
+        if num_packets_consumed > 0 && base_packet_num != 0 {
             if let Err(e) = self
                 .writer_tx_channel
                 .send_ack(base_packet_num, num_packets_consumed)

@@ -187,15 +187,6 @@ impl OrderedBytes {
         let mut num_bytes = 0;
         let mut writer_ix = 0;
 
-        let base = self.smallest_packet_number_index;
-        let mut base_packet_number = {
-            if let Some(ref _p) = self.packets[base] {
-                _p.header.packet_number
-            } else {
-                0
-            }
-        };
-
         // peek into carry over bytes
         if let Some(ref mut c_bytes) = self.carry_over_bytes {
             // We can take all of the carry over
@@ -209,9 +200,18 @@ impl OrderedBytes {
                 let drained = c_bytes.drain(len..).collect();
                 buf[writer_ix..writer_ix + len].copy_from_slice(&c_bytes);
                 self.carry_over_bytes = Some(drained);
-                return Ok(ConsumeResult::new(0, base_packet_number, len as u64));
+                return Ok(ConsumeResult::new(0, 0, len as u64));
             }
         }
+
+        let base = self.smallest_packet_number_index;
+        let base_packet_number = {
+            if let Some(ref _p) = self.packets[base] {
+                _p.header.packet_number
+            } else {
+                0
+            }
+        };
 
         let mut ix = 0;
         while ix < MAX_BUFFER_SIZE
@@ -246,7 +246,6 @@ impl OrderedBytes {
             self.smallest_packet_number_index =
                 (self.smallest_packet_number_index + 1) % MAX_BUFFER_SIZE;
 
-            base_packet_number += 1;
             ix += 1;
         }
 
@@ -305,7 +304,7 @@ mod tests {
         // Consumed 100 bytes. This means 1500 - 100 = 1400 bytes are buffered in the left-over
         // bytes buffer
         let consume = consume_res.unwrap();
-        assert_eq!(consume.base_packet_number, start_packet_num + 1);
+        assert_eq!(consume.base_packet_number, start_packet_num);
         assert_eq!(consume.num_packets_consumed, 1);
         assert_eq!(consume.bytes_consumed, 100);
         assert_eq!(payload[..100], buf[..100]);
@@ -329,7 +328,8 @@ mod tests {
 
         // We now have 1400 - 100 = 1300 bytes left in the carry over.
         let consume = consume_res.unwrap();
-        assert_eq!(consume.base_packet_number, start_packet_num + 1);
+        // Base packet number should be zero since it's all coming from the carry over
+        assert_eq!(consume.base_packet_number, 0);
         assert_eq!(consume.num_packets_consumed, 0);
         assert_eq!(consume.bytes_consumed, 100);
         assert_eq!(payload[100..200], buf[..100]);
@@ -342,7 +342,7 @@ mod tests {
         // 1300 of these bytes come from the carry over. The remaining 100 bytes are from the second
         // packet we inserted
         let consume = consume_res.unwrap();
-        assert_eq!(consume.base_packet_number, start_packet_num + 2);
+        assert_eq!(consume.base_packet_number, start_packet_num + 1);
         assert_eq!(consume.num_packets_consumed, 1);
         assert_eq!(consume.bytes_consumed, 1400);
         assert_eq!(payload[200..], buf[..1300]);
@@ -399,7 +399,7 @@ mod tests {
         assert!(consume_res.is_ok());
 
         let consume = consume_res.unwrap();
-        assert_eq!(consume.base_packet_number, start_packet_num + 1);
+        assert_eq!(consume.base_packet_number, start_packet_num);
         assert_eq!(consume.num_packets_consumed, 1);
         assert_eq!(consume.bytes_consumed, 1);
         assert_eq!(buf, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);

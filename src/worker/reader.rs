@@ -95,7 +95,7 @@ impl ReaderRxChannel {
         let base_packet_num = consume_res.get_base_packet_number();
 
         // We need to send an ack.
-        if num_packets_consumed > 0 {
+        if num_packets_consumed > 0 && base_packet_num != 0 {
             if let Err(e) = self
                 .writer_tx_channel
                 .send_ack(base_packet_num, num_packets_consumed)
@@ -232,11 +232,9 @@ impl ReaderTxChannel {
         if !is_client_ack && !is_hello && packet.header.type_field == PacketType::Ack {
             let mut ack_buff = buffers.ack_buff.lock().unwrap();
             Self::buffer_to_ack_buffer(&mut ack_buff, packet)?;
-            drop(ack_buff);
         } else {
             let mut conn_buff = buffers.conn_buff.lock().unwrap();
             Self::buffer_to_conn_buffer(&mut conn_buff, packet, addr, is_hello, is_client_ack)?;
-            drop(conn_buff);
         }
         Ok(())
     }

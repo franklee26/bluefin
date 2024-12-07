@@ -41,6 +41,17 @@ impl BluefinClient {
         }
     }
 
+    #[inline]
+    pub fn set_num_reader_workers(&mut self, num_reader_workers: u16) -> BluefinResult<()> {
+        if num_reader_workers == 0 {
+            return Err(BluefinError::Unexpected(
+                "Cannot have zero reader values".to_string(),
+            ));
+        }
+        self.num_reader_workers = num_reader_workers;
+        Ok(())
+    }
+
     pub async fn connect(&mut self, dst_addr: SocketAddr) -> BluefinResult<BluefinConnection> {
         let socket = Arc::new(UdpSocket::bind(self.src_addr).await?);
         self.socket = Some(Arc::clone(&socket));

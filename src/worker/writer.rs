@@ -248,7 +248,7 @@ impl WriterTxChannel {
         }
 
         self.num_runs_without_sleep += 1;
-        if self.num_runs_without_sleep >= 137 {
+        if self.num_runs_without_sleep >= 100 {
             sleep(Duration::from_nanos(10)).await;
             self.num_runs_without_sleep = 0;
         }

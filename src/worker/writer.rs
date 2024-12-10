@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, task::yield_now, time::sleep};
+use tokio::{net::UdpSocket, time::sleep};
 
 use crate::{
     core::{

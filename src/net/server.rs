@@ -1,5 +1,4 @@
 use std::{
-    mem,
     net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -11,7 +10,7 @@ use tokio::{net::UdpSocket, sync::RwLock};
 use crate::{
     core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
     net::{build_empty_encrypted_packet, connection::HandshakeConnectionBuffer},
-    utils::{common::BluefinResult, get_connected_udp_socket, get_udp_socket},
+    utils::{common::BluefinResult, get_udp_socket},
 };
 
 use super::{
@@ -19,7 +18,6 @@ use super::{
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
     AckBuffer, ConnectionManagedBuffers,
 };
-use std::os::fd::AsRawFd;
 const NUM_TX_WORKERS_FOR_SERVER_DEFAULT: u16 = 10;
 
 #[derive(Clone)]

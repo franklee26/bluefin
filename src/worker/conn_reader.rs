@@ -1,20 +1,11 @@
 use tokio::net::UdpSocket;
-use tokio::task::yield_now;
-use tokio::time::{sleep, Sleep};
 
 use crate::core::error::BluefinError;
 use crate::core::header::PacketType;
 use crate::core::packet::BluefinPacket;
 use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use crate::utils::common::BluefinResult;
-use crate::utils::get_connected_udp_socket;
-use std::mem;
-use std::os::fd::AsRawFd;
-use std::time::Duration;
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 pub(crate) struct ConnReaderTxChannel {
     id: u16,
@@ -39,7 +30,7 @@ impl ConnReaderTxChannel {
         let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
         loop {
             if let Err(e) = self.run_impl(&mut buf).await {
-                eprintln!("Encountered err in conn_reader: {:?}", e);
+                eprintln!("{} Encountered err in conn_reader: {:?}", self.id, e);
             }
         }
     }
@@ -48,7 +39,6 @@ impl ConnReaderTxChannel {
     async fn run_impl(&self, buf: &mut [u8]) -> BluefinResult<()> {
         let size = self.socket.recv(buf).await?;
         let packets = BluefinPacket::from_bytes(&buf[..size])?;
-        // eprintln!("Active {}, {} packet(s)", self.id, packets.len());
 
         if packets.len() == 0 {
             return Err(BluefinError::Unexpected(

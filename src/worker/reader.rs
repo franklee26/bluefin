@@ -195,8 +195,6 @@ impl ReaderTxChannel {
         let packet_src_conn_id = packet.header.source_connection_id;
         if !is_hello && !is_client_ack {
             // If not hello, we buffer in the bytes
-            // Could not buffer in packet... buffer is likely full. We will have to discard the
-            // packet.
             conn_buff.buffer_in_bytes(packet)?;
         } else {
             conn_buff.buffer_in_packet(packet)?;

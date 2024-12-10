@@ -24,7 +24,7 @@ async fn run() -> BluefinResult<()> {
         Ipv4Addr::new(127, 0, 0, 1),
         1318,
     )));
-    server.set_num_reader_workers(300)?;
+    server.set_num_reader_workers(5)?;
     server.bind().await?;
     let mut join_set = JoinSet::new();
 
@@ -61,19 +61,31 @@ async fn run() -> BluefinResult<()> {
                         );
                         */
                         num_iterations_without_print += 1;
-                        if total_bytes >= 100000 && num_iterations_without_print == 200 {
+                        if total_bytes >= 100000 && num_iterations_without_print == 500 {
                             let elapsed = now.elapsed().as_secs();
                             let through_put = u64::try_from(total_bytes).unwrap() / elapsed;
+                            let through_put_mb = through_put as f64 / 1e6;
                             let avg_recv_bytes: f64 = total_bytes as f64 / iteration as f64;
+                            if through_put_mb < 1000.0 {
                             eprintln!(
                                     "{} {:.1} kb/s or {:.1} mb/s (read {:.1} kb/iteration, min: {:.1} kb, max: {:.1} kb)",
                                     _num,
                                     through_put as f64 / 1e3,
-                                    through_put as f64 / 1e6,
+                                    through_put_mb,
                                     avg_recv_bytes / 1e3,
                                     min_bytes as f64 / 1e3,
                                     max_bytes as f64 / 1e3
                                 );
+                            } else {
+                            eprintln!(
+                                    "{} {:.1} gb/s (read {:.1} kb/iteration, min: {:.1} kb, max: {:.1} kb)",
+                                    _num,
+                                    through_put_mb / 1e3,
+                                    avg_recv_bytes / 1e3,
+                                    min_bytes as f64 / 1e3,
+                                    max_bytes as f64 / 1e3
+                                );
+                            }
                                 num_iterations_without_print = 0;
                             // break;
                         }

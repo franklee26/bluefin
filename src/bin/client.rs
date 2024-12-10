@@ -54,8 +54,8 @@ async fn main() -> BluefinResult<()> {
                 let my_array = [0u8; 1500];
                 size = conn.send(&my_array).await?;
                 total_bytes += size;
-                if ix % 3000 == 0 {
-                    sleep(Duration::from_millis(3)).await;
+                if ix % 5000 == 0 {
+                    sleep(Duration::from_micros(500)).await;
                 }
             }
             println!("Sent {} bytes", total_bytes);

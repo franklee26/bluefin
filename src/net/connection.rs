@@ -16,7 +16,7 @@ use crate::{
 };
 
 use super::{
-    build_and_start_writer_rx_channel,
+    build_and_start_conn_reader_tx_channels, build_and_start_writer_rx_channel,
     ordered_bytes::{ConsumeResult, OrderedBytes},
     AckBuffer, ConnectionManagedBuffers, WriterQueue,
 };
@@ -266,6 +266,7 @@ impl BluefinConnection {
         ack_buffer: Arc<Mutex<AckBuffer>>,
         socket: Arc<UdpSocket>,
         dst_addr: SocketAddr,
+        src_addr: SocketAddr,
     ) -> Self {
         let writer_queue = Arc::new(Mutex::new(WriterQueue::new()));
         let ack_queue = Arc::new(Mutex::new(WriterQueue::new()));
@@ -282,6 +283,13 @@ impl BluefinConnection {
             src_conn_id,
             dst_conn_id,
         );
+
+        let conn_bufs = Arc::new(ConnectionManagedBuffers {
+            conn_buff: Arc::clone(&conn_buffer),
+            ack_buff: Arc::clone(&ack_buffer),
+        });
+
+        let _ = build_and_start_conn_reader_tx_channels(src_addr, dst_addr, conn_bufs);
 
         let reader_rx = ReaderRxChannel::new(Arc::clone(&conn_buffer), writer_tx.clone());
 

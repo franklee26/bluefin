@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, time::sleep};
+use tokio::{net::UdpSocket, task::yield_now, time::sleep};
 
 use crate::{
     core::{
@@ -248,7 +248,7 @@ impl WriterTxChannel {
         }
 
         self.num_runs_without_sleep += 1;
-        if self.num_runs_without_sleep >= 100 {
+        if self.num_runs_without_sleep >= 1100 {
             sleep(Duration::from_nanos(10)).await;
             self.num_runs_without_sleep = 0;
         }

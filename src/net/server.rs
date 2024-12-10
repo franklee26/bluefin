@@ -11,7 +11,7 @@ use tokio::{net::UdpSocket, sync::RwLock};
 use crate::{
     core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
     net::{build_empty_encrypted_packet, connection::HandshakeConnectionBuffer},
-    utils::common::BluefinResult,
+    utils::{common::BluefinResult, get_connected_udp_socket, get_udp_socket},
 };
 
 use super::{
@@ -54,37 +54,8 @@ impl BluefinServer {
     }
 
     pub async fn bind(&mut self) -> BluefinResult<()> {
-        let socket = UdpSocket::bind(self.src_addr).await?;
-        let socket_fd = socket.as_raw_fd();
+        let socket = get_udp_socket(self.src_addr)?;
         self.socket = Some(Arc::new(socket));
-
-        #[cfg(target_os = "macos")]
-        {
-            use sysctl::Sysctl;
-            if let Ok(ctl) = sysctl::Ctl::new("net.inet.udp.maxdgram") {
-                match ctl.set_value_string("16000") {
-                    Ok(s) => {
-                        println!("Successfully set net.inet.udp.maxdgram to {}", s)
-                    }
-                    Err(e) => eprintln!("Failed to set net.inet.udp.maxdgram due to err: {:?}", e),
-                }
-            }
-        }
-
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            let optval: libc::c_int = 1;
-            let ret = libc::setsockopt(
-                socket_fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                mem::size_of_val(&optval) as libc::socklen_t,
-            );
-            if ret != 0 {
-                return Err(BluefinError::InvalidSocketError);
-            }
-        }
 
         build_and_start_tx(
             self.num_reader_workers,
@@ -167,6 +138,7 @@ impl BluefinServer {
             Arc::clone(&ack_buffer),
             Arc::clone(self.socket.as_ref().unwrap()),
             addr,
+            self.src_addr,
         ))
     }
 }

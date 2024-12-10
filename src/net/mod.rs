@@ -15,7 +15,7 @@ use crate::{
     },
     utils::{common::BluefinResult, get_connected_udp_socket},
     worker::{
-        conn_reader::ConnReaderTxChannel,
+        conn_reader::ConnReaderHandler,
         reader::ReaderTxChannel,
         writer::{WriterQueue, WriterRxChannel},
     },
@@ -66,19 +66,8 @@ fn build_and_start_conn_reader_tx_channels(
     conn_bufs: Arc<ConnectionManagedBuffers>,
 ) -> BluefinResult<()> {
     let conn_socket = Arc::new(get_connected_udp_socket(src_addr, dst_addr)?);
-    for id in 0..5 {
-        let tx = ConnReaderTxChannel::new(id, Arc::clone(&conn_socket), Arc::clone(&conn_bufs));
-        spawn(async move {
-            if let Err(e) = tx.run().await {
-                eprintln!(
-                    "{}: Encountered err while running conn reader tx channel: {:?}",
-                    id, e
-                );
-                return;
-            }
-        });
-    }
-    Ok(())
+    let handler = ConnReaderHandler::new(conn_socket, conn_bufs);
+    handler.start()
 }
 
 #[inline]

@@ -5,10 +5,9 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::{Poll, Waker},
-    time::Duration,
 };
 
-use tokio::{net::UdpSocket, time::sleep};
+use tokio::net::UdpSocket;
 
 use crate::{
     core::{
@@ -217,7 +216,6 @@ impl WriterQueue {
 pub(crate) struct WriterTxChannel {
     data_queue: Arc<Mutex<WriterQueue>>,
     ack_queue: Arc<Mutex<WriterQueue>>,
-    num_runs_without_sleep: u32,
 }
 
 impl WriterTxChannel {
@@ -228,7 +226,6 @@ impl WriterTxChannel {
         Self {
             data_queue,
             ack_queue,
-            num_runs_without_sleep: 0,
         }
     }
 
@@ -245,12 +242,6 @@ impl WriterTxChannel {
             if let Some(ref waker) = guard.waker {
                 waker.wake_by_ref();
             }
-        }
-
-        self.num_runs_without_sleep += 1;
-        if self.num_runs_without_sleep >= 1100 {
-            sleep(Duration::from_nanos(10)).await;
-            self.num_runs_without_sleep = 0;
         }
 
         Ok(bytes)

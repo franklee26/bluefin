@@ -1,4 +1,6 @@
 use tokio::net::UdpSocket;
+use tokio::spawn;
+use tokio::sync::mpsc::{self};
 
 use crate::core::error::BluefinError;
 use crate::core::header::PacketType;
@@ -7,66 +9,77 @@ use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use crate::utils::common::BluefinResult;
 use std::sync::Arc;
 
-pub(crate) struct ConnReaderTxChannel {
-    id: u16,
+pub(crate) struct ConnReaderHandler {
     socket: Arc<UdpSocket>,
     conn_bufs: Arc<ConnectionManagedBuffers>,
 }
 
-impl ConnReaderTxChannel {
-    pub(crate) fn new(
-        id: u16,
+impl ConnReaderHandler {
+    pub(crate) fn new(socket: Arc<UdpSocket>, conn_bufs: Arc<ConnectionManagedBuffers>) -> Self {
+        Self { socket, conn_bufs }
+    }
+
+    pub(crate) fn start(&self) -> BluefinResult<()> {
+        let (tx, rx) = mpsc::channel::<Vec<BluefinPacket>>(1024);
+        // let (tx, rx) = flume::bounded(1024);
+        for _ in 0..4 {
+            let tx_cloned = tx.clone();
+            let socket_cloned = self.socket.clone();
+            spawn(async move {
+                let _ = ConnReaderHandler::tx_impl(socket_cloned, tx_cloned).await;
+            });
+        }
+
+        let conn_bufs = self.conn_bufs.clone();
+        spawn(async move {
+            let _ = ConnReaderHandler::rx_impl(rx, &*conn_bufs).await;
+        });
+        Ok(())
+    }
+
+    #[inline]
+    async fn tx_impl(
         socket: Arc<UdpSocket>,
-        conn_bufs: Arc<ConnectionManagedBuffers>,
-    ) -> Self {
-        Self {
-            id,
-            socket,
-            conn_bufs,
+        tx: mpsc::Sender<Vec<BluefinPacket>>,
+    ) -> BluefinResult<()> {
+        let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
+        loop {
+            let size = socket.recv(&mut buf).await?;
+            let packets = BluefinPacket::from_bytes(&buf[..size])?;
+
+            if packets.len() == 0 {
+                continue;
+            }
+
+            let _ = tx.send(packets).await;
         }
     }
 
-    pub(crate) async fn run(&self) -> BluefinResult<()> {
-        let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
+    #[inline]
+    async fn rx_impl(
+        mut rx: mpsc::Receiver<Vec<BluefinPacket>>,
+        conn_bufs: &ConnectionManagedBuffers,
+    ) {
         loop {
-            if let Err(e) = self.run_impl(&mut buf).await {
-                eprintln!("{} Encountered err in conn_reader: {:?}", self.id, e);
+            if let Some(packets) = rx.recv().await {
+                for p in packets {
+                    let _ = ConnReaderHandler::buffer_in_packet(conn_bufs, p.clone());
+                }
             }
         }
     }
 
     #[inline]
-    async fn run_impl(&self, buf: &mut [u8]) -> BluefinResult<()> {
-        let size = self.socket.recv(buf).await?;
-        let packets = BluefinPacket::from_bytes(&buf[..size])?;
-
-        if packets.len() == 0 {
-            return Err(BluefinError::Unexpected(
-                "UDP payload contains zero bluefin packets".to_string(),
-            ));
-        }
-
-        let mut err = None;
-        for p in packets {
-            if let Err(e) = self.buffer_in_packet(p).await {
-                err = Some(e);
-            }
-        }
-
-        if err.is_some() {
-            return Err(err.unwrap());
-        }
-
-        Ok(())
-    }
-
-    async fn buffer_in_packet(&self, packet: BluefinPacket) -> BluefinResult<()> {
+    fn buffer_in_packet(
+        conn_bufs: &ConnectionManagedBuffers,
+        packet: BluefinPacket,
+    ) -> BluefinResult<()> {
         if packet.header.type_field == PacketType::Ack {
-            let mut guard = self.conn_bufs.ack_buff.lock().unwrap();
+            let mut guard = conn_bufs.ack_buff.lock().unwrap();
             guard.buffer_in_ack_packet(packet)?;
             guard.wake()?;
         } else {
-            let mut guard = self.conn_bufs.conn_buff.lock().unwrap();
+            let mut guard = conn_bufs.conn_buff.lock().unwrap();
             guard.buffer_in_bytes(packet)?;
             if let Some(w) = guard.get_waker() {
                 w.wake_by_ref();

@@ -24,7 +24,7 @@ async fn run() -> BluefinResult<()> {
         Ipv4Addr::new(127, 0, 0, 1),
         1318,
     )));
-    server.set_num_reader_workers(5)?;
+    server.set_num_reader_workers(3)?;
     server.bind().await?;
     let mut join_set = JoinSet::new();
 
@@ -38,14 +38,16 @@ async fn run() -> BluefinResult<()> {
             match _conn {
                 Ok(mut conn) => {
                     let mut total_bytes = 0;
-                    let mut recv_bytes = [0u8; 80000];
+                    let mut recv_bytes = [0u8; 10000];
                     let mut min_bytes = usize::MAX;
                     let mut max_bytes = 0;
                     let mut iteration = 1;
                     let mut num_iterations_without_print = 0;
+                    let mut max_throughput = 0.0;
+                    let mut min_throughput = f64::MAX;
                     let now = Instant::now();
                     loop {
-                        let size = conn.recv(&mut recv_bytes, 80000).await.unwrap();
+                        let size = conn.recv(&mut recv_bytes, 10000).await.unwrap();
                         total_bytes += size;
                         min_bytes = min(size, min_bytes);
                         max_bytes = max(size, max_bytes);
@@ -61,11 +63,20 @@ async fn run() -> BluefinResult<()> {
                         );
                         */
                         num_iterations_without_print += 1;
-                        if total_bytes >= 100000 && num_iterations_without_print == 500 {
+                        if total_bytes >= 100000 && num_iterations_without_print == 800 {
                             let elapsed = now.elapsed().as_secs();
                             let through_put = u64::try_from(total_bytes).unwrap() / elapsed;
                             let through_put_mb = through_put as f64 / 1e6;
                             let avg_recv_bytes: f64 = total_bytes as f64 / iteration as f64;
+
+                            if through_put_mb > max_throughput {
+                                max_throughput = through_put_mb;
+                            }
+
+                            if through_put_mb < min_throughput {
+                                min_throughput = through_put_mb;
+                            }
+                            
                             if through_put_mb < 1000.0 {
                             eprintln!(
                                     "{} {:.1} kb/s or {:.1} mb/s (read {:.1} kb/iteration, min: {:.1} kb, max: {:.1} kb)",
@@ -78,12 +89,14 @@ async fn run() -> BluefinResult<()> {
                                 );
                             } else {
                             eprintln!(
-                                    "{} {:.1} gb/s (read {:.1} kb/iteration, min: {:.1} kb, max: {:.1} kb)",
+                                    "{} {:.2} gb/s (read {:.1} kb/iter, min: {:.1} kb, max: {:.1} kb) (max {:.2} gb/s, min {:.1} kb/s)",
                                     _num,
                                     through_put_mb / 1e3,
                                     avg_recv_bytes / 1e3,
                                     min_bytes as f64 / 1e3,
-                                    max_bytes as f64 / 1e3
+                                    max_bytes as f64 / 1e3,
+                                    max_throughput / 1e3,
+                                    min_throughput
                                 );
                             }
                                 num_iterations_without_print = 0;

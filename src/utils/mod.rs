@@ -35,7 +35,6 @@ fn get_udp_socket_impl(src_addr: SocketAddr) -> BluefinResult<socket2::Socket> {
     let udp_sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     udp_sock.set_reuse_address(true)?;
     udp_sock.set_reuse_port(true)?;
-    // from tokio-rs/mio/blob/master/src/sys/unix/net.rs
     udp_sock.set_cloexec(true)?;
     udp_sock.set_nonblocking(true).unwrap();
     udp_sock.bind(&socket2::SockAddr::from(src_addr))?;

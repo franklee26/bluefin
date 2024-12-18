@@ -21,7 +21,6 @@ impl ConnReaderHandler {
 
     pub(crate) fn start(&self) -> BluefinResult<()> {
         let (tx, rx) = mpsc::channel::<Vec<BluefinPacket>>(1024);
-        // let (tx, rx) = flume::bounded(1024);
         for _ in 0..4 {
             let tx_cloned = tx.clone();
             let socket_cloned = self.socket.clone();
@@ -63,7 +62,7 @@ impl ConnReaderHandler {
         loop {
             if let Some(packets) = rx.recv().await {
                 for p in packets {
-                    let _ = ConnReaderHandler::buffer_in_packet(conn_bufs, p.clone());
+                    let _ = ConnReaderHandler::buffer_in_packet(conn_bufs, p);
                 }
             }
         }

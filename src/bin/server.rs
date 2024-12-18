@@ -41,7 +41,7 @@ async fn run() -> BluefinResult<()> {
                     let mut recv_bytes = [0u8; 10000];
                     let mut min_bytes = usize::MAX;
                     let mut max_bytes = 0;
-                    let mut iteration = 1;
+                    let mut iteration: i64 = 1;
                     let mut num_iterations_without_print = 0;
                     let mut max_throughput = 0.0;
                     let mut min_throughput = f64::MAX;
@@ -55,10 +55,9 @@ async fn run() -> BluefinResult<()> {
 
                         /*
                         println!(
-                            "({:x}_{:x}) >>> Received: {:?} (total: {})",
+                            "({:x}_{:x}) >>> Received: {} bytes",
                             conn.src_conn_id,
                             conn.dst_conn_id,
-                            &recv_bytes[..size],
                             total_bytes
                         );
                         */
@@ -79,13 +78,15 @@ async fn run() -> BluefinResult<()> {
                             
                             if through_put_mb < 1000.0 {
                             eprintln!(
-                                    "{} {:.1} kb/s or {:.1} mb/s (read {:.1} kb/iteration, min: {:.1} kb, max: {:.1} kb)",
+                                    "{} {:.1} kb/s or {:.1} mb/s (read {:.1} kb/iteration, min: {:.1} kb, max: {:.1} kb) (max {:.1} mb/s, min {:.1} mb/s)",
                                     _num,
                                     through_put as f64 / 1e3,
                                     through_put_mb,
                                     avg_recv_bytes / 1e3,
                                     min_bytes as f64 / 1e3,
-                                    max_bytes as f64 / 1e3
+                                    max_bytes as f64 / 1e3,
+                                    max_throughput,
+                                    min_throughput
                                 );
                             } else {
                             eprintln!(

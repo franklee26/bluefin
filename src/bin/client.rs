@@ -31,31 +31,31 @@ async fn main() -> BluefinResult<()> {
                 .await?;
 
             let bytes = [1, 2, 3, 4, 5, 6, 7];
-            let mut size = conn.send(&bytes).await?;
+            let mut size = conn.send(&bytes)?;
             total_bytes += size;
             println!("Sent {} bytes", size);
 
-            size = conn.send(&[12, 12, 12, 12, 12, 12]).await?;
+            size = conn.send(&[12, 12, 12, 12, 12, 12])?;
             total_bytes += size;
             println!("Sent {} bytes", size);
 
-            size = conn.send(&[13; 100]).await?;
+            size = conn.send(&[13; 100])?;
             total_bytes += size;
             println!("Sent {} bytes", size);
 
             sleep(Duration::from_secs(1)).await;
 
-            size = conn.send(&[14, 14, 14, 14, 14, 14]).await?;
+            size = conn.send(&[14, 14, 14, 14, 14, 14])?;
             total_bytes += size;
             println!("Sent {} bytes", size);
 
             for ix in 0..10000000 {
                 // let my_array: [u8; 32] = rand::random();
                 let my_array = [0u8; 1500];
-                size = conn.send(&my_array).await?;
+                size = conn.send(&my_array)?;
                 total_bytes += size;
-                if ix % 6000 == 0 {
-                    sleep(Duration::from_micros(250)).await;
+                if ix % 5000 == 0 {
+                    sleep(Duration::from_millis(1)).await;
                 }
             }
             println!("Sent {} bytes", total_bytes);

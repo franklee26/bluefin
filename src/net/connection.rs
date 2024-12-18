@@ -12,11 +12,15 @@ use tokio::{net::UdpSocket, time::timeout};
 use crate::{
     core::{context::BluefinHost, error::BluefinError, packet::BluefinPacket},
     utils::common::BluefinResult,
-    worker::{reader::ReaderRxChannel, writer::WriterTxChannel},
+    worker::{
+        reader::ReaderRxChannel,
+        writer::{WriterHandler, WriterTxChannel},
+    },
 };
 
 use super::{
-    build_and_start_conn_reader_tx_channels, build_and_start_writer_rx_channel,
+    build_and_start_ack_consumer_workers, build_and_start_conn_reader_tx_channels,
+    get_connected_udp_socket,
     ordered_bytes::{ConsumeResult, OrderedBytes},
     AckBuffer, ConnectionManagedBuffers, WriterQueue,
 };
@@ -254,7 +258,7 @@ pub struct BluefinConnection {
     pub src_conn_id: u32,
     pub dst_conn_id: u32,
     reader_rx: ReaderRxChannel,
-    writer_tx: WriterTxChannel,
+    writer_handler: WriterHandler,
 }
 
 impl BluefinConnection {
@@ -268,36 +272,37 @@ impl BluefinConnection {
         dst_addr: SocketAddr,
         src_addr: SocketAddr,
     ) -> Self {
-        let writer_queue = Arc::new(Mutex::new(WriterQueue::new()));
-        let ack_queue = Arc::new(Mutex::new(WriterQueue::new()));
-        let writer_tx = WriterTxChannel::new(Arc::clone(&writer_queue), Arc::clone(&ack_queue));
+        build_and_start_ack_consumer_workers(1, Arc::clone(&ack_buffer));
+        let s = get_connected_udp_socket(src_addr, dst_addr);
+        if let Err(e) = s {
+            panic!("Failed to get connected sockets due to error: {:?}", e);
+        }
+        let conn_socket = Arc::new(s.unwrap());
 
-        build_and_start_writer_rx_channel(
-            Arc::clone(&writer_queue),
-            Arc::clone(&ack_queue),
-            Arc::clone(&socket),
-            1,
-            dst_addr,
-            Arc::clone(&ack_buffer),
+        let mut writer_handler = WriterHandler::new(
+            Arc::clone(&conn_socket),
             next_send_packet_num,
             src_conn_id,
             dst_conn_id,
         );
+        if let Err(e) = writer_handler.start() {
+            panic!("Cannot start connection due to error: {:?}", e);
+        }
 
         let conn_bufs = Arc::new(ConnectionManagedBuffers {
             conn_buff: Arc::clone(&conn_buffer),
             ack_buff: Arc::clone(&ack_buffer),
         });
 
-        let _ = build_and_start_conn_reader_tx_channels(src_addr, dst_addr, conn_bufs);
+        let _ = build_and_start_conn_reader_tx_channels(Arc::clone(&conn_socket), conn_bufs);
 
-        let reader_rx = ReaderRxChannel::new(Arc::clone(&conn_buffer), writer_tx.clone());
+        let reader_rx = ReaderRxChannel::new(Arc::clone(&conn_buffer), writer_handler.clone());
 
         Self {
             src_conn_id,
             dst_conn_id,
             reader_rx,
-            writer_tx,
+            writer_handler,
         }
     }
 
@@ -308,10 +313,10 @@ impl BluefinConnection {
     }
 
     #[inline]
-    pub async fn send(&mut self, buf: &[u8]) -> BluefinResult<usize> {
+    pub fn send(&mut self, buf: &[u8]) -> BluefinResult<usize> {
         // TODO! This returns the total bytes sent (including bluefin payload). This
         // really should only return the total payload bytes
-        let _ = self.writer_tx.send(buf).await?;
+        self.writer_handler.send_data(buf)?;
         Ok(buf.len())
     }
 }

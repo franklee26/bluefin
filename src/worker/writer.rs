@@ -5,12 +5,19 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::{Poll, Waker},
+    thread,
 };
 
-use tokio::net::UdpSocket;
+use tokio::{
+    net::UdpSocket,
+    spawn,
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task::spawn_blocking,
+};
 
 use crate::{
     core::{
+        error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
         Serialisable,
@@ -200,6 +207,336 @@ impl WriterQueue {
                     }
                 }
                 _ => unreachable!(),
+            }
+        }
+
+        if bytes.len() == 0 {
+            return None;
+        }
+
+        Some(bytes)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AckData {
+    base_packet_num: u64,
+    num_packets_consumed: usize,
+}
+
+#[derive(Clone)]
+pub(crate) struct WriterHandler {
+    socket: Arc<UdpSocket>,
+    next_packet_num: u64,
+    data_sender: Option<UnboundedSender<Vec<u8>>>,
+    ack_sender: Option<UnboundedSender<AckData>>,
+    src_conn_id: u32,
+    dst_conn_id: u32,
+}
+
+impl WriterHandler {
+    pub(crate) fn new(
+        socket: Arc<UdpSocket>,
+        next_packet_num: u64,
+        src_conn_id: u32,
+        dst_conn_id: u32,
+    ) -> Self {
+        Self {
+            socket,
+            src_conn_id,
+            dst_conn_id,
+            next_packet_num,
+            data_sender: None,
+            ack_sender: None,
+        }
+    }
+
+    pub(crate) fn start(&mut self) -> BluefinResult<()> {
+        let (data_s, data_r) = mpsc::unbounded_channel();
+        let (ack_s, ack_r) = mpsc::unbounded_channel();
+        self.data_sender = Some(data_s);
+        self.ack_sender = Some(ack_s);
+
+        let next_packet_num = self.next_packet_num;
+        let src_conn_id = self.src_conn_id;
+        let dst_conn_id = self.dst_conn_id;
+        let socket = Arc::clone(&self.socket);
+        spawn(async move {
+            Self::read_data(data_r, next_packet_num, src_conn_id, dst_conn_id, socket).await;
+        });
+
+        let socket = Arc::clone(&self.socket);
+        spawn(async move {
+            Self::read_ack(ack_r, socket, src_conn_id, dst_conn_id).await;
+        });
+
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<()> {
+        if self.data_sender.is_none() {
+            return Err(BluefinError::WriteError(
+                "Sender is not available. Cannot send.".to_string(),
+            ));
+        }
+
+        if let Err(e) = self.data_sender.as_ref().unwrap().send(payload.to_vec()) {
+            return Err(BluefinError::WriteError(format!(
+                "Failed to send data due to error: {:?}",
+                e
+            )));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn send_ack(
+        &self,
+        base_packet_num: u64,
+        num_packets_consumed: usize,
+    ) -> BluefinResult<()> {
+        if self.ack_sender.is_none() {
+            return Err(BluefinError::WriteError(
+                "Ack sender is not available. Cannot send.".to_string(),
+            ));
+        }
+
+        let data = AckData {
+            base_packet_num,
+            num_packets_consumed,
+        };
+
+        if let Err(e) = self.ack_sender.as_ref().unwrap().send(data) {
+            return Err(BluefinError::WriteError(format!(
+                "Failed to send ack due to error: {:?}",
+                e
+            )));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    async fn read_ack(
+        mut rx: UnboundedReceiver<AckData>,
+        socket: Arc<UdpSocket>,
+        src_conn_id: u32,
+        dst_conn_id: u32,
+    ) {
+        let mut ack_queue = VecDeque::new();
+        let mut b = vec![];
+        let limit = 10;
+        loop {
+            let size = rx.recv_many(&mut b, limit).await;
+            for i in 0..size {
+                ack_queue.push_back(b[i]);
+            }
+
+            if let Err(e) = socket.writable().await {
+                eprintln!("Cannot write to socket due to err: {:?}", e);
+                continue;
+            }
+
+            if let Some(data) = Self::consume_acks(&mut ack_queue, src_conn_id, dst_conn_id) {
+                if let Err(e) = socket.try_send(&data) {
+                    eprintln!(
+                        "Encountered error {} while sending ack packet across wire",
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    async fn read_data(
+        mut rx: UnboundedReceiver<Vec<u8>>,
+        next_packet_num: u64,
+        src_conn_id: u32,
+        dst_conn_id: u32,
+        socket: Arc<UdpSocket>,
+    ) {
+        let mut data_queue = VecDeque::new();
+        let limit = 10;
+        let mut next_packet_num = next_packet_num;
+        let mut b = vec![];
+        loop {
+            b.clear();
+            let size = rx.recv_many(&mut b, limit).await;
+            for i in 0..size {
+                data_queue.push_back(b[i].clone());
+            }
+
+            if let Err(e) = socket.writable().await {
+                eprintln!("Cannot write to socket due to err: {:?}", e);
+                continue;
+            }
+
+            if let Some(data) = Self::consume_data(
+                &mut data_queue,
+                &mut next_packet_num,
+                src_conn_id,
+                dst_conn_id,
+            ) {
+                if let Err(e) = socket.try_send(&data) {
+                    eprintln!(
+                        "Encountered error {} while sending data packet across wire",
+                        e
+                    );
+                    continue;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn consume_data(
+        queue: &mut VecDeque<Vec<u8>>,
+        next_packet_num: &mut u64,
+        src_conn_id: u32,
+        dst_conn_id: u32,
+    ) -> Option<Vec<u8>> {
+        let mut ans = vec![];
+        let mut bytes_remaining = MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM;
+        let mut running_payload = vec![];
+
+        let security_fields = BluefinSecurityFields::new(false, 0x0);
+        let mut header = BluefinHeader::new(
+            src_conn_id,
+            dst_conn_id,
+            PacketType::UnencryptedData,
+            0,
+            security_fields,
+        );
+
+        while !queue.is_empty() && bytes_remaining > 20 {
+            // We already have some bytes left over and it's more than we can afford. Take what
+            // we can and end.
+            if running_payload.len() >= bytes_remaining - 20 {
+                // Keep taking as many bytes out of the running payload as we can afford to
+                while !running_payload.is_empty() && bytes_remaining >= 20 {
+                    let max_bytes_to_take = min(
+                        running_payload.len(),
+                        min(MAX_BLUEFIN_PAYLOAD_SIZE_BYTES, bytes_remaining - 20),
+                    );
+                    header.with_packet_number(*next_packet_num);
+                    header.type_specific_payload = max_bytes_to_take as u16;
+                    let p = BluefinPacket::builder()
+                        .header(header)
+                        .payload(running_payload[..max_bytes_to_take].to_vec())
+                        .build();
+                    ans.extend(p.serialise());
+                    *next_packet_num += 1;
+                    bytes_remaining -= max_bytes_to_take + 20;
+                    running_payload = running_payload[max_bytes_to_take..].to_vec();
+                }
+
+                if !running_payload.is_empty() {
+                    queue.push_front(running_payload.to_vec());
+                }
+                return Some(ans);
+            }
+
+            // We just happen to have a completely full running payload. Let's take as much as we can.
+            if running_payload.len() >= MAX_BLUEFIN_PAYLOAD_SIZE_BYTES {
+                let max_bytes_to_take = min(
+                    running_payload.len(),
+                    min(bytes_remaining - 20, MAX_BLUEFIN_PAYLOAD_SIZE_BYTES),
+                );
+                header.with_packet_number(*next_packet_num);
+                header.type_specific_payload = max_bytes_to_take as u16;
+                let p = BluefinPacket::builder()
+                    .header(header)
+                    .payload(running_payload[..max_bytes_to_take].to_vec())
+                    .build();
+                ans.extend(p.serialise());
+                *next_packet_num += 1;
+                bytes_remaining -= max_bytes_to_take + 20;
+                running_payload = running_payload[max_bytes_to_take..].to_vec();
+                continue;
+            }
+
+            // We have room
+            let data = queue.pop_front().unwrap();
+            let potential_bytes_len = data.len();
+            if potential_bytes_len + running_payload.len() > MAX_BLUEFIN_PAYLOAD_SIZE_BYTES {
+                // We cannot simply fit both payloads into this packet.
+                running_payload.extend(data);
+
+                // Try to take as much as we can
+                let max_bytes_to_take = min(
+                    running_payload.len(),
+                    min(MAX_BLUEFIN_PAYLOAD_SIZE_BYTES, bytes_remaining - 20),
+                );
+                header.with_packet_number(*next_packet_num);
+                header.type_specific_payload = max_bytes_to_take as u16;
+                let packet = BluefinPacket::builder()
+                    .header(header)
+                    .payload(running_payload[..max_bytes_to_take].to_vec())
+                    .build();
+                ans.extend(packet.serialise());
+                *next_packet_num += 1;
+                bytes_remaining -= max_bytes_to_take + 20;
+                running_payload = running_payload[max_bytes_to_take..].to_vec();
+            } else {
+                // We can fit both the payload and the left over bytes
+                running_payload.extend(data);
+            }
+        }
+
+        // Take the remaining amount
+        while !running_payload.is_empty() && bytes_remaining >= 20 {
+            let max_bytes_to_take = min(
+                running_payload.len(),
+                min(MAX_BLUEFIN_PAYLOAD_SIZE_BYTES, bytes_remaining - 20),
+            );
+            header.with_packet_number(*next_packet_num);
+            header.type_specific_payload = max_bytes_to_take as u16;
+            let p = BluefinPacket::builder()
+                .header(header)
+                .payload(running_payload[..max_bytes_to_take].to_vec())
+                .build();
+            ans.extend(p.serialise());
+            *next_packet_num += 1;
+            running_payload = running_payload[max_bytes_to_take..].to_vec();
+            bytes_remaining -= max_bytes_to_take + 20;
+        }
+
+        // Re-queue the remaining bytes
+        if !running_payload.is_empty() {
+            queue.push_front(running_payload);
+        }
+
+        if ans.is_empty() {
+            return None;
+        }
+        Some(ans)
+    }
+
+    fn consume_acks(
+        queue: &mut VecDeque<AckData>,
+        src_conn_id: u32,
+        dst_conn_id: u32,
+    ) -> Option<Vec<u8>> {
+        let mut bytes = vec![];
+        let security_fields = BluefinSecurityFields::new(false, 0x0);
+        let mut header = BluefinHeader::new(
+            src_conn_id,
+            dst_conn_id,
+            PacketType::Ack,
+            0,
+            security_fields,
+        );
+        while !queue.is_empty() && bytes.len() <= MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM {
+            let data = queue.pop_front().unwrap();
+            header.packet_number = data.base_packet_num;
+            header.type_specific_payload = data.num_packets_consumed as u16;
+            if bytes.len() + 20 <= MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM {
+                bytes.extend(header.serialise());
+            } else {
+                queue.push_front(data);
+                break;
             }
         }
 

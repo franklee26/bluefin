@@ -19,7 +19,7 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-use super::writer::WriterTxChannel;
+use super::writer::{WriterHandler, WriterTxChannel};
 
 #[derive(Clone)]
 /// [ReaderTxChannel] is the transmission channel for the receiving [ReaderRxChannel]. This channel will when
@@ -43,7 +43,7 @@ pub(crate) struct ReaderTxChannel {
 /// *receives* bytes *from* the buffer.
 pub(crate) struct ReaderRxChannel {
     future: ReaderRxChannelFuture,
-    writer_tx_channel: WriterTxChannel,
+    writer_handler: WriterHandler,
 }
 
 #[derive(Clone)]
@@ -69,14 +69,11 @@ impl Future for ReaderRxChannelFuture {
 }
 
 impl ReaderRxChannel {
-    pub(crate) fn new(
-        buffer: Arc<Mutex<ConnectionBuffer>>,
-        writer_tx_channel: WriterTxChannel,
-    ) -> Self {
+    pub(crate) fn new(buffer: Arc<Mutex<ConnectionBuffer>>, writer_handler: WriterHandler) -> Self {
         let future = ReaderRxChannelFuture { buffer };
         Self {
             future,
-            writer_tx_channel,
+            writer_handler,
         }
     }
 
@@ -97,9 +94,8 @@ impl ReaderRxChannel {
         // We need to send an ack.
         if num_packets_consumed > 0 && base_packet_num != 0 {
             if let Err(e) = self
-                .writer_tx_channel
+                .writer_handler
                 .send_ack(base_packet_num, num_packets_consumed)
-                .await
             {
                 eprintln!(
                     "Failed to send ack packet after reads due to error: {:?}",

@@ -61,44 +61,19 @@ fn build_and_start_tx(
 
 #[inline]
 fn build_and_start_conn_reader_tx_channels(
-    src_addr: SocketAddr,
-    dst_addr: SocketAddr,
+    socket: Arc<UdpSocket>,
     conn_bufs: Arc<ConnectionManagedBuffers>,
 ) -> BluefinResult<()> {
-    let conn_socket = Arc::new(get_connected_udp_socket(src_addr, dst_addr)?);
-    let handler = ConnReaderHandler::new(conn_socket, conn_bufs);
+    let handler = ConnReaderHandler::new(socket, conn_bufs);
     handler.start()
 }
 
 #[inline]
-fn build_and_start_writer_rx_channel(
-    data_queue: Arc<Mutex<WriterQueue>>,
-    ack_queue: Arc<Mutex<WriterQueue>>,
-    socket: Arc<UdpSocket>,
+fn build_and_start_ack_consumer_workers(
     num_ack_consumer_workers: u8,
-    dst_addr: SocketAddr,
     ack_buffer: Arc<Mutex<AckBuffer>>,
-    next_packet_num: u64,
-    src_conn_id: u32,
-    dst_conn_id: u32,
 ) {
     let largest_recv_acked_packet_num = Arc::new(RwLock::new(0));
-    let mut rx = WriterRxChannel::new(
-        data_queue,
-        ack_queue,
-        socket,
-        dst_addr,
-        next_packet_num,
-        src_conn_id,
-        dst_conn_id,
-    );
-    let mut cloned = rx.clone();
-    spawn(async move {
-        cloned.run_data().await;
-    });
-    spawn(async move {
-        rx.run_ack().await;
-    });
     let ack_consumer = AckConsumer::new(Arc::clone(&ack_buffer), largest_recv_acked_packet_num);
 
     for _ in 0..num_ack_consumer_workers {

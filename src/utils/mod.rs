@@ -20,7 +20,6 @@ pub(crate) fn get_connected_udp_socket(
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
 ) -> BluefinResult<UdpSocket> {
-    eprintln!("Binding to {:?}, conn to {:?}", src_addr, dst_addr);
     let socket = get_udp_socket_impl(src_addr)?;
     socket.connect(&socket2::SockAddr::from(dst_addr))?;
 

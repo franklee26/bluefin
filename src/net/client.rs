@@ -1,5 +1,7 @@
 use std::{
+    mem,
     net::SocketAddr,
+    os::fd::AsRawFd,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -56,6 +58,33 @@ impl BluefinClient {
         let socket = Arc::new(UdpSocket::bind(self.src_addr).await?);
         self.socket = Some(Arc::clone(&socket));
         self.dst_addr = Some(dst_addr);
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            let socket_fd = socket.as_raw_fd();
+            let optval: libc::c_int = 1;
+            let ret = libc::setsockopt(
+                socket_fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &optval as *const _ as *const libc::c_void,
+                mem::size_of_val(&optval) as libc::socklen_t,
+            );
+            if ret != 0 {
+                return Err(BluefinError::InvalidSocketError);
+            }
+
+            let ret = libc::setsockopt(
+                socket_fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &optval as *const _ as *const libc::c_void,
+                mem::size_of_val(&optval) as libc::socklen_t,
+            );
+            if ret != 0 {
+                return Err(BluefinError::InvalidSocketError);
+            }
+        }
 
         build_and_start_tx(
             self.num_reader_workers,
@@ -139,6 +168,7 @@ impl BluefinClient {
             Arc::clone(&ack_buff),
             Arc::clone(self.socket.as_ref().unwrap()),
             self.dst_addr.unwrap(),
+            self.src_addr,
         ))
     }
 }

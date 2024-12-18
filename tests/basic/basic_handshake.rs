@@ -136,21 +136,12 @@ async fn basic_server_client_connection_send_recv(
         }
 
         // Now flip around and let the server send 5 bytes
-        let size = timeout(Duration::from_secs(1), conn.send(&[5, 4, 3, 2, 1]))
-            .await
-            .expect("Server timed out while trying to send five bytes")
-            .expect("Server encountered error while trying to send bytes");
-        assert_eq!(size, 5);
+        let size = conn.send(&[5, 4, 3, 2, 1]);
+        assert!(size.is_ok_and(|s| s == 5), "Failed to send bytes");
 
         // Send another 10 bytes
-        let size = timeout(
-            Duration::from_secs(1),
-            conn.send(&[2, 4, 6, 8, 10, 12, 14, 16, 18, 20]),
-        )
-        .await
-        .expect("Server timed out while trying to send ten bytes")
-        .expect("Server encountered error while trying to send bytes");
-        assert_eq!(size, 10);
+        let size = conn.send(&[2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+        assert!(size.is_ok_and(|s| s == 10), "Failed to send bytes");
     });
 
     let loopback_cloned = loopback_ip_addr.clone();
@@ -171,77 +162,53 @@ async fn basic_server_client_connection_send_recv(
 
         // Send 7 bytes
         let bytes = [1, 2, 3, 4, 5, 6, 7];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #1")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 7);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 7), "Failed to send bytes");
         total_num_bytes_sent += 7;
 
         // Send 50 bytes
         let bytes = [10; 50];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #2")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 50);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 50), "Failed to send bytes");
         total_num_bytes_sent += 50;
 
         // Send 3 bytes
         let bytes = [8, 8, 8];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #3")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 3);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 3), "Failed to send bytes");
         total_num_bytes_sent += 3;
 
         // Send 40 bytes
         let bytes = [99; 40];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #4")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 40);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 40), "Failed to send bytes");
         total_num_bytes_sent += 40;
 
         // Send 500 bytes
         let bytes = [27; 500];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #5")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 500);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 500), "Failed to send bytes");
         total_num_bytes_sent += 500;
 
         // Send 399 bytes
         let bytes = [18; 399];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #6")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 399);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 399), "Failed to send bytes");
         total_num_bytes_sent += 399;
 
         // Send 1 byte
         let bytes = [19];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #7")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 1);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 1), "Failed to send bytes");
         total_num_bytes_sent += 1;
 
         // We will send 2000 bytes now in batches of 250 bytes
         for round_num in 0..8 {
             let bytes = [round_num; BATCH_SIZE];
-            let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-                .await
-                .expect(&format!(
-                    "Client timed out while sending batch #{}",
-                    8 + round_num
-                ))
-                .expect("Client encountered error while sending");
+            let size = conn.send(&bytes).expect(&format!(
+                "Client timed out while sending batch #{}",
+                8 + round_num
+            ));
             assert_eq!(size, BATCH_SIZE);
             total_num_bytes_sent += BATCH_SIZE;
         }
@@ -351,11 +318,8 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
 
             // Tell the server who we are by sending the key. Key is five bytes.
             let key = format!("key_{}", conn_num);
-            let size = timeout(Duration::from_secs(1), conn.send(key.as_bytes()))
-                .await
-                .expect("Client timed out after sending key")
-                .expect("Client encountered error while sending");
-            assert_eq!(size, 5);
+            let size = conn.send(key.as_bytes());
+            assert!(size.is_ok_and(|s| s == 5), "Failed to send bytes");
 
             sleep(Duration::from_millis(10)).await;
 
@@ -366,16 +330,10 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
             let mut start_ix = 0;
             let mut num_iterations = 0;
             while num_iterations < max_num_iterations {
-                let size = timeout(
-                    Duration::from_secs(1),
-                    conn.send(&data_to_send[start_ix..start_ix + 32]),
-                )
-                .await
-                .expect("Client timed out after sending data")
-                .expect("Client encountered error while sending");
-                assert_eq!(size, 32);
+                let size = conn.send(&data_to_send[start_ix..start_ix + 32]);
+                assert!(size.is_ok_and(|s| s == 32), "Failed to send bytes");
                 start_ix += 32;
-                total_bytes_sent += size;
+                total_bytes_sent += 32;
                 num_iterations += 1;
             }
 

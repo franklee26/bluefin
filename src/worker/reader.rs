@@ -44,6 +44,8 @@ pub(crate) struct ReaderTxChannel {
 pub(crate) struct ReaderRxChannel {
     future: ReaderRxChannelFuture,
     writer_handler: WriterHandler,
+    packets_consumed: usize,
+    packets_consumed_before_ack: usize,
 }
 
 #[derive(Clone)]
@@ -74,6 +76,8 @@ impl ReaderRxChannel {
         Self {
             future,
             writer_handler,
+            packets_consumed: 0,
+            packets_consumed_before_ack: 100,
         }
     }
 
@@ -90,9 +94,13 @@ impl ReaderRxChannel {
         };
         let num_packets_consumed = consume_res.get_num_packets_consumed();
         let base_packet_num = consume_res.get_base_packet_number();
+        self.packets_consumed += num_packets_consumed;
 
         // We need to send an ack.
-        if num_packets_consumed > 0 && base_packet_num != 0 {
+        if num_packets_consumed > 0
+            && base_packet_num != 0
+            && self.packets_consumed >= self.packets_consumed_before_ack
+        {
             if let Err(e) = self
                 .writer_handler
                 .send_ack(base_packet_num, num_packets_consumed)
@@ -102,6 +110,7 @@ impl ReaderRxChannel {
                     e
                 );
             }
+            self.packets_consumed = 0;
         }
 
         Ok((consume_res.get_bytes_consumed(), addr))

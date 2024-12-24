@@ -59,7 +59,7 @@ async fn main() -> BluefinResult<()> {
                 }
             }
             println!("Sent {} bytes", total_bytes);
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(3)).await;
 
             Ok::<(), BluefinError>(())
         });

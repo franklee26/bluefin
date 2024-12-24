@@ -5,9 +5,11 @@ use tokio::sync::mpsc::{self};
 use crate::core::error::BluefinError;
 use crate::core::header::PacketType;
 use crate::core::packet::BluefinPacket;
+use crate::net::ack_handler::AckBuffer;
+use crate::net::connection::ConnectionBuffer;
 use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use crate::utils::common::BluefinResult;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 pub(crate) struct ConnReaderHandler {
     socket: Arc<UdpSocket>,
@@ -21,7 +23,7 @@ impl ConnReaderHandler {
 
     pub(crate) fn start(&self) -> BluefinResult<()> {
         let (tx, rx) = mpsc::channel::<Vec<BluefinPacket>>(1024);
-        for _ in 0..4 {
+        for _ in 0..2 {
             let tx_cloned = tx.clone();
             let socket_cloned = self.socket.clone();
             spawn(async move {
@@ -61,30 +63,74 @@ impl ConnReaderHandler {
     ) {
         loop {
             if let Some(packets) = rx.recv().await {
-                for p in packets {
-                    let _ = ConnReaderHandler::buffer_in_packet(conn_bufs, p);
-                }
+                let _ = Self::buffer_in_packets(packets, conn_bufs);
             }
         }
     }
 
     #[inline]
-    fn buffer_in_packet(
+    fn buffer_in_packets(
+        packets: Vec<BluefinPacket>,
         conn_bufs: &ConnectionManagedBuffers,
-        packet: BluefinPacket,
     ) -> BluefinResult<()> {
-        if packet.header.type_field == PacketType::Ack {
-            let mut guard = conn_bufs.ack_buff.lock().unwrap();
-            guard.buffer_in_ack_packet(packet)?;
-            guard.wake()?;
-        } else {
-            let mut guard = conn_bufs.conn_buff.lock().unwrap();
-            guard.buffer_in_bytes(packet)?;
-            if let Some(w) = guard.get_waker() {
-                w.wake_by_ref();
-            } else {
-                return Err(BluefinError::NoSuchWakerError);
+        // Nothing to do if empty
+        if packets.is_empty() {
+            return Ok(());
+        }
+
+        // Peek at the first packet and acquire the buffer.
+        let p = packets.first().unwrap();
+        match p.header.type_field {
+            PacketType::Ack => {
+                let guard = conn_bufs.ack_buff.lock().unwrap();
+                Self::buffer_in_ack_packets(guard, packets)
             }
+            _ => {
+                let guard = conn_bufs.conn_buff.lock().unwrap();
+                Self::buffer_in_data_packets(guard, packets)
+            }
+        }
+    }
+
+    #[inline]
+    fn buffer_in_ack_packets(
+        mut guard: MutexGuard<'_, AckBuffer>,
+        packets: Vec<BluefinPacket>,
+    ) -> BluefinResult<()> {
+        let mut e: Option<BluefinError> = None;
+        for p in packets {
+            if let Err(err) = guard.buffer_in_ack_packet(p) {
+                e = Some(err);
+            }
+        }
+        guard.wake()?;
+
+        if e.is_some() {
+            return Err(e.unwrap());
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn buffer_in_data_packets(
+        mut guard: MutexGuard<'_, ConnectionBuffer>,
+        packets: Vec<BluefinPacket>,
+    ) -> BluefinResult<()> {
+        let mut e: Option<BluefinError> = None;
+        for p in packets {
+            if let Err(err) = guard.buffer_in_bytes(p) {
+                e = Some(err);
+            }
+        }
+
+        if let Some(w) = guard.get_waker() {
+            w.wake_by_ref();
+        } else {
+            return Err(BluefinError::NoSuchWakerError);
+        }
+
+        if e.is_some() {
+            return Err(e.unwrap());
         }
         Ok(())
     }

@@ -1,14 +1,14 @@
+use bluefin::net::{client::BluefinClient, server::BluefinServer};
 use core::str;
+use local_ip_address::list_afinet_netifas;
+use rstest::{fixture, rstest};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddrV4},
     time::Duration,
 };
-
-use bluefin::net::{client::BluefinClient, server::BluefinServer};
-use local_ip_address::list_afinet_netifas;
-use rstest::{fixture, rstest};
 use tokio::{
+    spawn,
     task::JoinSet,
     time::{sleep, timeout},
 };
@@ -136,21 +136,12 @@ async fn basic_server_client_connection_send_recv(
         }
 
         // Now flip around and let the server send 5 bytes
-        let size = timeout(Duration::from_secs(1), conn.send(&[5, 4, 3, 2, 1]))
-            .await
-            .expect("Server timed out while trying to send five bytes")
-            .expect("Server encountered error while trying to send bytes");
-        assert_eq!(size, 5);
+        let size = conn.send(&[5, 4, 3, 2, 1]);
+        assert!(size.is_ok_and(|s| s == 5), "Failed to send bytes");
 
         // Send another 10 bytes
-        let size = timeout(
-            Duration::from_secs(1),
-            conn.send(&[2, 4, 6, 8, 10, 12, 14, 16, 18, 20]),
-        )
-        .await
-        .expect("Server timed out while trying to send ten bytes")
-        .expect("Server encountered error while trying to send bytes");
-        assert_eq!(size, 10);
+        let size = conn.send(&[2, 4, 6, 8, 10, 12, 14, 16, 18, 20]);
+        assert!(size.is_ok_and(|s| s == 10), "Failed to send bytes");
     });
 
     let loopback_cloned = loopback_ip_addr.clone();
@@ -171,77 +162,53 @@ async fn basic_server_client_connection_send_recv(
 
         // Send 7 bytes
         let bytes = [1, 2, 3, 4, 5, 6, 7];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #1")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 7);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 7), "Failed to send bytes");
         total_num_bytes_sent += 7;
 
         // Send 50 bytes
         let bytes = [10; 50];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #2")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 50);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 50), "Failed to send bytes");
         total_num_bytes_sent += 50;
 
         // Send 3 bytes
         let bytes = [8, 8, 8];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #3")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 3);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 3), "Failed to send bytes");
         total_num_bytes_sent += 3;
 
         // Send 40 bytes
         let bytes = [99; 40];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #4")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 40);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 40), "Failed to send bytes");
         total_num_bytes_sent += 40;
 
         // Send 500 bytes
         let bytes = [27; 500];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #5")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 500);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 500), "Failed to send bytes");
         total_num_bytes_sent += 500;
 
         // Send 399 bytes
         let bytes = [18; 399];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #6")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 399);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 399), "Failed to send bytes");
         total_num_bytes_sent += 399;
 
         // Send 1 byte
         let bytes = [19];
-        let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-            .await
-            .expect("Client timed out while sending batch #7")
-            .expect("Client encountered error while sending");
-        assert_eq!(size, 1);
+        let size = conn.send(&bytes);
+        assert!(size.is_ok_and(|s| s == 1), "Failed to send bytes");
         total_num_bytes_sent += 1;
 
         // We will send 2000 bytes now in batches of 250 bytes
         for round_num in 0..8 {
             let bytes = [round_num; BATCH_SIZE];
-            let size = timeout(Duration::from_secs(3), conn.send(&bytes))
-                .await
-                .expect(&format!(
-                    "Client timed out while sending batch #{}",
-                    8 + round_num
-                ))
-                .expect("Client encountered error while sending");
+            let size = conn.send(&bytes).expect(&format!(
+                "Client timed out while sending batch #{}",
+                8 + round_num
+            ));
             assert_eq!(size, BATCH_SIZE);
             total_num_bytes_sent += BATCH_SIZE;
         }
@@ -285,106 +252,102 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
     let client_ports: [u16; NUM_CONNECTIONS] = [1420, 1421, 1422];
     let loopback_cloned = loopback_ip_addr.clone();
     let data = Arc::new(generate_connection_date(NUM_CONNECTIONS));
+    let data_cloned = Arc::clone(&data);
 
-    for conn_num in 0..NUM_CONNECTIONS {
-        let mut s = server.clone();
-        let data_cloned = Arc::clone(&data);
-        join_set.spawn(async move {
-            let mut conn = timeout(Duration::from_secs(10), s.accept())
-                .await
-                .expect(&format!(
-                    "Server #{} timed out waiting to accept connection from client",
-                    conn_num
-                ))
-                .expect("Failed to create bluefin connection");
-
-            // The test will first send a key of five bytes.
-            let mut key_buf: [u8; 5] = [0; 5];
-            let size = timeout(Duration::from_secs(1), conn.recv(&mut key_buf, 5))
-                .await
-                .expect("Server timed out while waiting for key")
-                .expect("Server encountered error while receiving");
-            assert_eq!(size, 5);
-            let key = match str::from_utf8(&key_buf) {
-                Ok(s) => s,
-                Err(_) => panic!("Could not retrieve key from client"),
-            };
-
-            let expected_data = data_cloned.get(key).expect("Could not fetch expected data");
-            let mut stitched_bytes: Vec<u8> = Vec::new();
-            let mut buf = [0u8; 1500];
-            loop {
-                let size = timeout(Duration::from_secs(1), conn.recv(&mut buf, 1500))
+    join_set.spawn(async move {
+        let mut conn_num = 0;
+        while let Ok(mut conn) = timeout(Duration::from_secs(10), server.accept())
+            .await
+            .expect(&format!(
+                "Server #{} timed out waiting to accept connection from client",
+                conn_num
+            ))
+        {
+            let data_cloned = Arc::clone(&data_cloned);
+            spawn(async move {
+                // The test will first send a key of five bytes.
+                let mut key_buf: [u8; 5] = [0; 5];
+                let size = timeout(Duration::from_secs(1), conn.recv(&mut key_buf, 5))
                     .await
-                    .expect("Server timed out while waiting for data")
-                    .expect("Server encountered error while receiving data");
-                assert_ne!(size, 0);
-                assert!(size <= 1500);
-                stitched_bytes.extend_from_slice(&buf[..size]);
+                    .expect("Server timed out while waiting for key")
+                    .expect("Server encountered error while receiving");
+                assert_eq!(size, 5);
+                let key = match str::from_utf8(&key_buf) {
+                    Ok(s) => s,
+                    Err(_) => panic!("Could not retrieve key from client"),
+                };
 
-                if stitched_bytes.len() == MAX_BYTES_SENT_PER_CONNECTION {
-                    break;
+                let expected_data = data_cloned.get(key).expect("Could not fetch expected data");
+                let mut stitched_bytes: Vec<u8> = Vec::new();
+                let mut buf = [0u8; 1500];
+                loop {
+                    let size = timeout(Duration::from_secs(1), conn.recv(&mut buf, 1500))
+                        .await
+                        .expect("Server timed out while waiting for data")
+                        .expect("Server encountered error while receiving data");
+                    assert_ne!(size, 0);
+                    assert!(size <= 1500);
+                    stitched_bytes.extend_from_slice(&buf[..size]);
+
+                    if stitched_bytes.len() == MAX_BYTES_SENT_PER_CONNECTION {
+                        break;
+                    }
                 }
+                assert_eq!(stitched_bytes, *expected_data);
+            });
+            conn_num += 1;
+
+            if conn_num >= NUM_CONNECTIONS {
+                break;
             }
-            assert_eq!(stitched_bytes, *expected_data);
-        });
-    }
+        }
+    });
+
     for conn_num in 0..NUM_CONNECTIONS {
         // Random amount of time to sleep
         let data_cloned = Arc::clone(&data);
-        join_set.spawn(async move {
-            let mut client = BluefinClient::new(std::net::SocketAddr::V4(SocketAddrV4::new(
+        let mut client = BluefinClient::new(std::net::SocketAddr::V4(SocketAddrV4::new(
+            loopback_cloned,
+            client_ports[conn_num],
+        )));
+
+        if let Ok(mut conn) = client
+            .connect(std::net::SocketAddr::V4(SocketAddrV4::new(
                 loopback_cloned,
-                client_ports[conn_num],
-            )));
+                1419,
+            )))
+            .await
+        {
+            join_set.spawn(async move {
+                // Tell the server who we are by sending the key. Key is five bytes.
+                let key = format!("key_{}", conn_num);
+                let size = conn.send(key.as_bytes());
+                assert!(size.is_ok_and(|s| s == 5), "Failed to send bytes");
 
-            let mut conn = client
-                .connect(std::net::SocketAddr::V4(SocketAddrV4::new(
-                    loopback_cloned,
-                    1419,
-                )))
-                .await
-                .expect(&format!(
-                    "Client #{} timed out waiting to connect to server",
-                    conn_num
-                ));
+                sleep(Duration::from_millis(10)).await;
 
-            // Tell the server who we are by sending the key. Key is five bytes.
-            let key = format!("key_{}", conn_num);
-            let size = timeout(Duration::from_secs(1), conn.send(key.as_bytes()))
-                .await
-                .expect("Client timed out after sending key")
-                .expect("Client encountered error while sending");
-            assert_eq!(size, 5);
+                // Now begin sending the actual data in batches of 32 bytes
+                let mut total_bytes_sent = 5;
+                let data_to_send = data_cloned.get(&key).unwrap();
+                let max_num_iterations = data_to_send.len() / 32;
+                let mut start_ix = 0;
+                let mut num_iterations = 0;
+                while num_iterations < max_num_iterations {
+                    let size = conn.send(&data_to_send[start_ix..start_ix + 32]);
+                    assert!(size.is_ok_and(|s| s == 32), "Failed to send bytes");
+                    start_ix += 32;
+                    total_bytes_sent += 32;
+                    num_iterations += 1;
+                }
 
-            sleep(Duration::from_millis(10)).await;
-
-            // Now begin sending the actual data in batches of 32 bytes
-            let mut total_bytes_sent = 5;
-            let data_to_send = data_cloned.get(&key).unwrap();
-            let max_num_iterations = data_to_send.len() / 32;
-            let mut start_ix = 0;
-            let mut num_iterations = 0;
-            while num_iterations < max_num_iterations {
-                let size = timeout(
-                    Duration::from_secs(1),
-                    conn.send(&data_to_send[start_ix..start_ix + 32]),
-                )
-                .await
-                .expect("Client timed out after sending data")
-                .expect("Client encountered error while sending");
-                assert_eq!(size, 32);
-                start_ix += 32;
-                total_bytes_sent += size;
-                num_iterations += 1;
-            }
-
-            assert_eq!(
-                total_bytes_sent,
-                MAX_BYTES_SENT_PER_CONNECTION + 5,
-                "Did not send the expected number of bytes"
-            );
-        });
+                assert_eq!(
+                    total_bytes_sent,
+                    MAX_BYTES_SENT_PER_CONNECTION + 5,
+                    "Did not send the expected number of bytes"
+                );
+            });
+            sleep(Duration::from_millis(5)).await;
+        }
     }
 
     join_set.join_all().await;

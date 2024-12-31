@@ -7,6 +7,11 @@ use std::{
 use rand::Rng;
 use tokio::{net::UdpSocket, sync::RwLock};
 
+use super::{
+    connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
+    AckBuffer, ConnectionManagedBuffers,
+};
+use crate::utils::get_udp_socket;
 use crate::{
     core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
     net::{
@@ -15,12 +20,7 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-use super::{
-    connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
-    AckBuffer, ConnectionManagedBuffers,
-};
-
-const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 5;
+const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 1;
 
 pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
@@ -53,7 +53,7 @@ impl BluefinClient {
     }
 
     pub async fn connect(&mut self, dst_addr: SocketAddr) -> BluefinResult<BluefinConnection> {
-        let socket = Arc::new(UdpSocket::bind(self.src_addr).await?);
+        let socket = Arc::new(get_udp_socket(self.src_addr)?);
         self.socket = Some(Arc::clone(&socket));
         self.dst_addr = Some(dst_addr);
 
@@ -137,8 +137,8 @@ impl BluefinClient {
             packet_number + 2,
             Arc::clone(&conn_buffer),
             Arc::clone(&ack_buff),
-            Arc::clone(self.socket.as_ref().unwrap()),
             self.dst_addr.unwrap(),
+            self.src_addr,
         ))
     }
 }

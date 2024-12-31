@@ -19,7 +19,7 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-use super::writer::WriterTxChannel;
+use super::writer::WriterHandler;
 
 #[derive(Clone)]
 /// [ReaderTxChannel] is the transmission channel for the receiving [ReaderRxChannel]. This channel will when
@@ -43,7 +43,9 @@ pub(crate) struct ReaderTxChannel {
 /// *receives* bytes *from* the buffer.
 pub(crate) struct ReaderRxChannel {
     future: ReaderRxChannelFuture,
-    writer_tx_channel: WriterTxChannel,
+    writer_handler: WriterHandler,
+    packets_consumed: usize,
+    packets_consumed_before_ack: usize,
 }
 
 #[derive(Clone)]
@@ -69,14 +71,13 @@ impl Future for ReaderRxChannelFuture {
 }
 
 impl ReaderRxChannel {
-    pub(crate) fn new(
-        buffer: Arc<Mutex<ConnectionBuffer>>,
-        writer_tx_channel: WriterTxChannel,
-    ) -> Self {
+    pub(crate) fn new(buffer: Arc<Mutex<ConnectionBuffer>>, writer_handler: WriterHandler) -> Self {
         let future = ReaderRxChannelFuture { buffer };
         Self {
             future,
-            writer_tx_channel,
+            writer_handler,
+            packets_consumed: 0,
+            packets_consumed_before_ack: 200,
         }
     }
 
@@ -93,19 +94,23 @@ impl ReaderRxChannel {
         };
         let num_packets_consumed = consume_res.get_num_packets_consumed();
         let base_packet_num = consume_res.get_base_packet_number();
+        self.packets_consumed += num_packets_consumed;
 
         // We need to send an ack.
-        if num_packets_consumed > 0 && base_packet_num != 0 {
+        if num_packets_consumed > 0
+            && base_packet_num != 0
+            && self.packets_consumed >= self.packets_consumed_before_ack
+        {
             if let Err(e) = self
-                .writer_tx_channel
+                .writer_handler
                 .send_ack(base_packet_num, num_packets_consumed)
-                .await
             {
                 eprintln!(
                     "Failed to send ack packet after reads due to error: {:?}",
                     e
                 );
             }
+            self.packets_consumed = 0;
         }
 
         Ok((consume_res.get_bytes_consumed(), addr))
@@ -195,8 +200,6 @@ impl ReaderTxChannel {
         let packet_src_conn_id = packet.header.source_connection_id;
         if !is_hello && !is_client_ack {
             // If not hello, we buffer in the bytes
-            // Could not buffer in packet... buffer is likely full. We will have to discard the
-            // packet.
             conn_buff.buffer_in_bytes(packet)?;
         } else {
             conn_buff.buffer_in_packet(packet)?;

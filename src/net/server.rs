@@ -18,9 +18,8 @@ use super::{
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
     AckBuffer, ConnectionManagedBuffers,
 };
-const NUM_TX_WORKERS_FOR_SERVER_DEFAULT: u16 = 10;
+const NUM_TX_WORKERS_FOR_SERVER_DEFAULT: u16 = 2;
 
-#[derive(Clone)]
 pub struct BluefinServer {
     socket: Option<Arc<UdpSocket>>,
     src_addr: SocketAddr,

@@ -10,6 +10,7 @@ use crate::net::connection::ConnectionBuffer;
 use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use crate::utils::common::BluefinResult;
 use std::sync::{Arc, MutexGuard};
+use std::thread::available_parallelism;
 
 pub(crate) struct ConnReaderHandler {
     socket: Arc<UdpSocket>,
@@ -23,7 +24,8 @@ impl ConnReaderHandler {
 
     pub(crate) fn start(&self) -> BluefinResult<()> {
         let (tx, rx) = mpsc::channel::<Vec<BluefinPacket>>(1024);
-        for _ in 0..2 {
+        let num_cpu_cores = available_parallelism()?.get();
+        for _ in 0..1 {
             let tx_cloned = tx.clone();
             let socket_cloned = self.socket.clone();
             spawn(async move {

@@ -1,7 +1,5 @@
 use std::{
-    mem,
     net::SocketAddr,
-    os::fd::AsRawFd,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -9,6 +7,11 @@ use std::{
 use rand::Rng;
 use tokio::{net::UdpSocket, sync::RwLock};
 
+use super::{
+    connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
+    AckBuffer, ConnectionManagedBuffers,
+};
+use crate::utils::get_udp_socket;
 use crate::{
     core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
     net::{
@@ -17,12 +20,7 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-use super::{
-    connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
-    AckBuffer, ConnectionManagedBuffers,
-};
-
-const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 5;
+const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 2;
 
 pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
@@ -55,36 +53,9 @@ impl BluefinClient {
     }
 
     pub async fn connect(&mut self, dst_addr: SocketAddr) -> BluefinResult<BluefinConnection> {
-        let socket = Arc::new(UdpSocket::bind(self.src_addr).await?);
+        let socket = Arc::new(get_udp_socket(self.src_addr)?);
         self.socket = Some(Arc::clone(&socket));
         self.dst_addr = Some(dst_addr);
-
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        unsafe {
-            let socket_fd = socket.as_raw_fd();
-            let optval: libc::c_int = 1;
-            let ret = libc::setsockopt(
-                socket_fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEPORT,
-                &optval as *const _ as *const libc::c_void,
-                mem::size_of_val(&optval) as libc::socklen_t,
-            );
-            if ret != 0 {
-                return Err(BluefinError::InvalidSocketError);
-            }
-
-            let ret = libc::setsockopt(
-                socket_fd,
-                libc::SOL_SOCKET,
-                libc::SO_REUSEADDR,
-                &optval as *const _ as *const libc::c_void,
-                mem::size_of_val(&optval) as libc::socklen_t,
-            );
-            if ret != 0 {
-                return Err(BluefinError::InvalidSocketError);
-            }
-        }
 
         build_and_start_tx(
             self.num_reader_workers,

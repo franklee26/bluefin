@@ -74,7 +74,7 @@ impl WriterHandler {
     }
 
     #[inline]
-    pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<()> {
+    pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<usize> {
         match self.data_sender {
             Some(ref sender) => {
                 if let Err(e) = sender.send(payload.to_vec()) {
@@ -83,7 +83,7 @@ impl WriterHandler {
                         e
                     )));
                 }
-                Ok(())
+                Ok(payload.len())
             }
             None => Err(BluefinError::WriteError(
                 "Sender is not available. Cannot send.".to_string(),

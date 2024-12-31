@@ -310,9 +310,6 @@ impl BluefinConnection {
 
     #[inline]
     pub fn send(&mut self, buf: &[u8]) -> BluefinResult<usize> {
-        // TODO! This returns the total bytes sent (including bluefin payload). This
-        // really should only return the total payload bytes
-        self.writer_handler.send_data(buf)?;
-        Ok(buf.len())
+        self.writer_handler.send_data(buf)
     }
 }

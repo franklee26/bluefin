@@ -55,12 +55,10 @@ impl Default for BluefinPacket {
     #[allow(invalid_value)]
     #[inline]
     fn default() -> Self {
-        // SAFETY
-        // Actually, this isn't safe and access to this kind of zero'd value would result
-        // in panics. There does not exist a 'default' bluefin packet. Therefore, the
-        // purpose of this is to quickly instantiate a 'filler' bluefin packet BUT this
-        // default value should NEVER be read/used.
-        unsafe { std::mem::zeroed() }
+        Self {
+            header: Default::default(),
+            payload: vec![],
+        }
     }
 }
 

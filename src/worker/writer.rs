@@ -18,12 +18,18 @@ use crate::{
     utils::common::BluefinResult,
 };
 
+/// Internal representation of an ack. These fields will be used to build a Bluefin ack packet.
 #[derive(Clone, Copy)]
 struct AckData {
     base_packet_num: u64,
     num_packets_consumed: usize,
 }
 
+/// [WriterHandler] is a handle for all write operations to the network. The writer handler is
+/// responsible for accepting bytes, dividing them into Bluefin packets and then eventually sending
+/// them on to the network. The handler ensures that the order in which the sends arrive at are
+/// preserved and that we fit at most [MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM] bytes of bluefin packets
+/// into a single UDP datagram.
 #[derive(Clone)]
 pub(crate) struct WriterHandler {
     socket: Arc<UdpSocket>,
@@ -74,20 +80,21 @@ impl WriterHandler {
     }
 
     #[inline]
-    pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<()> {
-        if self.data_sender.is_none() {
-            return Err(BluefinError::WriteError(
+    pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<usize> {
+        match self.data_sender {
+            Some(ref sender) => {
+                if let Err(e) = sender.send(payload.to_vec()) {
+                    return Err(BluefinError::WriteError(format!(
+                        "Failed to send data due to error: {:?}",
+                        e
+                    )));
+                }
+                Ok(payload.len())
+            }
+            None => Err(BluefinError::WriteError(
                 "Sender is not available. Cannot send.".to_string(),
-            ));
+            )),
         }
-
-        if let Err(e) = self.data_sender.as_ref().unwrap().send(payload.to_vec()) {
-            return Err(BluefinError::WriteError(format!(
-                "Failed to send data due to error: {:?}",
-                e
-            )));
-        }
-        Ok(())
     }
 
     #[inline]
@@ -165,9 +172,8 @@ impl WriterHandler {
             b.clear();
             let size = rx.recv_many(&mut b, limit).await;
             for i in 0..size {
-                // Extract is a small optimization quicker. We avoid a (potentially)
-                // costly clone by moving the bytes out of the vec and replacing it
-                // via a zeroed default value.
+                // Extract is a small optimization. We avoid a (potentially) costly clone by
+                // moving the bytes out of the vec and replacing it via a zeroed default value.
                 data_queue.push_back(b[i].extract());
             }
 

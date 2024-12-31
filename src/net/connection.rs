@@ -305,14 +305,11 @@ impl BluefinConnection {
     #[inline]
     pub async fn recv(&mut self, buf: &mut [u8], len: usize) -> BluefinResult<usize> {
         let (size, _) = self.reader_rx.read(len, buf).await?;
-        return Ok(size as usize);
+        Ok(size as usize)
     }
 
     #[inline]
     pub fn send(&mut self, buf: &[u8]) -> BluefinResult<usize> {
-        // TODO! This returns the total bytes sent (including bluefin payload). This
-        // really should only return the total payload bytes
-        self.writer_handler.send_data(buf)?;
-        Ok(buf.len())
+        self.writer_handler.send_data(buf)
     }
 }

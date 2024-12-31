@@ -3,10 +3,9 @@ use std::{
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::Poll,
-    time::Duration,
 };
 
-use tokio::{net::UdpSocket, sync::RwLock, time::sleep};
+use tokio::{net::UdpSocket, sync::RwLock};
 
 use crate::{
     core::{context::BluefinHost, error::BluefinError, header::PacketType, packet::BluefinPacket},
@@ -134,16 +133,6 @@ impl ReaderTxChannel {
     }
 
     #[inline]
-    async fn run_sleep(encountered_err: &mut bool) {
-        if !*encountered_err {
-            sleep(Duration::from_micros(1)).await;
-            return;
-        }
-        sleep(Duration::from_millis(5)).await;
-        *encountered_err = false;
-    }
-
-    #[inline]
     fn handle_for_handshake(
         &self,
         packet: &BluefinPacket,
@@ -181,13 +170,11 @@ impl ReaderTxChannel {
 
     #[inline]
     fn build_conn_buff_key(is_hello: bool, src_conn_id: u32, dst_conn_id: u32) -> String {
-        return {
-            if !is_hello {
-                format!("{}_{}", src_conn_id, dst_conn_id)
-            } else {
-                format!("{}_0", src_conn_id)
-            }
-        };
+        if !is_hello {
+            format!("{}_{}", src_conn_id, dst_conn_id)
+        } else {
+            format!("{}_0", src_conn_id)
+        }
     }
 
     fn buffer_to_conn_buffer(
@@ -245,18 +232,14 @@ impl ReaderTxChannel {
     /// The [TxChannel]'s engine runner. This method will run forever and is responsible for reading bytes
     /// from the udp socket into a connection buffer. This method should be run its own asynchronous task.
     pub(crate) async fn run(&mut self) -> BluefinResult<()> {
-        let mut encountered_err = false;
         let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
 
         loop {
-            ReaderTxChannel::run_sleep(&mut encountered_err).await;
-
             let (size, addr) = self.socket.recv_from(&mut buf).await?;
             let packets_res = BluefinPacket::from_bytes(&buf[..size]);
 
             // Not bluefin packet(s) or it's invalid.
             if let Err(e) = packets_res {
-                encountered_err = true;
                 eprintln!("Encountered err: {:?}", e);
                 continue;
             }
@@ -264,7 +247,6 @@ impl ReaderTxChannel {
             // Acquire lock and buffer in data
             let packets = packets_res.unwrap();
             if packets.len() == 0 {
-                encountered_err = true;
                 continue;
             }
 
@@ -281,7 +263,6 @@ impl ReaderTxChannel {
                     self.handle_for_handshake(&packets[0], &mut is_hello, &mut src_conn_id)
                 {
                     eprintln!("{}", e);
-                    encountered_err = true;
                     continue;
                 }
             }
@@ -298,7 +279,6 @@ impl ReaderTxChannel {
 
             if _conn_buf.is_none() {
                 eprintln!("Could not find connection {}", &key);
-                encountered_err = true;
                 continue;
             }
 
@@ -308,7 +288,6 @@ impl ReaderTxChannel {
                     ReaderTxChannel::buffer_in_data(is_hello, self.host_type, p, addr, &buffers)
                 {
                     eprintln!("Failed to buffer in data: {}", e);
-                    encountered_err = true;
                 }
             }
         }

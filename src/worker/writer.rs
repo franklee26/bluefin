@@ -166,9 +166,8 @@ impl WriterHandler {
             b.clear();
             let size = rx.recv_many(&mut b, limit).await;
             for i in 0..size {
-                // Extract is a small optimization quicker. We avoid a (potentially)
-                // costly clone by moving the bytes out of the vec and replacing it
-                // via a zeroed default value.
+                // Extract is a small optimization. We avoid a (potentially) costly clone by
+                // moving the bytes out of the vec and replacing it via a zeroed default value.
                 data_queue.push_back(b[i].extract());
             }
 

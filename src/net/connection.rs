@@ -305,7 +305,7 @@ impl BluefinConnection {
     #[inline]
     pub async fn recv(&mut self, buf: &mut [u8], len: usize) -> BluefinResult<usize> {
         let (size, _) = self.reader_rx.read(len, buf).await?;
-        return Ok(size as usize);
+        Ok(size as usize)
     }
 
     #[inline]

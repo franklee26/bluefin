@@ -3,11 +3,12 @@ use crate::utils::common::BluefinResult;
 use super::{error::BluefinError, Serialisable};
 
 /// 4 bits reserved for PacketType => 16 possible packet types
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum PacketType {
     UnencryptedClientHello = 0x00,
     UnencryptedServerHello = 0x01,
     ClientAck = 0x02,
+    #[default]
     UnencryptedData = 0x03,
     Ack = 0x04,
 }
@@ -26,7 +27,7 @@ impl PacketType {
 }
 
 /// This struct contains the encryption flag and header-protection fields for a total of 8 bits
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct BluefinSecurityFields {
     /// header_encrypted is one bit and signals whether the header contains encrypted fields
     header_encrypted: bool,
@@ -87,7 +88,7 @@ impl Serialisable for BluefinSecurityFields {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
 ///
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct BluefinHeader {
     // The version is 4 bits
     pub version: u8,

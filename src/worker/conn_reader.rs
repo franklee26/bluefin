@@ -10,7 +10,8 @@ use crate::net::connection::ConnectionBuffer;
 use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use crate::utils::common::BluefinResult;
 use std::sync::{Arc, MutexGuard};
-use std::thread::available_parallelism;
+
+const DEFAULT_NUMBER_OF_TASKS_TO_SPAWN: usize = 3;
 
 pub(crate) struct ConnReaderHandler {
     socket: Arc<UdpSocket>,
@@ -24,8 +25,7 @@ impl ConnReaderHandler {
 
     pub(crate) fn start(&self) -> BluefinResult<()> {
         let (tx, rx) = mpsc::channel::<Vec<BluefinPacket>>(1024);
-        let num_cpu_cores = available_parallelism()?.get();
-        for _ in 0..1 {
+        for _ in 0..Self::get_num_cpu_cores() {
             let tx_cloned = tx.clone();
             let socket_cloned = self.socket.clone();
             spawn(async move {
@@ -38,6 +38,29 @@ impl ConnReaderHandler {
             let _ = ConnReaderHandler::rx_impl(rx, &*conn_bufs).await;
         });
         Ok(())
+    }
+
+    #[allow(unreachable_code)]
+    #[inline]
+    fn get_num_cpu_cores() -> usize {
+        // For linux, let's use all the cpu cores available.
+        #[cfg(target_os = "linux")]
+        {
+            use std::thread::available_parallelism;
+            if let Ok(num_cpu_cores) = available_parallelism() {
+                return num_cpu_cores.get();
+            }
+        }
+
+        // For macos (at least silicon macs), we can't seem to use
+        // SO_REUSEPORT to our benefit. We will pretend we have one core.
+        #[cfg(target_os = "macos")]
+        {
+            return 1;
+        }
+
+        // For everything else, we assume the default.
+        DEFAULT_NUMBER_OF_TASKS_TO_SPAWN
     }
 
     #[inline]

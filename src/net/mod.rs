@@ -1,7 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use ack_handler::{AckBuffer, AckConsumer};
 use connection::{ConnectionBuffer, ConnectionManager};
@@ -14,11 +11,7 @@ use crate::{
         packet::BluefinPacket,
     },
     utils::{common::BluefinResult, get_connected_udp_socket},
-    worker::{
-        conn_reader::ConnReaderHandler,
-        reader::ReaderTxChannel,
-        writer::{WriterQueue, WriterRxChannel},
-    },
+    worker::{conn_reader::ConnReaderHandler, reader::ReaderTxChannel},
 };
 
 pub mod ack_handler;

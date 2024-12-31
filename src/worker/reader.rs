@@ -19,7 +19,7 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-use super::writer::{WriterHandler, WriterTxChannel};
+use super::writer::WriterHandler;
 
 #[derive(Clone)]
 /// [ReaderTxChannel] is the transmission channel for the receiving [ReaderRxChannel]. This channel will when
@@ -77,7 +77,7 @@ impl ReaderRxChannel {
             future,
             writer_handler,
             packets_consumed: 0,
-            packets_consumed_before_ack: 100,
+            packets_consumed_before_ack: 200,
         }
     }
 

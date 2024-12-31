@@ -7,22 +7,19 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, time::timeout};
+use tokio::time::timeout;
 
 use crate::{
     core::{context::BluefinHost, error::BluefinError, packet::BluefinPacket},
     utils::common::BluefinResult,
-    worker::{
-        reader::ReaderRxChannel,
-        writer::{WriterHandler, WriterTxChannel},
-    },
+    worker::{reader::ReaderRxChannel, writer::WriterHandler},
 };
 
 use super::{
     build_and_start_ack_consumer_workers, build_and_start_conn_reader_tx_channels,
     get_connected_udp_socket,
     ordered_bytes::{ConsumeResult, OrderedBytes},
-    AckBuffer, ConnectionManagedBuffers, WriterQueue,
+    AckBuffer, ConnectionManagedBuffers,
 };
 
 pub const MAX_BUFFER_SIZE: usize = 2000;
@@ -268,7 +265,6 @@ impl BluefinConnection {
         next_send_packet_num: u64,
         conn_buffer: Arc<Mutex<ConnectionBuffer>>,
         ack_buffer: Arc<Mutex<AckBuffer>>,
-        socket: Arc<UdpSocket>,
         dst_addr: SocketAddr,
         src_addr: SocketAddr,
     ) -> Self {

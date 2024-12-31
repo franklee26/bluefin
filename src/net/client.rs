@@ -20,7 +20,7 @@ use crate::{
     utils::common::BluefinResult,
 };
 
-const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 2;
+const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 1;
 
 pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
@@ -137,7 +137,6 @@ impl BluefinClient {
             packet_number + 2,
             Arc::clone(&conn_buffer),
             Arc::clone(&ack_buff),
-            Arc::clone(self.socket.as_ref().unwrap()),
             self.dst_addr.unwrap(),
             self.src_addr,
         ))

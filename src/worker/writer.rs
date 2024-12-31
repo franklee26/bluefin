@@ -18,12 +18,18 @@ use crate::{
     utils::common::BluefinResult,
 };
 
+/// Internal representation of an ack. These fields will be used to build a Bluefin ack packet.
 #[derive(Clone, Copy)]
 struct AckData {
     base_packet_num: u64,
     num_packets_consumed: usize,
 }
 
+/// [WriterHandler] is a handle for all write operations to the network. The writer handler is
+/// responsible for accepting bytes, dividing them into Bluefin packets and then eventually sending
+/// them on to the network. The handler ensures that the order in which the sends arrive at are
+/// preserved and that we fit at most [MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM] bytes of bluefin packets
+/// into a single UDP datagram.
 #[derive(Clone)]
 pub(crate) struct WriterHandler {
     socket: Arc<UdpSocket>,

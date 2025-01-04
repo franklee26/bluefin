@@ -7,20 +7,20 @@ use std::{
     time::Duration,
 };
 
-use tokio::time::timeout;
-
-use crate::{
-    core::{context::BluefinHost, error::BluefinError, packet::BluefinPacket},
-    utils::common::BluefinResult,
-    worker::{reader::ReaderRxChannel, writer::WriterHandler},
-};
-
 use super::{
     build_and_start_ack_consumer_workers, build_and_start_conn_reader_tx_channels,
     get_connected_udp_socket,
     ordered_bytes::{ConsumeResult, OrderedBytes},
     AckBuffer, ConnectionManagedBuffers,
 };
+use crate::{
+    core::packet::BluefinPacket,
+    worker::{reader::ReaderRxChannel, writer::WriterHandler},
+};
+use bluefin_proto::context::BluefinHost;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
+use tokio::time::timeout;
 
 pub const MAX_BUFFER_SIZE: usize = 2000;
 pub const MAX_BUFFER_CONSUME: usize = 1000;
@@ -58,10 +58,10 @@ impl HandshakeConnectionBuffer {
             return Ok(res);
         }
 
-        return Err(BluefinError::TimedOut(format!(
+        Err(BluefinError::TimedOut(format!(
             "Failed to read from handshake connection buffer after {:?}",
             timeout_duration
-        )));
+        )))
     }
 }
 

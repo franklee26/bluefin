@@ -4,26 +4,28 @@ use std::{
     time::Duration,
 };
 
-use rand::Rng;
-use tokio::{net::UdpSocket, sync::RwLock};
-
-use crate::{
-    core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
-    net::{build_empty_encrypted_packet, connection::HandshakeConnectionBuffer},
-    utils::{common::BluefinResult, get_udp_socket},
-};
-
 use super::{
     build_and_start_tx,
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
     AckBuffer, ConnectionManagedBuffers,
 };
+use crate::{
+    core::{header::PacketType, Serialisable},
+    net::{build_empty_encrypted_packet, connection::HandshakeConnectionBuffer},
+    utils::get_udp_socket,
+};
+use bluefin_proto::context::BluefinHost;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
+use rand::Rng;
+use tokio::net::UdpSocket;
+
 const NUM_TX_WORKERS_FOR_SERVER_DEFAULT: u16 = 1;
 
 pub struct BluefinServer {
     socket: Option<Arc<UdpSocket>>,
     src_addr: SocketAddr,
-    conn_manager: Arc<RwLock<ConnectionManager>>,
+    conn_manager: Arc<Mutex<ConnectionManager>>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     num_reader_workers: u16,
 }
@@ -32,7 +34,7 @@ impl BluefinServer {
     pub fn new(src_addr: SocketAddr) -> Self {
         Self {
             socket: None,
-            conn_manager: Arc::new(RwLock::new(ConnectionManager::new())),
+            conn_manager: Arc::new(Mutex::new(ConnectionManager::new())),
             pending_accept_ids: Arc::new(Mutex::new(Vec::new())),
             src_addr,
             num_reader_workers: NUM_TX_WORKERS_FOR_SERVER_DEFAULT,
@@ -83,8 +85,8 @@ impl BluefinServer {
         let hello_key = format!("{}_0", src_conn_id);
         let _ = self
             .conn_manager
-            .write()
-            .await
+            .lock()
+            .unwrap()
             .insert(&hello_key, conn_mgr_buffers.clone());
         self.pending_accept_ids.lock().unwrap().push(src_conn_id);
 
@@ -101,10 +103,11 @@ impl BluefinServer {
         }
 
         // delete the old hello entry and insert the new connection entry
-        let mut guard = self.conn_manager.write().await;
-        let _ = guard.remove(&hello_key);
-        let _ = guard.insert(&key, conn_mgr_buffers);
-        drop(guard);
+        {
+            let mut guard = self.conn_manager.lock().unwrap();
+            let _ = guard.remove(&hello_key);
+            let _ = guard.insert(&key, conn_mgr_buffers);
+        }
 
         // send server hello
         let packet = build_empty_encrypted_packet(

@@ -5,15 +5,13 @@ use std::{
     time::Duration,
 };
 
-use tokio::{sync::RwLock, time::sleep};
-
 use crate::{
-    core::{error::BluefinError, packet::BluefinPacket},
-    utils::{
-        common::BluefinResult,
-        window::{SlidingWindow, SlidingWindowConsumeResult},
-    },
+    core::packet::BluefinPacket,
+    utils::window::{SlidingWindow, SlidingWindowConsumeResult},
 };
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
+use tokio::{sync::RwLock, time::sleep};
 
 #[derive(Clone)]
 pub(crate) struct AckBuffer {

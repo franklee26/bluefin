@@ -1,6 +1,7 @@
-use crate::utils::common::BluefinResult;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
 
-use super::{error::BluefinError, Serialisable};
+use super::Serialisable;
 
 /// 4 bits reserved for PacketType => 16 possible packet types
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

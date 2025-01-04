@@ -1,0 +1,31 @@
+[package]
+name = "bluefin"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bluefin-proto = { path = "../bluefin-proto" }
+local-ip-address = { workspace = true }
+rand = { workspace = true }
+rstest = { workspace = true }
+tokio = { workspace = true, features = ["full", "tracing"] }
+libc = { workspace = true }
+socket2 = { workspace = true }
+
+[dev-dependencies]
+local-ip-address = "0.6.3"
+rstest = "0.24.0"
+
+[[bin]]
+name = "client"
+path = "src/bin/client.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[lints]
+workspace = true

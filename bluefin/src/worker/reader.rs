@@ -5,20 +5,20 @@ use std::{
     task::Poll,
 };
 
-use tokio::{net::UdpSocket, sync::RwLock};
-
+use super::writer::WriterHandler;
 use crate::{
-    core::{context::BluefinHost, error::BluefinError, header::PacketType, packet::BluefinPacket},
+    core::{header::PacketType, packet::BluefinPacket},
     net::{
         ack_handler::AckBuffer,
         connection::{ConnectionBuffer, ConnectionManager},
         is_client_ack_packet, is_hello_packet, ConnectionManagedBuffers,
         MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
     },
-    utils::common::BluefinResult,
 };
-
-use super::writer::WriterHandler;
+use bluefin_proto::context::BluefinHost;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
+use tokio::{net::UdpSocket, sync::RwLock};
 
 #[derive(Clone)]
 /// [ReaderTxChannel] is the transmission channel for the receiving [ReaderRxChannel]. This channel will when
@@ -30,7 +30,7 @@ use super::writer::WriterHandler;
 pub(crate) struct ReaderTxChannel {
     pub(crate) id: u16,
     socket: Arc<UdpSocket>,
-    conn_manager: Arc<RwLock<ConnectionManager>>,
+    conn_manager: Arc<Mutex<ConnectionManager>>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     host_type: BluefinHost,
 }
@@ -119,7 +119,7 @@ impl ReaderRxChannel {
 impl ReaderTxChannel {
     pub(crate) fn new(
         socket: Arc<UdpSocket>,
-        conn_manager: Arc<RwLock<ConnectionManager>>,
+        conn_manager: Arc<Mutex<ConnectionManager>>,
         pending_accept_ids: Arc<Mutex<Vec<u32>>>,
         host_type: BluefinHost,
     ) -> Self {
@@ -270,7 +270,7 @@ impl ReaderTxChannel {
             let key = ReaderTxChannel::build_conn_buff_key(is_hello, src_conn_id, dst_conn_id);
             let _conn_buf = {
                 // ACQUIRE LOCK FOR CONN MANAGER
-                let guard = self.conn_manager.read().await;
+                let guard = self.conn_manager.lock().unwrap();
                 guard.get(&key)
                 // We just need the conn buffer, which is behind its own lock. We don't need the
                 // conn manager anymore.

@@ -1,6 +1,8 @@
-use crate::{core::header::BluefinHeader, utils::common::BluefinResult};
+use crate::core::header::BluefinHeader;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
 
-use super::{error::BluefinError, header::PacketType, Serialisable};
+use super::{header::PacketType, Serialisable};
 
 #[derive(Clone, Debug)]
 pub struct BluefinPacket {
@@ -153,10 +155,10 @@ impl BluefinPacketBuilder {
 #[cfg(test)]
 mod tests {
     use crate::core::{
-        error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         Serialisable,
     };
+    use bluefin_proto::error::BluefinError;
 
     use super::BluefinPacket;
 

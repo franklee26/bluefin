@@ -1,21 +1,20 @@
 use std::{cmp::min, collections::VecDeque, sync::Arc};
 
-use tokio::{
-    net::UdpSocket,
-    spawn,
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-};
-
 use crate::core::Extract;
 use crate::{
     core::{
-        error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
         Serialisable,
     },
     net::{MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM, MAX_BLUEFIN_PAYLOAD_SIZE_BYTES},
-    utils::common::BluefinResult,
+};
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
+use tokio::{
+    net::UdpSocket,
+    spawn,
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 
 /// Internal representation of an ack. These fields will be used to build a Bluefin ack packet.

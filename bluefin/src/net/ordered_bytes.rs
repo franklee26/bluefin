@@ -1,9 +1,7 @@
+use crate::core::packet::BluefinPacket;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
 use std::fmt;
-
-use crate::{
-    core::{error::BluefinError, packet::BluefinPacket},
-    utils::common::BluefinResult,
-};
 
 /// Represents the maximum number of *packets* we can buffer in memory. When bytes are consumed
 /// via [OrderedBytes::consume()], we can only consume at most [MAX_BUFFER_SIZE] number of packets.
@@ -262,12 +260,12 @@ impl OrderedBytes {
 mod tests {
     use crate::{
         core::{
-            error::BluefinError,
             header::{BluefinHeader, BluefinSecurityFields, PacketType},
             packet::BluefinPacket,
         },
         net::MAX_BLUEFIN_PAYLOAD_SIZE_BYTES,
     };
+    use bluefin_proto::error::BluefinError;
 
     use super::OrderedBytes;
 

@@ -4,21 +4,23 @@ use std::{
     time::Duration,
 };
 
-use rand::Rng;
-use tokio::{net::UdpSocket, sync::RwLock};
-
 use super::{
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
     AckBuffer, ConnectionManagedBuffers,
 };
 use crate::utils::get_udp_socket;
 use crate::{
-    core::{context::BluefinHost, error::BluefinError, header::PacketType, Serialisable},
+    core::{header::PacketType, Serialisable},
     net::{
         build_and_start_tx, build_empty_encrypted_packet, connection::HandshakeConnectionBuffer,
     },
-    utils::common::BluefinResult,
 };
+use bluefin_proto::context::BluefinHost;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::handshake::state_machine::HandshakeHandler;
+use bluefin_proto::BluefinResult;
+use rand::Rng;
+use tokio::net::UdpSocket;
 
 const NUM_TX_WORKERS_FOR_CLIENT_DEFAULT: u16 = 1;
 
@@ -26,8 +28,9 @@ pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
     src_addr: SocketAddr,
     dst_addr: Option<SocketAddr>,
-    conn_manager: Arc<RwLock<ConnectionManager>>,
+    conn_manager: Arc<Mutex<ConnectionManager>>,
     num_reader_workers: u16,
+    handshake_handler: HandshakeHandler,
 }
 
 impl BluefinClient {
@@ -35,9 +38,10 @@ impl BluefinClient {
         Self {
             socket: None,
             dst_addr: None,
-            conn_manager: Arc::new(RwLock::new(ConnectionManager::new())),
+            conn_manager: Arc::new(Mutex::new(ConnectionManager::new())),
             src_addr,
             num_reader_workers: NUM_TX_WORKERS_FOR_CLIENT_DEFAULT,
+            handshake_handler: HandshakeHandler::new(BluefinHost::Client),
         }
     }
 
@@ -56,6 +60,8 @@ impl BluefinClient {
         let socket = Arc::new(get_udp_socket(self.src_addr)?);
         self.socket = Some(Arc::clone(&socket));
         self.dst_addr = Some(dst_addr);
+
+        self.handshake_handler.begin()?;
 
         build_and_start_tx(
             self.num_reader_workers,
@@ -81,8 +87,8 @@ impl BluefinClient {
         // Register the connection
         let hello_key = format!("{}_0", src_conn_id);
         self.conn_manager
-            .write()
-            .await
+            .lock()
+            .unwrap()
             .insert(&hello_key, conn_mgrs_buffs.clone())?;
 
         // send the client hello
@@ -113,7 +119,7 @@ impl BluefinClient {
 
         // delete the old hello entry and insert the new connection entry
         {
-            let mut guard = self.conn_manager.write().await;
+            let mut guard = self.conn_manager.lock().unwrap();
             let _ = guard.remove(&hello_key);
             let _ = guard.insert(&key, conn_mgrs_buffs);
         }

@@ -1,18 +1,18 @@
 use std::sync::{Arc, Mutex};
 
-use ack_handler::{AckBuffer, AckConsumer};
-use connection::{ConnectionBuffer, ConnectionManager};
-use tokio::{net::UdpSocket, spawn, sync::RwLock};
-
 use crate::{
     core::{
-        context::BluefinHost,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
     },
-    utils::{common::BluefinResult, get_connected_udp_socket},
+    utils::get_connected_udp_socket,
     worker::{conn_reader::ConnReaderHandler, reader::ReaderTxChannel},
 };
+use ack_handler::{AckBuffer, AckConsumer};
+use bluefin_proto::context::BluefinHost;
+use bluefin_proto::BluefinResult;
+use connection::{ConnectionBuffer, ConnectionManager};
+use tokio::{net::UdpSocket, spawn, sync::RwLock};
 
 pub mod ack_handler;
 pub mod client;
@@ -37,7 +37,7 @@ pub(crate) struct ConnectionManagedBuffers {
 fn build_and_start_tx(
     num_tx_workers: u16,
     socket: Arc<UdpSocket>,
-    conn_manager: Arc<RwLock<ConnectionManager>>,
+    conn_manager: Arc<Mutex<ConnectionManager>>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     host_type: BluefinHost,
 ) {

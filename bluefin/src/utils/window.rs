@@ -1,8 +1,6 @@
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
 use std::collections::VecDeque;
-
-use crate::core::error::BluefinError;
-
-use super::common::BluefinResult;
 
 pub const MAX_SLIDING_WINDOW_SIZE: usize = 20000;
 
@@ -100,7 +98,8 @@ impl SlidingWindow {
 
 #[cfg(test)]
 mod tests {
-    use crate::{core::error::BluefinError, utils::window::MAX_SLIDING_WINDOW_SIZE};
+    use crate::utils::window::MAX_SLIDING_WINDOW_SIZE;
+    use bluefin_proto::error::BluefinError;
 
     use super::SlidingWindow;
 

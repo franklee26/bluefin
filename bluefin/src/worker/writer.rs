@@ -1,21 +1,20 @@
 use std::{cmp::min, collections::VecDeque, sync::Arc};
 
-use tokio::{
-    net::UdpSocket,
-    spawn,
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
-};
-
 use crate::core::Extract;
 use crate::{
     core::{
-        error::BluefinError,
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
         Serialisable,
     },
     net::{MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM, MAX_BLUEFIN_PAYLOAD_SIZE_BYTES},
-    utils::common::BluefinResult,
+};
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
+use tokio::{
+    net::UdpSocket,
+    spawn,
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
 };
 
 /// Internal representation of an ack. These fields will be used to build a Bluefin ack packet.
@@ -399,7 +398,6 @@ mod tests {
     };
 
     #[rstest]
-    #[test]
     #[case(550)]
     #[case(1)]
     #[case(10)]
@@ -444,7 +442,6 @@ mod tests {
     }
 
     #[rstest]
-    #[test]
     #[case(1000)]
     #[case(761)]
     #[case(1234)]
@@ -532,7 +529,6 @@ mod tests {
     #[case(55, 56)]
     #[case(3, 2000)]
     #[case(10, 123)]
-    #[test]
     fn writer_queue_consume_data_for_one_datagram_behaves_as_expected(
         #[case] num_iterations: usize,
         #[case] payload_size: usize,
@@ -606,7 +602,6 @@ mod tests {
     #[case(9, 15001)]
     #[case(1, 150000)]
     #[case(432, 234)]
-    #[test]
     fn writer_queue_consume_data_for_multiple_datagram_behaves_as_expected(
         #[case] num_iterations: usize,
         #[case] payload_size: usize,

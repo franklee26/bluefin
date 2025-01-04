@@ -1,5 +1,6 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
-use bluefin::{net::server::BluefinServer, utils::common::BluefinResult};
+use bluefin::net::server::BluefinServer;
+use bluefin_proto::BluefinResult;
 use std::{
     cmp::{max, min},
     net::{Ipv4Addr, SocketAddrV4},

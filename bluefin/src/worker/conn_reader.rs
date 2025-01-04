@@ -2,14 +2,14 @@ use tokio::net::UdpSocket;
 use tokio::spawn;
 use tokio::sync::mpsc::{self};
 
-use crate::core::error::BluefinError;
 use crate::core::header::PacketType;
 use crate::core::packet::BluefinPacket;
 use crate::core::Extract;
 use crate::net::ack_handler::AckBuffer;
 use crate::net::connection::ConnectionBuffer;
 use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
-use crate::utils::common::BluefinResult;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
 use std::sync::{Arc, MutexGuard};
 
 /// This is arbitrary number of worker tasks to use if we cannot decide how many worker tasks

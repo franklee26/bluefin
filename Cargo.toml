@@ -1,5 +1,8 @@
-[package]
-name = "bluefin"
+[workspace]
+members = ["bluefin", "bluefin-proto"]
+resolver = "2"
+
+[workspace.package]
 version = "0.1.6"
 edition = "2021"
 description = "An experimental, secure, P2P, transport-layer protocol."
@@ -8,7 +11,7 @@ repository = "https://github.com/franklee26/bluefin"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[dependencies]
+[workspace.dependencies]
 local-ip-address = "0.6.3"
 rand = "0.8.5"
 rstest = "0.23.0"
@@ -18,22 +21,7 @@ console-subscriber = "0.4.1"
 libc = "0.2.164"
 socket2 = "0.5.8"
 
-[dev-dependencies]
-local-ip-address = "0.6.3"
-rstest = "0.23.0"
-
-[lib]
-name = "bluefin"
-
-[[bin]]
-name = "client"
-path = "src/bin/client.rs"
-
-[[bin]]
-name = "server"
-path = "src/bin/server.rs"
-
-[lints.rust]
+[workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)', 'cfg(kani)'] }
 
 [profile.release]

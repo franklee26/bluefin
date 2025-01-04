@@ -4,9 +4,9 @@ use std::{
     time::Duration,
 };
 
-use bluefin::{
-    core::error::BluefinError, net::client::BluefinClient, utils::common::BluefinResult,
-};
+use bluefin::net::client::BluefinClient;
+use bluefin_proto::error::BluefinError;
+use bluefin_proto::BluefinResult;
 use tokio::{spawn, time::sleep};
 
 #[cfg_attr(coverage_nightly, coverage(off))]

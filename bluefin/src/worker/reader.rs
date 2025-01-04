@@ -18,7 +18,7 @@ use crate::{
 use bluefin_proto::context::BluefinHost;
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
-use tokio::{net::UdpSocket, sync::RwLock};
+use tokio::net::UdpSocket;
 
 #[derive(Clone)]
 /// [ReaderTxChannel] is the transmission channel for the receiving [ReaderRxChannel]. This channel will when

@@ -10,14 +10,13 @@ repository.workspace = true
 bluefin-proto = { path = "../bluefin-proto" }
 local-ip-address = { workspace = true }
 rand = { workspace = true }
-rstest = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
 libc = { workspace = true }
 socket2 = { workspace = true }
 
 [dev-dependencies]
 local-ip-address = "0.6.3"
-rstest = "0.24.0"
+rstest = { workspace = true }
 
 [[bin]]
 name = "client"

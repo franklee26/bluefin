@@ -398,7 +398,6 @@ mod tests {
     };
 
     #[rstest]
-    #[test]
     #[case(550)]
     #[case(1)]
     #[case(10)]
@@ -443,7 +442,6 @@ mod tests {
     }
 
     #[rstest]
-    #[test]
     #[case(1000)]
     #[case(761)]
     #[case(1234)]
@@ -531,7 +529,6 @@ mod tests {
     #[case(55, 56)]
     #[case(3, 2000)]
     #[case(10, 123)]
-    #[test]
     fn writer_queue_consume_data_for_one_datagram_behaves_as_expected(
         #[case] num_iterations: usize,
         #[case] payload_size: usize,
@@ -605,7 +602,6 @@ mod tests {
     #[case(9, 15001)]
     #[case(1, 150000)]
     #[case(432, 234)]
-    #[test]
     fn writer_queue_consume_data_for_multiple_datagram_behaves_as_expected(
         #[case] num_iterations: usize,
         #[case] payload_size: usize,

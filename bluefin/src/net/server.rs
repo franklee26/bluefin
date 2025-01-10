@@ -17,8 +17,8 @@ use crate::{
 use bluefin_proto::context::BluefinHost;
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
-use rand::Rng;
 use tokio::net::UdpSocket;
+use rand::{rng, Rng};
 
 const NUM_TX_WORKERS_FOR_SERVER_DEFAULT: u16 = 1;
 
@@ -69,9 +69,9 @@ impl BluefinServer {
 
     pub async fn accept(&mut self) -> BluefinResult<BluefinConnection> {
         // generate random conn id and insert buffer
-        let src_conn_id: u32 = rand::thread_rng().gen();
+        let src_conn_id: u32 = rng().random();
         // This is the packet number the server will begin using.
-        let packet_number: u64 = rand::thread_rng().gen();
+        let packet_number: u64 = rng().random();
         let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new(
             src_conn_id,
             BluefinHost::PackLeader,

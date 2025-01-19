@@ -19,3 +19,6 @@ rstest = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+macos-fast = []

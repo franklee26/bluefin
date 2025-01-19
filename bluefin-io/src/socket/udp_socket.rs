@@ -2,8 +2,9 @@ use crate::error::{BluefinIoError, BluefinIoResult};
 use crate::socket::cmsghdr::CmsghdrBufferHandler;
 use crate::socket::set_sock_opt;
 use libc::{c_int, sockaddr_storage};
+use std::cmp::min;
 use std::io::IoSliceMut;
-use std::mem::MaybeUninit;
+use std::mem::{zeroed, MaybeUninit};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::task::{Context, Poll};
@@ -13,11 +14,13 @@ use tokio::net::UdpSocket;
 pub struct BluefinSocket(UdpSocket);
 
 /// Aligns `T` to 8 byte boundaries
+#[derive(Clone, Copy)]
 #[repr(align(8))]
 pub(crate) struct Align<T>(T);
 
 // This is just a guess.
 const MSG_CONTROLLEN: usize = 8 * 10;
+const IOVEC_SIZE: usize = 8;
 
 pub struct BufMetadata {
     pub src_addr: SocketAddr,
@@ -37,6 +40,26 @@ pub struct TransmitData<'a> {
     src_addr: SocketAddr,
     dst_addr: SocketAddr,
     data: &'a [u8],
+}
+
+#[cfg(feature = "macos-fast")]
+#[repr(C)]
+pub(crate) struct msghdr_x {
+    pub msg_name: *mut libc::c_void,
+    pub msg_namelen: libc::socklen_t,
+    pub msg_iov: *mut libc::iovec,
+    pub msg_iovlen: c_int,
+    pub msg_control: *mut libc::c_void,
+    pub msg_controllen: libc::socklen_t,
+    pub msg_flags: c_int,
+    pub msg_datalen: usize,
+}
+
+#[cfg(feature = "macos-fast")]
+extern "C" {
+    fn recvmsg_x(s: c_int, msgp: *const msghdr_x, cnt: libc::c_uint, flags: c_int) -> isize;
+
+    fn sendmsg_x(s: c_int, msgp: *const msghdr_x, cnt: libc::c_uint, flags: c_int) -> isize;
 }
 
 impl TransmitData<'_> {
@@ -94,6 +117,26 @@ impl BluefinSocket {
         }
     }
 
+    #[cfg(not(feature = "macos-fast"))]
+    pub fn send_to(&self, transmit_data: &TransmitData) -> BluefinIoResult<usize> {
+        let msghdr = self.init_buf_for_send(transmit_data)?;
+        loop {
+            let size = unsafe { libc::sendmsg(self.0.as_raw_fd(), &msghdr, 0) };
+            // Successful send! Returns number of characters sent.
+            if size >= 0 {
+                return Ok(size as _);
+            }
+
+            // Else, we must have encountered an error. Let's see if we can recover.
+            let err = io::Error::last_os_error();
+            match err.kind() {
+                io::ErrorKind::Interrupted => continue,
+                _ => return Err(BluefinIoError::from(err)),
+            }
+        }
+    }
+
+    #[cfg(feature = "macos-fast")]
     pub fn send_to(&self, transmit_data: &TransmitData) -> BluefinIoResult<usize> {
         let msghdr = self.init_buf_for_send(transmit_data)?;
         loop {
@@ -113,6 +156,7 @@ impl BluefinSocket {
     }
 
     // Returns number of buffers filled
+    #[cfg(not(feature = "macos-fast"))]
     fn poll_recv_impl(
         &self,
         fd: c_int,
@@ -147,15 +191,55 @@ impl BluefinSocket {
             break n;
         };
 
-        unsafe {
-            // Try to get the name manually
-            let name: sockaddr_storage =
-                core::ptr::read(msghdr.msg_name as *const sockaddr_storage);
-            eprintln!("MANUAL CAST SS_FAMILY: {}", c_int::from(name.ss_family));
-        }
-
         // Write the metadata for the one buffer we filled
         metadata_bufs[0] = self.get_metadata_buf(&msg_name, num_bytes as _)?;
+
+        // Upon success, we touch just one buffer
+        Ok(1)
+    }
+
+    #[cfg(feature = "macos-fast")]
+    fn poll_recv_impl(
+        &self,
+        fd: c_int,
+        bufs: &mut [IoSliceMut<'_>],
+        metadata_bufs: &mut [BufMetadata],
+    ) -> BluefinIoResult<usize> {
+        let mut msg_names = [MaybeUninit::<sockaddr_storage>::uninit(); IOVEC_SIZE];
+        let mut msghdrxs = unsafe { zeroed::<[msghdr_x; IOVEC_SIZE]>() };
+        let mut msg_controls = [Align(MaybeUninit::<[u8; MSG_CONTROLLEN]>::uninit()); IOVEC_SIZE];
+        let size = min(bufs.len(), IOVEC_SIZE);
+        for ix in 0..size {
+            self.init_buf(
+                &mut bufs[ix],
+                &mut msg_names[ix],
+                &mut msghdrxs[ix],
+                &mut msg_controls[ix],
+            )?
+        }
+
+        let num_bytes = loop {
+            // TODO:
+            // Despite vectored io, we can only make use of one buf?
+            // Reproduced from recvmsg(2)
+            // https://man7.org/linux/man-pages/man2/recvmsg.2.html
+            //
+            // ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
+            // According to the manpage this syscall 'return(s) the length of the message
+            // on successful completion'.
+            let n = unsafe { recvmsg_x(fd, msghdrxs.as_mut_ptr(), size as _, 0) };
+            if n == -1 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(BluefinIoError::from(e));
+            }
+            break n;
+        };
+
+        // Write the metadata for the one buffer we filled
+        // metadata_bufs[0] = self.get_metadata_buf(&msg_name, num_bytes as _)?;
 
         // Upon success, we touch just one buffer
         Ok(1)
@@ -174,6 +258,7 @@ impl BluefinSocket {
     ///    int              msg_flags;       /* Flags on received message */
     /// };
     ///
+    #[cfg(not(feature = "macos-fast"))]
     #[inline]
     fn init_buf(
         &self,
@@ -195,6 +280,27 @@ impl BluefinSocket {
         msghdr.msg_flags = 0;
 
         Ok(msghdr)
+    }
+
+    #[cfg(feature = "macos-fast")]
+    #[inline]
+    fn init_buf(
+        &self,
+        buf: &mut IoSliceMut,
+        msg_name: &mut MaybeUninit<sockaddr_storage>,
+        msghdr_x: &mut msghdr_x,
+        msg_control: &mut Align<MaybeUninit<[u8; MSG_CONTROLLEN]>>,
+    ) -> BluefinIoResult<()> {
+        msghdr_x.msg_name = msg_name.as_mut_ptr() as _;
+        msghdr_x.msg_namelen = size_of::<sockaddr_storage>() as _;
+        msghdr_x.msg_iov = buf as *mut IoSliceMut as *mut libc::iovec;
+        msghdr_x.msg_iovlen = 1;
+        msghdr_x.msg_control = msg_control.0.as_mut_ptr() as _;
+        msghdr_x.msg_controllen = MSG_CONTROLLEN as _;
+        msghdr_x.msg_flags = 0;
+        msghdr_x.msg_controllen = buf.len() as _;
+
+        Ok(())
     }
 
     #[inline]

@@ -123,8 +123,8 @@ async fn basic_bluefin_socket_read_write(loopback_ip_addr: &Ipv4Addr) {
     });
 
     let transmit_data = TransmitData::new(tx_addr, rx_addr, &expected_data);
-    let bytes_sent = tx.send_to(&transmit_data).expect("Could not send data");
-    assert_eq!(bytes_sent, data_size);
+    let messages_sent = tx.send_to(&transmit_data).expect("Could not send data");
+    assert_eq!(messages_sent, 1);
 
     read_handle
         .await

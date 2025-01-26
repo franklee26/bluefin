@@ -22,6 +22,8 @@ pub(crate) struct Align<T>(T);
 const MSG_CONTROLLEN: usize = 8 * 10;
 const IOVEC_SIZE: usize = 8;
 
+const MAX_CHUNK_SIZE: usize = 1500;
+
 pub struct BufMetadata {
     pub src_addr: SocketAddr,
     pub len: usize,
@@ -42,7 +44,7 @@ pub struct TransmitData<'a> {
     data: &'a [u8],
 }
 
-#[cfg(feature = "macos-fast")]
+#[cfg(macos_fast)]
 #[repr(C)]
 pub(crate) struct msghdr_x {
     pub msg_name: *mut libc::c_void,
@@ -55,7 +57,7 @@ pub(crate) struct msghdr_x {
     pub msg_datalen: usize,
 }
 
-#[cfg(feature = "macos-fast")]
+#[cfg(macos_fast)]
 extern "C" {
     fn recvmsg_x(s: c_int, msgp: *const msghdr_x, cnt: libc::c_uint, flags: c_int) -> isize;
 
@@ -106,7 +108,7 @@ impl BluefinSocket {
             if self.0.poll_recv_ready(cx).is_pending() {
                 return Poll::Pending;
             }
-            eprintln!("Ready!");
+
             return match self.poll_recv_impl(self.0.as_raw_fd(), bufs, metadata_bufs) {
                 Ok(num_msgs) => Poll::Ready(num_msgs),
                 Err(e) => {
@@ -117,14 +119,14 @@ impl BluefinSocket {
         }
     }
 
-    #[cfg(not(feature = "macos-fast"))]
+    #[cfg(not(macos_fast))]
     pub fn send_to(&self, transmit_data: &TransmitData) -> BluefinIoResult<usize> {
         let msghdr = self.init_buf_for_send(transmit_data)?;
         loop {
             let size = unsafe { libc::sendmsg(self.0.as_raw_fd(), &msghdr, 0) };
             // Successful send! Returns number of characters sent.
             if size >= 0 {
-                return Ok(size as _);
+                return Ok(1);
             }
 
             // Else, we must have encountered an error. Let's see if we can recover.
@@ -136,14 +138,28 @@ impl BluefinSocket {
         }
     }
 
-    #[cfg(feature = "macos-fast")]
+    #[cfg(macos_fast)]
     pub fn send_to(&self, transmit_data: &TransmitData) -> BluefinIoResult<usize> {
-        let msghdr = self.init_buf_for_send(transmit_data)?;
+        let mut msghdrxs = unsafe { zeroed::<[msghdr_x; IOVEC_SIZE]>() };
+        let mut cnt = 0;
+        for (ix, bytes) in transmit_data
+            .data
+            .chunks(MAX_CHUNK_SIZE)
+            .enumerate()
+            .take(IOVEC_SIZE)
+        {
+            msghdrxs[ix] = self.init_buf_for_send(&TransmitData {
+                src_addr: transmit_data.src_addr,
+                dst_addr: transmit_data.dst_addr,
+                data: bytes,
+            })?;
+            cnt += 1;
+        }
         loop {
-            let size = unsafe { libc::sendmsg(self.0.as_raw_fd(), &msghdr, 0) };
+            let num_msgs = unsafe { sendmsg_x(self.0.as_raw_fd(), msghdrxs.as_ptr(), cnt, 0) };
             // Successful send! Returns number of characters sent.
-            if size >= 0 {
-                return Ok(size as _);
+            if num_msgs >= 0 {
+                return Ok(num_msgs as _);
             }
 
             // Else, we must have encountered an error. Let's see if we can recover.
@@ -156,7 +172,7 @@ impl BluefinSocket {
     }
 
     // Returns number of buffers filled
-    #[cfg(not(feature = "macos-fast"))]
+    #[cfg(not(macos_fast))]
     fn poll_recv_impl(
         &self,
         fd: c_int,
@@ -198,7 +214,7 @@ impl BluefinSocket {
         Ok(1)
     }
 
-    #[cfg(feature = "macos-fast")]
+    #[cfg(macos_fast)]
     fn poll_recv_impl(
         &self,
         fd: c_int,
@@ -218,7 +234,7 @@ impl BluefinSocket {
             )?
         }
 
-        let num_bytes = loop {
+        let num_messages = loop {
             // TODO:
             // Despite vectored io, we can only make use of one buf?
             // Reproduced from recvmsg(2)
@@ -238,8 +254,9 @@ impl BluefinSocket {
             break n;
         };
 
-        // Write the metadata for the one buffer we filled
-        // metadata_bufs[0] = self.get_metadata_buf(&msg_name, num_bytes as _)?;
+        for ix in 0..(num_messages as usize) {
+            metadata_bufs[ix] = self.get_metadata_buf(&msg_names[ix], msghdrxs[ix].msg_datalen)?;
+        }
 
         // Upon success, we touch just one buffer
         Ok(1)
@@ -258,7 +275,7 @@ impl BluefinSocket {
     ///    int              msg_flags;       /* Flags on received message */
     /// };
     ///
-    #[cfg(not(feature = "macos-fast"))]
+    #[cfg(not(macos_fast))]
     #[inline]
     fn init_buf(
         &self,
@@ -282,7 +299,7 @@ impl BluefinSocket {
         Ok(msghdr)
     }
 
-    #[cfg(feature = "macos-fast")]
+    #[cfg(macos_fast)]
     #[inline]
     fn init_buf(
         &self,
@@ -316,10 +333,6 @@ impl BluefinSocket {
         // SAFETY:
         // msg_name is always initialised and populated.
         let msg_name_unwrapped = unsafe { msg_name.assume_init() };
-        eprintln!(
-            "ss_len: {}, ss_family: {}",
-            msg_name_unwrapped.ss_len, msg_name_unwrapped.ss_family
-        );
         let src_addr = match c_int::from(msg_name_unwrapped.ss_family) {
             libc::AF_INET => {
                 // SAFETY:
@@ -358,9 +371,10 @@ impl BluefinSocket {
     ///    int              msg_flags;       /* Flags on received message */
     /// };
     ///
+    #[cfg(not(macos_fast))]
     fn init_buf_for_send(&self, transmit_data: &TransmitData<'_>) -> BluefinIoResult<libc::msghdr> {
-        let mut msghdr: libc::msghdr = unsafe { mem::zeroed() };
-        let mut msg_iov: libc::iovec = unsafe { mem::zeroed() };
+        let mut msghdr: libc::msghdr = unsafe { zeroed() };
+        let mut msg_iov: libc::iovec = unsafe { zeroed() };
         let mut msg_control = Align([0u8; MSG_CONTROLLEN]);
 
         // Set the actual data to be sent. Placed in msg_iov
@@ -398,5 +412,50 @@ impl BluefinSocket {
         msghdr.msg_namelen = dst_addr.len();
 
         Ok(msghdr)
+    }
+
+    #[cfg(macos_fast)]
+    fn init_buf_for_send(&self, transmit_data: &TransmitData<'_>) -> BluefinIoResult<msghdr_x> {
+        let mut msghdr_x: msghdr_x = unsafe { zeroed() };
+        let mut msg_iov: libc::iovec = unsafe { zeroed() };
+        let mut msg_control = Align([0u8; MSG_CONTROLLEN]);
+
+        // Set the actual data to be sent. Placed in msg_iov
+        msg_iov.iov_base = transmit_data.data.as_ptr() as _;
+        msg_iov.iov_len = transmit_data.data.len() as _;
+        msghdr_x.msg_iov = &mut msg_iov as *mut _;
+        msghdr_x.msg_iovlen = 1;
+
+        // Set the msg_control. We need to do this before using the handler to add data.
+        msghdr_x.msg_control = msg_control.0.as_mut_ptr() as _;
+        msghdr_x.msg_controllen = MSG_CONTROLLEN as _;
+
+        // To add ancillary data, we must use the cmsghdr handler.
+        /*
+        let mut cmsg_handler = CmsghdrBufferHandler::new(&msghdr);
+        match transmit_data.src_addr.ip() {
+            IpAddr::V4(addr) => {
+                let libc_in_addr = libc::in_addr {
+                    s_addr: u32::from_ne_bytes(addr.octets()),
+                };
+                cmsg_handler.append(libc::IPPROTO_IP, libc::IP_RECVDSTADDR, libc_in_addr)?;
+            }
+            _ => {
+                return Err(BluefinIoError::Unsupported(
+                    "Non ipv4 addr are currently unsupported".to_string(),
+                ))
+            }
+        }
+        */
+
+        // The socket is not connected so the dst addr is needed. This is set in the msg_name field
+        // and the length of this data is in msg_namelen.
+        // Cast this to socket2::SockAddr so we can get a pointer to it.
+        let dst_addr: &socket2::SockAddr = &transmit_data.dst_addr.into();
+        let dst_addr_ptr = dst_addr.as_ptr();
+        msghdr_x.msg_name = dst_addr_ptr as *mut _;
+        msghdr_x.msg_namelen = dst_addr.len();
+
+        Ok(msghdr_x)
     }
 }

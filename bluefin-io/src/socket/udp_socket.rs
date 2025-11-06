@@ -8,6 +8,7 @@ use std::os::fd::AsRawFd;
 use std::task::{Context, Poll};
 use std::{io, mem};
 use tokio::net::UdpSocket;
+use std::cmp::min;
 
 pub struct BluefinSocket(UdpSocket);
 

@@ -22,7 +22,6 @@ libc = "0.2.164"
 socket2 = "0.5.8"
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)', 'cfg(kani)'] }
 
 [profile.release]
 opt-level = 3

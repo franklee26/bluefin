@@ -1,11 +1,9 @@
 use crate::error::{BluefinIoError, BluefinIoResult};
-use crate::socket::cmsghdr::CmsghdrBufferHandler;
 use crate::socket::set_sock_opt;
 use libc::{c_int, sockaddr_storage};
-use std::cmp::min;
 use std::io::IoSliceMut;
 use std::mem::{zeroed, MaybeUninit};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::task::{Context, Poll};
 use std::{io, mem};
@@ -19,7 +17,7 @@ pub struct BluefinSocket(UdpSocket);
 pub(crate) struct Align<T>(T);
 
 // This is just a guess.
-const MSG_CONTROLLEN: usize = 8 * 10;
+const MSG_CONTROLLEN: usize = 8 * 11;
 const IOVEC_SIZE: usize = 8;
 
 const MAX_CHUNK_SIZE: usize = 1500;
@@ -89,7 +87,15 @@ impl BluefinSocket {
 
         let fd = udp_sock.as_raw_fd();
         set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, 1)?;
+        #[cfg(macos)]
         set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, 1)?;
+
+        #[cfg(linux)]
+        {
+            // set_sock_opt(fd, libc::SOL_UDP, libc::UDP_GRO, 1)?;
+            set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_PKTINFO, 1)?;
+            set_sock_opt(fd, libc::SOL_UDP, libc::UDP_SEGMENT, 1500)?;
+        }
 
         let udp_sock: std::net::UdpSocket = udp_sock.into();
         let socket = udp_sock.try_into()?;
@@ -121,7 +127,16 @@ impl BluefinSocket {
 
     #[cfg(not(macos_fast))]
     pub fn send_to(&self, transmit_data: &TransmitData) -> BluefinIoResult<usize> {
-        let msghdr = self.init_buf_for_send(transmit_data)?;
+        let mut msghdr: libc::msghdr = unsafe { zeroed() };
+        let mut msg_iov: libc::iovec = unsafe { zeroed() };
+        let dst_addr = socket2::SockAddr::from(transmit_data.dst_addr);
+        
+        self.init_buf_for_send(
+            transmit_data,
+            &mut msghdr,
+            &mut msg_iov,
+            &dst_addr,
+        )?;
         loop {
             let size = unsafe { libc::sendmsg(self.0.as_raw_fd(), &msghdr, 0) };
             // Successful send! Returns number of characters sent.
@@ -372,29 +387,59 @@ impl BluefinSocket {
     /// };
     ///
     #[cfg(not(macos_fast))]
-    fn init_buf_for_send(&self, transmit_data: &TransmitData<'_>) -> BluefinIoResult<libc::msghdr> {
-        let mut msghdr: libc::msghdr = unsafe { zeroed() };
-        let mut msg_iov: libc::iovec = unsafe { zeroed() };
-        let mut msg_control = Align([0u8; MSG_CONTROLLEN]);
-
+    fn init_buf_for_send(
+        &self,
+        transmit_data: &TransmitData<'_>,
+        msghdr: &mut libc::msghdr,
+        msg_iov: &mut libc::iovec,
+        dst_addr: &socket2::SockAddr,
+    ) -> BluefinIoResult<()> {
         // Set the actual data to be sent. Placed in msg_iov
         msg_iov.iov_base = transmit_data.data.as_ptr() as _;
-        msg_iov.iov_len = transmit_data.data.len() as _;
-        msghdr.msg_iov = &mut msg_iov as *mut _;
+        msg_iov.iov_len = transmit_data.data.len();
+        
+        // Use the dst_addr parameter that was passed in (which has the correct lifetime)
+        msghdr.msg_name = dst_addr.as_ptr() as *mut _;
+        msghdr.msg_namelen = dst_addr.len();
+
+        msghdr.msg_iov = msg_iov;
         msghdr.msg_iovlen = 1;
 
-        // Set the msg_control. We need to do this before using the handler to add data.
-        msghdr.msg_control = msg_control.0.as_mut_ptr() as _;
-        msghdr.msg_controllen = MSG_CONTROLLEN as _;
+        // Set the msg_control to null since we're not using ancillary data
+        msghdr.msg_control = std::ptr::null_mut();
+        msghdr.msg_controllen = 0;
+
+        // The socket is not connected so the dst addr is needed. This is set in the msg_name field
+        // and the length of this data is in msg_namelen.
+        // Cast this to socket2::SockAddr so we can get a pointer to it.
+        // let dst_addr: &socket2::SockAddr = &transmit_data.dst_addr.into();
+        // let dst_addr_ptr = dst_addr.as_ptr();
+        // msghdr.msg_name = dst_addr_ptr as *mut libc::c_void as *mut _;
+        // msghdr.msg_namelen = dst_addr.len();
 
         // To add ancillary data, we must use the cmsghdr handler.
+        /*
         let mut cmsg_handler = CmsghdrBufferHandler::new(&msghdr);
         match transmit_data.src_addr.ip() {
             IpAddr::V4(addr) => {
-                let libc_in_addr = libc::in_addr {
-                    s_addr: u32::from_ne_bytes(addr.octets()),
-                };
-                cmsg_handler.append(libc::IPPROTO_IP, libc::IP_RECVDSTADDR, libc_in_addr)?;
+                #[cfg(any(macos, macos_fast))]
+                {
+                    let libc_in_addr = libc::in_addr {
+                        s_addr: u32::from_ne_bytes(addr.octets()),
+                    };
+                    cmsg_handler.append(libc::IPPROTO_IP, libc::IP_RECVDSTADDR, libc_in_addr)?;
+                }
+                #[cfg(linux)]
+                {
+                    let pktinfo = libc::in_pktinfo {
+                        ipi_ifindex: 0,
+                        ipi_spec_dst: libc::in_addr {
+                            s_addr: u32::from_ne_bytes(addr.octets()),
+                        },
+                        ipi_addr: libc::in_addr { s_addr: 0 },
+                    };
+                    cmsg_handler.append(libc::IPPROTO_IP, libc::IP_PKTINFO, pktinfo)?;
+                }
             }
             _ => {
                 return Err(BluefinIoError::Unsupported(
@@ -402,16 +447,9 @@ impl BluefinSocket {
                 ))
             }
         }
+         */
 
-        // The socket is not connected so the dst addr is needed. This is set in the msg_name field
-        // and the length of this data is in msg_namelen.
-        // Cast this to socket2::SockAddr so we can get a pointer to it.
-        let dst_addr: &socket2::SockAddr = &transmit_data.dst_addr.into();
-        let dst_addr_ptr = dst_addr.as_ptr();
-        msghdr.msg_name = dst_addr_ptr as *mut _;
-        msghdr.msg_namelen = dst_addr.len();
-
-        Ok(msghdr)
+        Ok(())
     }
 
     #[cfg(macos_fast)]

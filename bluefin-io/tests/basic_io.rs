@@ -98,8 +98,8 @@ impl Future for Recv<'_> {
 #[timeout(Duration::from_secs(5))]
 #[tokio::test]
 async fn basic_bluefin_socket_read_write(loopback_ip_addr: &Ipv4Addr) {
-    let rx_addr = SocketAddr::V4(SocketAddrV4::new(*loopback_ip_addr, 1350));
-    let tx_addr = SocketAddr::V4(SocketAddrV4::new(*loopback_ip_addr, 1351));
+    let rx_addr = SocketAddr::V4(SocketAddrV4::new(*loopback_ip_addr, 7760));
+    let tx_addr = SocketAddr::V4(SocketAddrV4::new(*loopback_ip_addr, 7761));
     let rx = BluefinSocketRead::new(rx_addr);
     let tx = BluefinSocketRead::new(tx_addr);
 

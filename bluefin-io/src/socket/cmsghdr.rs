@@ -62,7 +62,7 @@ impl<'a> CmsghdrBufferHandler<'a> {
         cmsghdr.cmsg_level = cmsg_level;
         cmsghdr.cmsg_type = cmsg_type;
         // size_of_val() is insufficient here. As stated in cmsg(3), we need to consider alignment.
-        cmsghdr.cmsg_len = unsafe { libc::CMSG_LEN(size_of_val(&cmsg_data) as _) };
+        cmsghdr.cmsg_len = unsafe { libc::CMSG_LEN(size_of_val(&cmsg_data) as _) as _ };
 
         // Now finally write the data
         // First use CMSG_DATA() to get a pointer to the data portion of cmsghdr.

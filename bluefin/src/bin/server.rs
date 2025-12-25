@@ -24,7 +24,7 @@ async fn run() -> BluefinResult<()> {
         Ipv4Addr::new(127, 0, 0, 1),
         1318,
     )));
-    server.set_num_reader_workers(3)?;
+    server.set_num_reader_workers(2)?;
     server.bind().await?;
     let mut join_set = JoinSet::new();
 

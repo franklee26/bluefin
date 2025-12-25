@@ -49,7 +49,7 @@ async fn main() -> BluefinResult<()> {
                 total_bytes += size;
                 println!("Sent {} bytes", size);
 
-                let my_array = [0u8; 1500];
+                let my_array = [0u8; 1000];
                 for ix in 0..10000000 {
                     // let my_array: [u8; 32] = rand::random();
                     size = conn.send(&my_array)?;

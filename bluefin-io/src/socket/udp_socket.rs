@@ -1,14 +1,16 @@
 use crate::error::{BluefinIoError, BluefinIoResult};
 use crate::socket::set_sock_opt;
 use libc::{c_int, sockaddr_storage};
+use std::cmp::min;
+use std::io;
 use std::io::IoSliceMut;
+#[cfg(not(macos_fast))]
+use std::mem;
 use std::mem::{zeroed, MaybeUninit};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
 use std::task::{Context, Poll};
-use std::{io, mem};
 use tokio::net::UdpSocket;
-use std::cmp::min;
 
 pub struct BluefinSocket(UdpSocket);
 
@@ -131,13 +133,8 @@ impl BluefinSocket {
         let mut msghdr: libc::msghdr = unsafe { zeroed() };
         let mut msg_iov: libc::iovec = unsafe { zeroed() };
         let dst_addr = socket2::SockAddr::from(transmit_data.dst_addr);
-        
-        self.init_buf_for_send(
-            transmit_data,
-            &mut msghdr,
-            &mut msg_iov,
-            &dst_addr,
-        )?;
+
+        self.init_buf_for_send(transmit_data, &mut msghdr, &mut msg_iov, &dst_addr)?;
         loop {
             let size = unsafe { libc::sendmsg(self.0.as_raw_fd(), &msghdr, 0) };
             // Successful send! Returns number of characters sent.
@@ -398,7 +395,7 @@ impl BluefinSocket {
         // Set the actual data to be sent. Placed in msg_iov
         msg_iov.iov_base = transmit_data.data.as_ptr() as _;
         msg_iov.iov_len = transmit_data.data.len();
-        
+
         // Use the dst_addr parameter that was passed in (which has the correct lifetime)
         msghdr.msg_name = dst_addr.as_ptr() as *mut _;
         msghdr.msg_namelen = dst_addr.len();

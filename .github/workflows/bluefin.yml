@@ -28,6 +28,12 @@ jobs:
         run: cargo build --verbose
       - name: Run tests
         run: cargo test --verbose
+      - name: Build w/ macos-fast
+        if: runner.os == 'macOS'
+        run: cargo build --verbose --features macos-fast
+      - name: Run test w/ macos-fast
+        if: runner.os == 'macOS'
+        run: cargo test --verbose --features macos-fast
 
   coverage:
     runs-on: ubuntu-latest

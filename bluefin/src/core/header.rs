@@ -130,6 +130,23 @@ impl BluefinHeader {
     pub fn with_packet_number(&mut self, packet_number: u64) {
         self.packet_number = packet_number;
     }
+
+    /// Zero-copy serialization: writes header directly into provided buffer.
+    /// Returns the number of bytes written (always 20 for BluefinHeader).
+    /// Buffer must be at least 20 bytes.
+    #[inline]
+    pub fn serialise_into(&self, buf: &mut [u8]) -> usize {
+        debug_assert!(buf.len() >= 20, "Buffer must be at least 20 bytes for header");
+        
+        buf[0] = (self.version << 4) | self.type_field as u8;
+        buf[1..3].copy_from_slice(&self.type_specific_payload.to_be_bytes());
+        buf[3] = self.security_fields.serialise()[0];
+        buf[4..8].copy_from_slice(&self.source_connection_id.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.destination_connection_id.to_be_bytes());
+        buf[12..20].copy_from_slice(&self.packet_number.to_be_bytes());
+        
+        20
+    }
 }
 
 impl Serialisable for BluefinHeader {

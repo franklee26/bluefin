@@ -5,7 +5,6 @@ use crate::{
     core::{
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         packet::BluefinPacket,
-        Serialisable,
     },
     net::{MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM, MAX_BLUEFIN_PAYLOAD_SIZE_BYTES},
 };
@@ -205,9 +204,9 @@ impl WriterHandler {
         src_conn_id: u32,
         dst_conn_id: u32,
     ) -> Option<Vec<u8>> {
-        let mut ans = vec![];
+        let mut ans = Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
         let mut bytes_remaining = MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM;
-        let mut running_payload = vec![];
+        let mut running_payload = Vec::with_capacity(MAX_BLUEFIN_PAYLOAD_SIZE_BYTES);
 
         let security_fields = BluefinSecurityFields::new(false, 0x0);
         let mut header = BluefinHeader::new(
@@ -234,14 +233,20 @@ impl WriterHandler {
                         .header(header)
                         .payload(running_payload[..max_bytes_to_take].to_vec())
                         .build();
-                    ans.extend(p.serialise());
+                    let current_len = ans.len();
+                    let packet_len = p.len();
+                    ans.reserve(packet_len);
+                    unsafe {
+                        ans.set_len(current_len + packet_len);
+                    }
+                    p.serialise_into(&mut ans[current_len..]);
                     *next_packet_num += 1;
                     bytes_remaining -= max_bytes_to_take + 20;
-                    running_payload = running_payload[max_bytes_to_take..].to_vec();
+                    running_payload.drain(..max_bytes_to_take);
                 }
 
                 if !running_payload.is_empty() {
-                    queue.push_front(running_payload.to_vec());
+                    queue.push_front(running_payload);
                 }
                 return Some(ans);
             }
@@ -258,10 +263,16 @@ impl WriterHandler {
                     .header(header)
                     .payload(running_payload[..max_bytes_to_take].to_vec())
                     .build();
-                ans.extend(p.serialise());
+                let current_len = ans.len();
+                let packet_len = p.len();
+                ans.reserve(packet_len);
+                unsafe {
+                    ans.set_len(current_len + packet_len);
+                }
+                p.serialise_into(&mut ans[current_len..]);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
-                running_payload = running_payload[max_bytes_to_take..].to_vec();
+                running_payload.drain(..max_bytes_to_take);
                 continue;
             }
 
@@ -283,7 +294,13 @@ impl WriterHandler {
                     .header(header)
                     .payload(running_payload[..max_bytes_to_take].to_vec())
                     .build();
-                ans.extend(packet.serialise());
+                let current_len = ans.len();
+                let packet_len = packet.len();
+                ans.reserve(packet_len);
+                unsafe {
+                    ans.set_len(current_len + packet_len);
+                }
+                packet.serialise_into(&mut ans[current_len..]);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
                 running_payload = running_payload[max_bytes_to_take..].to_vec();
@@ -305,7 +322,13 @@ impl WriterHandler {
                 .header(header)
                 .payload(running_payload[..max_bytes_to_take].to_vec())
                 .build();
-            ans.extend(p.serialise());
+            let current_len = ans.len();
+            let packet_len = p.len();
+            ans.reserve(packet_len);
+            unsafe {
+                ans.set_len(current_len + packet_len);
+            }
+            p.serialise_into(&mut ans[current_len..]);
             *next_packet_num += 1;
             running_payload = running_payload[max_bytes_to_take..].to_vec();
             bytes_remaining -= max_bytes_to_take + 20;
@@ -327,7 +350,7 @@ impl WriterHandler {
         src_conn_id: u32,
         dst_conn_id: u32,
     ) -> Option<Vec<u8>> {
-        let mut bytes = vec![];
+        let mut bytes = Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
         let security_fields = BluefinSecurityFields::new(false, 0x0);
         let mut header = BluefinHeader::new(
             src_conn_id,
@@ -341,7 +364,12 @@ impl WriterHandler {
             header.packet_number = data.base_packet_num;
             header.type_specific_payload = data.num_packets_consumed as u16;
             if bytes.len() + 20 <= MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM {
-                bytes.extend(header.serialise());
+                let current_len = bytes.len();
+                bytes.reserve(20);
+                unsafe {
+                    bytes.set_len(current_len + 20);
+                }
+                header.serialise_into(&mut bytes[current_len..]);
             } else {
                 queue.push_front(data);
                 break;

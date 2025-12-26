@@ -41,12 +41,24 @@ impl SlidingWindow {
             ));
         }
 
-        // Find the index to insert into our sorted vector.
+        // Fast path: if empty or packet goes at end (common case for in-order delivery)
+        if self.ordered_packet_numbers.is_empty() {
+            self.ordered_packet_numbers.push_back(packet_number);
+            return Ok(());
+        }
+        
+        if let Some(&last) = self.ordered_packet_numbers.back() {
+            if packet_number > last {
+                self.ordered_packet_numbers.push_back(packet_number);
+                return Ok(());
+            } else if packet_number == last {
+                return Err(BluefinError::UnexpectedPacketNumberError);
+            }
+        }
+
+        // Slow path: binary search for out-of-order packets
         let index = match self.ordered_packet_numbers.binary_search(&packet_number) {
-            // Ok result means we have already stored this packet number before. Fail here.
             Ok(_) => return Err(BluefinError::UnexpectedPacketNumberError),
-            // We have found the index to insert this number in. It is possible this index
-            // is much to large for our vector.
             Err(index) => index,
         };
 

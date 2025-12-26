@@ -20,6 +20,7 @@ tokio = { version = "1.42.0", features = ["full", "tracing"] }
 console-subscriber = "0.5.0"
 libc = "0.2.164"
 socket2 = { version = "0.6.1", features = ["all"] }
+bytes = "1.9.0"
 
 [workspace.lints.rust]
 

@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use bluefin_io::socket::udp_socket::BluefinSocket;
 use bluefin_proto::BluefinResult;
 use tokio::net::UdpSocket;
 
@@ -36,6 +37,12 @@ fn get_udp_socket_impl(src_addr: SocketAddr) -> BluefinResult<socket2::Socket> {
     udp_sock.set_reuse_port(true)?;
     udp_sock.set_cloexec(true)?;
     udp_sock.set_nonblocking(true).unwrap();
+    
+    // Set large socket buffers for high-throughput HFT scenarios
+    // 8MB buffers prevent packet drops during burst traffic
+    udp_sock.set_recv_buffer_size(8 * 1024 * 1024)?;  // 8MB recv buffer
+    udp_sock.set_send_buffer_size(8 * 1024 * 1024)?;  // 8MB send buffer
+    
     udp_sock.bind(&socket2::SockAddr::from(src_addr))?;
     Ok(udp_sock)
 }

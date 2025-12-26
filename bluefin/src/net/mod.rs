@@ -12,7 +12,7 @@ use ack_handler::{AckBuffer, AckConsumer};
 use bluefin_proto::context::BluefinHost;
 use bluefin_proto::BluefinResult;
 use connection::{ConnectionBuffer, ConnectionManager};
-use tokio::{net::UdpSocket, spawn, sync::RwLock};
+use tokio::{net::UdpSocket, spawn};
 
 pub mod ack_handler;
 pub mod client;
@@ -37,7 +37,7 @@ pub(crate) struct ConnectionManagedBuffers {
 fn build_and_start_tx(
     num_tx_workers: u16,
     socket: Arc<UdpSocket>,
-    conn_manager: Arc<Mutex<ConnectionManager>>,
+    conn_manager: Arc<ConnectionManager>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     host_type: BluefinHost,
 ) {
@@ -66,7 +66,7 @@ fn build_and_start_ack_consumer_workers(
     num_ack_consumer_workers: u8,
     ack_buffer: Arc<Mutex<AckBuffer>>,
 ) {
-    let largest_recv_acked_packet_num = Arc::new(RwLock::new(0));
+    let largest_recv_acked_packet_num = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let ack_consumer = AckConsumer::new(Arc::clone(&ack_buffer), largest_recv_acked_packet_num);
 
     for _ in 0..num_ack_consumer_workers {

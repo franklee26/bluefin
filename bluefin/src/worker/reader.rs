@@ -30,7 +30,7 @@ use tokio::net::UdpSocket;
 pub(crate) struct ReaderTxChannel {
     pub(crate) id: u16,
     socket: Arc<UdpSocket>,
-    conn_manager: Arc<Mutex<ConnectionManager>>,
+    conn_manager: Arc<ConnectionManager>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     host_type: BluefinHost,
 }
@@ -64,7 +64,7 @@ impl Future for ReaderRxChannelFuture {
             return Poll::Ready(());
         }
 
-        guard.set_waker(cx.waker().clone());
+        guard.set_waker_if_changed(cx.waker());
         Poll::Pending
     }
 }
@@ -119,7 +119,7 @@ impl ReaderRxChannel {
 impl ReaderTxChannel {
     pub(crate) fn new(
         socket: Arc<UdpSocket>,
-        conn_manager: Arc<Mutex<ConnectionManager>>,
+        conn_manager: Arc<ConnectionManager>,
         pending_accept_ids: Arc<Mutex<Vec<u32>>>,
         host_type: BluefinHost,
     ) -> Self {
@@ -142,9 +142,11 @@ impl ReaderTxChannel {
         if is_hello_packet(self.host_type, &packet) {
             match self.host_type {
                 BluefinHost::PackLeader => {
-                    // Choose a conn id to buffer this in FIFO
-                    if let Some(id) = self.pending_accept_ids.lock().unwrap().pop() {
-                        *src_conn_id = id;
+                    // Choose a conn id to buffer this in FIFO order
+                    // Use remove(0) instead of pop() to get first element (FIFO)
+                    let mut pending = self.pending_accept_ids.lock().unwrap();
+                    if !pending.is_empty() {
+                        *src_conn_id = pending.remove(0);
                         *is_hello = true;
                         return Ok(());
                     } else {
@@ -169,11 +171,11 @@ impl ReaderTxChannel {
     }
 
     #[inline]
-    fn build_conn_buff_key(is_hello: bool, src_conn_id: u32, dst_conn_id: u32) -> String {
+    fn build_conn_buff_key(is_hello: bool, src_conn_id: u32, dst_conn_id: u32) -> (u32, u32) {
         if !is_hello {
-            format!("{}_{}", src_conn_id, dst_conn_id)
+            (src_conn_id, dst_conn_id)
         } else {
-            format!("{}_0", src_conn_id)
+            (src_conn_id, 0)
         }
     }
 
@@ -235,7 +237,11 @@ impl ReaderTxChannel {
         let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
 
         loop {
-            let (size, addr) = self.socket.recv_from(&mut buf).await?;
+            // Try non-blocking recv first for lower latency when packets are queued
+            let (size, addr) = match self.socket.try_recv_from(&mut buf) {
+                Ok(result) => result,
+                Err(_) => self.socket.recv_from(&mut buf).await?,
+            };
             let packets_res = BluefinPacket::from_bytes(&buf[..size]);
 
             // Not bluefin packet(s) or it's invalid.
@@ -269,16 +275,12 @@ impl ReaderTxChannel {
 
             let key = ReaderTxChannel::build_conn_buff_key(is_hello, src_conn_id, dst_conn_id);
             let _conn_buf = {
-                // ACQUIRE LOCK FOR CONN MANAGER
-                let guard = self.conn_manager.lock().unwrap();
-                guard.get(&key)
-                // We just need the conn buffer, which is behind its own lock. We don't need the
-                // conn manager anymore.
-                // RELEASE LOCK FOR CONN MANAGER
+                // Lock-free lookup with DashMap - no contention!
+                self.conn_manager.get(&key).map(|entry| entry.value().clone())
             };
 
             if _conn_buf.is_none() {
-                eprintln!("Could not find connection {}", &key);
+                eprintln!("Could not find connection ({}, {})", key.0, key.1);
                 continue;
             }
 

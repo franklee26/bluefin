@@ -28,7 +28,7 @@ pub struct BluefinClient {
     socket: Option<Arc<UdpSocket>>,
     src_addr: SocketAddr,
     dst_addr: Option<SocketAddr>,
-    conn_manager: Arc<Mutex<ConnectionManager>>,
+    conn_manager: Arc<ConnectionManager>,
     num_reader_workers: u16,
     handshake_handler: HandshakeHandler,
 }
@@ -38,7 +38,7 @@ impl BluefinClient {
         Self {
             socket: None,
             dst_addr: None,
-            conn_manager: Arc::new(Mutex::new(ConnectionManager::new())),
+            conn_manager: Arc::new(dashmap::DashMap::new()),
             src_addr,
             num_reader_workers: NUM_TX_WORKERS_FOR_CLIENT_DEFAULT,
             handshake_handler: HandshakeHandler::new(BluefinHost::Client),
@@ -71,8 +71,8 @@ impl BluefinClient {
             BluefinHost::Client,
         );
 
-        let src_conn_id: u32 = rand::thread_rng().gen();
-        let packet_number: u64 = rand::thread_rng().gen();
+        let src_conn_id: u32 = rand::rng().random();
+        let packet_number: u64 = rand::rng().random();
         let conn_buffer = Arc::new(Mutex::new(ConnectionBuffer::new(
             src_conn_id,
             BluefinHost::Client,
@@ -85,11 +85,10 @@ impl BluefinClient {
         let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
 
         // Register the connection
-        let hello_key = format!("{}_0", src_conn_id);
-        self.conn_manager
-            .lock()
-            .unwrap()
-            .insert(&hello_key, conn_mgrs_buffs.clone())?;
+        let hello_key = (src_conn_id, 0);
+        if self.conn_manager.insert(hello_key, conn_mgrs_buffs.clone()).is_some() {
+            return Err(BluefinError::ConnectionAlreadyExists);
+        }
 
         // send the client hello
         let packet = build_empty_encrypted_packet(
@@ -110,7 +109,7 @@ impl BluefinClient {
             .read_with_timeout(server_hello_timeout)
             .await?;
         let dst_conn_id = server_hello.header.source_connection_id;
-        let key = format!("{}_{}", src_conn_id, dst_conn_id);
+        let key = (src_conn_id, dst_conn_id);
         let server_packet_number = server_hello.header.packet_number;
         // Bluefin handshake asserts that the initial packet numbers cannot be zero
         if server_packet_number == 0x0 {
@@ -118,10 +117,11 @@ impl BluefinClient {
         }
 
         // delete the old hello entry and insert the new connection entry
-        {
-            let mut guard = self.conn_manager.lock().unwrap();
-            let _ = guard.remove(&hello_key);
-            let _ = guard.insert(&key, conn_mgrs_buffs);
+        if self.conn_manager.remove(&hello_key).is_none() {
+            return Err(BluefinError::NoSuchConnectionError);
+        }
+        if self.conn_manager.insert(key, conn_mgrs_buffs).is_some() {
+            return Err(BluefinError::ConnectionAlreadyExists);
         }
 
         // send the client ack

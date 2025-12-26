@@ -24,13 +24,30 @@ async fn run() -> BluefinResult<()> {
         Ipv4Addr::new(127, 0, 0, 1),
         1318,
     )));
-    server.set_num_reader_workers(2)?;
+    server.set_num_reader_workers(3)?;
     server.bind().await?;
     let mut join_set = JoinSet::new();
 
-    let mut _num = 0;
-    while let Ok(mut conn) = server.accept().await {
+    const NUM_EXPECTED_CONNECTIONS: usize = 2;
+    let mut connections = Vec::with_capacity(NUM_EXPECTED_CONNECTIONS);
+    
+    // Accept all connections FIRST before spawning any processing tasks
+    // This avoids the race where processing one connection blocks accepting the next
+    for _conn_num in 0..NUM_EXPECTED_CONNECTIONS {
+        match server.accept().await {
+            Ok(conn) => {
+                connections.push((_conn_num, conn));
+            }
+            Err(_e) => {
+                // Connection failed to accept
+            }
+        }
+    }
+    
+    // Now spawn processing tasks for all accepted connections
+    for (conn_num, mut conn) in connections {
         let _ = join_set.spawn(async move {
+            let _num = conn_num;
                     let mut total_bytes = 0;
                     let mut recv_bytes = [0u8; 10000];
                     let mut min_bytes = usize::MAX;
@@ -104,11 +121,7 @@ async fn run() -> BluefinResult<()> {
                         }
                         iteration += 1;
                     }
-        });
-        _num += 1;
-        if _num >= 2 {
-            break;
-        }
+                });
     }
 
     join_set.join_all().await;

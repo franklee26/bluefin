@@ -30,8 +30,7 @@ impl Serialisable for BluefinPacket {
     #[inline]
     fn serialise(&self) -> Vec<u8> {
         let mut header_bytes = self.header.serialise();
-        let mut payload_bytes = self.payload.clone();
-        header_bytes.append(&mut payload_bytes);
+        header_bytes.extend_from_slice(&self.payload);
 
         header_bytes
     }
@@ -78,6 +77,23 @@ impl BluefinPacket {
     pub fn len(&self) -> usize {
         // Header is always 20 bytes
         self.payload.len() + 20
+    }
+
+    /// Zero-copy serialization: writes packet directly into provided buffer.
+    /// Returns the number of bytes written (20 + payload.len()).
+    /// Buffer must be at least 20 + payload.len() bytes.
+    #[inline]
+    pub fn serialise_into(&self, buf: &mut [u8]) -> usize {
+        let total_len = 20 + self.payload.len();
+        debug_assert!(buf.len() >= total_len, "Buffer too small for packet serialization");
+        
+        // Write header directly (20 bytes)
+        self.header.serialise_into(&mut buf[..20]);
+        
+        // Write payload directly (no clone!)
+        buf[20..total_len].copy_from_slice(&self.payload);
+        
+        total_len
     }
 
     /// Converts an array of bytes into a vector of bluefin packets. The array of bytes must be

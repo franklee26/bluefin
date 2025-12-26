@@ -2,7 +2,7 @@ use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
 use std::collections::VecDeque;
 
-pub const MAX_SLIDING_WINDOW_SIZE: usize = 20000;
+pub const MAX_SLIDING_WINDOW_SIZE: usize = 40000;
 
 #[derive(Clone)]
 pub(crate) struct SlidingWindow {

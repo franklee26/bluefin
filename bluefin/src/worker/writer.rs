@@ -147,18 +147,27 @@ impl WriterHandler {
             .map(|_| Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM))
             .collect();
         let mut b = Vec::with_capacity(limit);
-        let mut pending_send: Option<Vec<u8>> = None;
-        loop {
-            // Try to send pending data first
-            if let Some(data) = pending_send.take() {
-                if socket.try_send(&data).is_err() {
-                    // Still can't send, wait for writable and continue
-                    pending_send = Some(data);
-                    let _ = socket.writable().await;
-                    continue;
+        
+        // Channel for parallel sends - decouple packetization from sending
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        
+        // Spawn dedicated sender task
+        let socket_clone = Arc::clone(&socket);
+        spawn(async move {
+            while let Some(datagram) = send_rx.recv().await {
+                // Keep retrying until sent
+                loop {
+                    match socket_clone.try_send(&datagram) {
+                        Ok(_) => break,
+                        Err(_) => {
+                            let _ = socket_clone.writable().await;
+                        }
+                    }
                 }
             }
-
+        });
+        
+        loop {
             b.clear();
             let size = rx.recv_many(&mut b, limit).await;
             if size == 0 {
@@ -170,8 +179,7 @@ impl WriterHandler {
                 let _ = data_queue.push_back(b[i].extract());
             }
 
-            // Batch sends: send up to 12 datagrams per iteration
-            // try_send will fail fast if not writable, no need to check first
+            // Batch packetization: create up to 12 datagrams per iteration
             for i in 0..12 {
                 datagram_pool[i].clear();
                 if Self::consume_data_into(
@@ -181,14 +189,8 @@ impl WriterHandler {
                     dst_conn_id,
                     &mut datagram_pool[i],
                 ) {
-                    if socket.try_send(&datagram_pool[i]).is_err() {
-                        // Move buffer out to pending_send
-                        pending_send = Some(std::mem::replace(
-                            &mut datagram_pool[i],
-                            Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM),
-                        ));
-                        break;
-                    }
+                    // Send asynchronously via channel - non-blocking
+                    let _ = send_tx.send(datagram_pool[i].clone());
                 } else {
                     break;
                 }

@@ -15,7 +15,7 @@ async fn main() -> BluefinResult<()> {
     // console_subscriber::init();
     let ports = [1320, 1322, 1323, 1324, 1325];
     let mut connection_tasks = vec![];
-    
+
     // Start connections with a small delay to avoid racing the server's accept() calls
     for ix in 0..2 {
         // Small delay to ensure server has both accept() calls ready
@@ -28,7 +28,7 @@ async fn main() -> BluefinResult<()> {
                 Ipv4Addr::new(127, 0, 0, 1),
                 port,
             )));
-            
+
             match client
                 .connect(std::net::SocketAddr::V4(SocketAddrV4::new(
                     Ipv4Addr::new(127, 0, 0, 1),
@@ -59,17 +59,15 @@ async fn main() -> BluefinResult<()> {
                         // let my_array: [u8; 32] = rand::random();
                         size = conn.send(&my_array)?;
                         total_bytes += size;
-                        if i % 4000 == 0 {
+                        if i % 7000 == 0 {
                             sleep(Duration::from_millis(1)).await;
                         }
                     }
-                    sleep(Duration::from_secs(3)).await;
+                    sleep(Duration::from_secs(1)).await;
 
                     Ok::<(), BluefinError>(())
                 }
-                Err(e) => {
-                    Err(e)
-                }
+                Err(e) => Err(e),
             }
         });
         connection_tasks.push(connection_task);

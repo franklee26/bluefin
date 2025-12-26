@@ -56,10 +56,9 @@ impl HandshakeConnectionBuffer {
             return Ok(res);
         }
 
-        Err(BluefinError::TimedOut(format!(
-            "Failed to read from handshake connection buffer after {:?}",
-            timeout_duration
-        )))
+        Err(BluefinError::TimedOut(
+            "Failed to read from handshake connection buffer",
+        ))
     }
 }
 

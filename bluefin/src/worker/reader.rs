@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    mem::MaybeUninit,
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::Poll,
@@ -100,15 +101,9 @@ impl ReaderRxChannel {
             && base_packet_num != 0
             && self.packets_consumed >= self.packets_consumed_before_ack
         {
-            if let Err(e) = self
+            let _ = self
                 .writer_handler
-                .send_ack(base_packet_num, num_packets_consumed)
-            {
-                eprintln!(
-                    "Failed to send ack packet after reads due to error: {:?}",
-                    e
-                );
-            }
+                .send_ack(base_packet_num, num_packets_consumed);
             self.packets_consumed = 0;
         }
 
@@ -234,19 +229,23 @@ impl ReaderTxChannel {
     /// The [TxChannel]'s engine runner. This method will run forever and is responsible for reading bytes
     /// from the udp socket into a connection buffer. This method should be run its own asynchronous task.
     pub(crate) async fn run(&mut self) -> BluefinResult<()> {
-        let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
+        // Use MaybeUninit to skip zeroing - we declare it uninit but recv_from will initialize before reading
+        let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> = MaybeUninit::uninit();
 
         loop {
+            // SAFETY: We get a mutable reference to the buffer storage and recv_from will initialize it.
+            // The buffer is reused across iterations but always initialized by recv_from before reading.
+            let buf = unsafe { &mut *buf_storage.as_mut_ptr() };
+            
             // Try non-blocking recv first for lower latency when packets are queued
-            let (size, addr) = match self.socket.try_recv_from(&mut buf) {
+            let (size, addr) = match self.socket.try_recv_from(buf) {
                 Ok(result) => result,
-                Err(_) => self.socket.recv_from(&mut buf).await?,
+                Err(_) => self.socket.recv_from(buf).await?,
             };
             let packets_res = BluefinPacket::from_bytes(&buf[..size]);
 
             // Not bluefin packet(s) or it's invalid.
-            if let Err(e) = packets_res {
-                eprintln!("Encountered err: {:?}", e);
+            if packets_res.is_err() {
                 continue;
             }
 
@@ -265,10 +264,10 @@ impl ReaderTxChannel {
             // If there is only one packet, then it's possible it is a handshake packet. Handshakes are sent
             // via one udp datagram carries exactly one bluefin packet
             if packets.len() == 1 {
-                if let Err(e) =
-                    self.handle_for_handshake(&packets[0], &mut is_hello, &mut src_conn_id)
+                if self
+                    .handle_for_handshake(&packets[0], &mut is_hello, &mut src_conn_id)
+                    .is_err()
                 {
-                    eprintln!("{}", e);
                     continue;
                 }
             }
@@ -280,17 +279,13 @@ impl ReaderTxChannel {
             };
 
             if _conn_buf.is_none() {
-                eprintln!("Could not find connection ({}, {})", key.0, key.1);
                 continue;
             }
 
             let buffers = _conn_buf.unwrap();
             for p in packets {
-                if let Err(e) =
-                    ReaderTxChannel::buffer_in_data(is_hello, self.host_type, p, addr, &buffers)
-                {
-                    eprintln!("Failed to buffer in data: {}", e);
-                }
+                let _ =
+                    ReaderTxChannel::buffer_in_data(is_hello, self.host_type, p, addr, &buffers);
             }
         }
     }

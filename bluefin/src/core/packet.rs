@@ -102,8 +102,7 @@ impl BluefinPacket {
     pub fn from_bytes(bytes: &[u8]) -> BluefinResult<Vec<BluefinPacket>> {
         if bytes.len() < 20 {
             return Err(BluefinError::ReadError(
-                "Array must be at least 20 bytes to contain at least one bluefin packet"
-                    .to_string(),
+                "Array must be at least 20 bytes",
             ));
         }
         let mut packets = vec![];
@@ -125,7 +124,7 @@ impl BluefinPacket {
                     let payload_len = header.type_specific_payload as usize;
                     if cursor + 20 >= bytes.len() || cursor + 19 + payload_len >= bytes.len() {
                         return Err(BluefinError::ReadError(
-                            "Cannot read all bytes specified by header".to_string(),
+                            "Cannot read all bytes specified by header",
                         ));
                     }
                     let payload = &bytes[cursor + 20..cursor + 20 + payload_len];
@@ -140,7 +139,9 @@ impl BluefinPacket {
         }
 
         if cursor != bytes.len() {
-            return Err(BluefinError::ReadError("Was not able to read all bytes into bluefin packets. Likely indicates corrupted UDP datagram.".to_string()));
+            return Err(BluefinError::ReadError(
+                "Was not able to read all bytes into bluefin packets",
+            ));
         }
         Ok(packets)
     }
@@ -199,7 +200,7 @@ mod tests {
         assert!(
             BluefinPacket::from_bytes(&packet.serialise()).is_err_and(|e| e
                 == BluefinError::ReadError(
-                    "Cannot read all bytes specified by header".to_string()
+                    "Cannot read all bytes specified by header",
                 ))
         );
 
@@ -208,7 +209,7 @@ mod tests {
         assert!(
             BluefinPacket::from_bytes(&packet.serialise()).is_err_and(|e| e
                 == BluefinError::ReadError(
-                    "Was not able to read all bytes into bluefin packets. Likely indicates corrupted UDP datagram.".to_string()
+                    "Was not able to read all bytes into bluefin packets",
                 ))
         );
     }

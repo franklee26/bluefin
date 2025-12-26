@@ -81,17 +81,12 @@ impl WriterHandler {
     pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<usize> {
         match self.data_sender {
             Some(ref sender) => {
-                if let Err(e) = sender.send(payload.to_vec()) {
-                    return Err(BluefinError::WriteError(format!(
-                        "Failed to send data due to error: {:?}",
-                        e
-                    )));
+                if sender.send(payload.to_vec()).is_err() {
+                    return Err(BluefinError::WriteError("Failed to send data"));
                 }
                 Ok(payload.len())
             }
-            None => Err(BluefinError::WriteError(
-                "Sender is not available. Cannot send.".to_string(),
-            )),
+            None => Err(BluefinError::WriteError("Sender is not available")),
         }
     }
 
@@ -103,7 +98,7 @@ impl WriterHandler {
     ) -> BluefinResult<()> {
         if self.ack_sender.is_none() {
             return Err(BluefinError::WriteError(
-                "Ack sender is not available. Cannot send.".to_string(),
+                "Ack sender is not available",
             ));
         }
 
@@ -112,11 +107,8 @@ impl WriterHandler {
             num_packets_consumed,
         };
 
-        if let Err(e) = self.ack_sender.as_ref().unwrap().send(data) {
-            return Err(BluefinError::WriteError(format!(
-                "Failed to send ack due to error: {:?}",
-                e
-            )));
+        if self.ack_sender.as_ref().unwrap().send(data).is_err() {
+            return Err(BluefinError::WriteError("Failed to send ack"));
         }
         Ok(())
     }
@@ -129,27 +121,24 @@ impl WriterHandler {
         dst_conn_id: u32,
     ) {
         let mut ack_queue = VecDeque::new();
-        let mut b = vec![];
         let limit = 10;
+        let mut b = Vec::with_capacity(limit);
         loop {
+            b.clear();
             let size = rx.recv_many(&mut b, limit).await;
+            if size == 0 {
+                continue;
+            }
             for i in 0..size {
                 ack_queue.push_back(b[i]);
             }
 
-            if let Err(e) = socket.writable().await {
-                eprintln!("Cannot write to socket due to err: {:?}", e);
+            if socket.writable().await.is_err() {
                 continue;
             }
 
             if let Some(data) = Self::consume_acks(&mut ack_queue, src_conn_id, dst_conn_id) {
-                if let Err(e) = socket.try_send(&data) {
-                    eprintln!(
-                        "Encountered error {} while sending ack packet across wire",
-                        e
-                    );
-                    continue;
-                }
+                let _ = socket.try_send(&data);
             }
         }
     }
@@ -163,20 +152,22 @@ impl WriterHandler {
         socket: Arc<UdpSocket>,
     ) {
         let mut data_queue = VecDeque::new();
-        let limit = 10;
         let mut next_packet_num = next_packet_num;
+        let limit = 10;
         let mut b = Vec::with_capacity(limit);
         loop {
             b.clear();
             let size = rx.recv_many(&mut b, limit).await;
+            if size == 0 {
+                continue;
+            }
+            // Extract is a small optimization. We avoid a (potentially) costly clone by
+            // moving the bytes out of the vec and replacing it via a zeroed default value.
             for i in 0..size {
-                // Extract is a small optimization. We avoid a (potentially) costly clone by
-                // moving the bytes out of the vec and replacing it via a zeroed default value.
                 data_queue.push_back(b[i].extract());
             }
 
-            if let Err(e) = socket.writable().await {
-                eprintln!("Cannot write to socket due to err: {:?}", e);
+            if socket.writable().await.is_err() {
                 continue;
             }
 
@@ -186,13 +177,7 @@ impl WriterHandler {
                 src_conn_id,
                 dst_conn_id,
             ) {
-                if let Err(e) = socket.try_send(&data) {
-                    eprintln!(
-                        "Encountered error {} while sending data packet across wire",
-                        e
-                    );
-                    continue;
-                }
+                let _ = socket.try_send(&data);
             }
         }
     }

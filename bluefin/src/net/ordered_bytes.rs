@@ -16,7 +16,7 @@ pub(crate) struct OrderedBytes {
     /// The connection id that owns the ordered bytes. Used for debugging.
     conn_id: u32,
     /// Represents the in-ordered buffer of packets. This is a circular buffer.
-    packets: Box<[Option<BluefinPacket>; MAX_BUFFER_SIZE]>,
+    packets: [Option<BluefinPacket>; MAX_BUFFER_SIZE],
     /// Pointer to the where the packet with the smallest packet number is buffered
     smallest_packet_number_index: usize,
     /// The packet number of the packet that *should* be buffered at packets\[start_index\] and
@@ -91,12 +91,9 @@ impl fmt::Display for OrderedBytes {
 impl OrderedBytes {
     pub(crate) fn new(conn_id: u32, start_packet_number: u64) -> Self {
         const ARRAY_REPEAT_VALUE: Option<BluefinPacket> = None;
-        let packets = vec![ARRAY_REPEAT_VALUE; MAX_BUFFER_SIZE]
-            .try_into()
-            .unwrap();
         Self {
             conn_id,
-            packets,
+            packets: [ARRAY_REPEAT_VALUE; MAX_BUFFER_SIZE],
             smallest_packet_number_index: 0,
             smallest_packet_number: start_packet_number,
             carry_over_bytes: None,

@@ -10,6 +10,7 @@ use crate::net::connection::ConnectionBuffer;
 use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
+use std::mem::MaybeUninit;
 use std::sync::{Arc, MutexGuard};
 
 /// This is arbitrary number of worker tasks to use if we cannot decide how many worker tasks
@@ -98,9 +99,14 @@ impl ConnReaderHandler {
         socket: Arc<UdpSocket>,
         tx: mpsc::Sender<Vec<BluefinPacket>>,
     ) -> BluefinResult<()> {
-        let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
+        // Use MaybeUninit to skip zeroing - recv will initialize before reading
+        let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> = MaybeUninit::uninit();
+        
         loop {
-            let size = socket.recv(&mut buf).await?;
+            // SAFETY: recv will initialize the buffer before we read from it
+            let buf = unsafe { &mut *buf_storage.as_mut_ptr() };
+            
+            let size = socket.recv(buf).await?;
             let packets = BluefinPacket::from_bytes(&buf[..size])?;
 
             let _ = tx.send(packets).await;

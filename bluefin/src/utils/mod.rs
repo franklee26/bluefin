@@ -5,6 +5,7 @@ use bluefin_proto::BluefinResult;
 use tokio::net::UdpSocket;
 
 pub mod common;
+pub mod ring_buffer;
 pub mod window;
 
 #[inline]

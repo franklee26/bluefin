@@ -77,42 +77,6 @@ impl WriterHandler {
     }
 
     #[inline]
-    pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<usize> {
-        match self.data_sender {
-            Some(ref sender) => {
-                if sender.send(payload.to_vec()).is_err() {
-                    return Err(BluefinError::WriteError("Failed to send data"));
-                }
-                Ok(payload.len())
-            }
-            None => Err(BluefinError::WriteError("Sender is not available")),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn send_ack(
-        &self,
-        base_packet_num: u64,
-        num_packets_consumed: usize,
-    ) -> BluefinResult<()> {
-        if self.ack_sender.is_none() {
-            return Err(BluefinError::WriteError(
-                "Ack sender is not available",
-            ));
-        }
-
-        let data = AckData {
-            base_packet_num,
-            num_packets_consumed,
-        };
-
-        if self.ack_sender.as_ref().unwrap().send(data).is_err() {
-            return Err(BluefinError::WriteError("Failed to send ack"));
-        }
-        Ok(())
-    }
-
-    #[inline]
     async fn read_ack(
         mut rx: UnboundedReceiver<AckData>,
         socket: Arc<UdpSocket>,
@@ -232,6 +196,42 @@ impl WriterHandler {
         }
     }
 
+    #[inline]
+    pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<usize> {
+        match self.data_sender {
+            Some(ref sender) => {
+                if sender.send(payload.to_vec()).is_err() {
+                    return Err(BluefinError::WriteError("Failed to send data"));
+                }
+                Ok(payload.len())
+            }
+            None => Err(BluefinError::WriteError("Sender is not available")),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn send_ack(
+        &self,
+        base_packet_num: u64,
+        num_packets_consumed: usize,
+    ) -> BluefinResult<()> {
+        if self.ack_sender.is_none() {
+            return Err(BluefinError::WriteError(
+                "Ack sender is not available",
+            ));
+        }
+
+        let data = AckData {
+            base_packet_num,
+            num_packets_consumed,
+        };
+
+        if self.ack_sender.as_ref().unwrap().send(data).is_err() {
+            return Err(BluefinError::WriteError("Failed to send ack"));
+        }
+        Ok(())
+    }
+
     /// Direct serialization: serialize header + payload into buffer without BluefinPacket allocation
     #[inline(always)]
     fn serialize_packet_direct(
@@ -288,9 +288,15 @@ impl WriterHandler {
                     ans.reserve(20 + max_bytes_to_take);
                     unsafe { ans.set_len(current_len + 20); }
                     header.serialise_into(&mut ans[current_len..]);
-                    // Copy payload bytes directly
-                    ans.extend_from_slice(&running_payload[..max_bytes_to_take]);
-                    running_payload.drain(..max_bytes_to_take);
+                    // Copy payload bytes directly - avoid bounds check with get_unchecked
+                    unsafe {
+                        let src = running_payload.as_ptr();
+                        let dst = ans.as_mut_ptr().add(current_len + 20);
+                        std::ptr::copy_nonoverlapping(src, dst, max_bytes_to_take);
+                        ans.set_len(current_len + 20 + max_bytes_to_take);
+                    }
+                    // Use split_off to avoid shifting - faster than drain
+                    running_payload = running_payload.split_off(max_bytes_to_take);
                     *next_packet_num += 1;
                     bytes_remaining -= max_bytes_to_take + 20;
                 }

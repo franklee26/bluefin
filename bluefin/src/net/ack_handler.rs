@@ -52,6 +52,15 @@ impl AckBuffer {
         }
         Err(BluefinError::NoSuchWakerError)
     }
+
+    /// Returns a `Waker` clone (cheap; atomic refcount bump on the inner Arc)
+    /// so the caller can drop the `AckBuffer` mutex guard before issuing
+    /// `wake()`. Calling `wake_by_ref()` while still holding the mutex causes
+    /// the woken task to immediately bounce on `lock()`.
+    #[inline]
+    pub(crate) fn take_waker_clone(&self) -> Option<Waker> {
+        self.waker.clone()
+    }
 }
 
 #[derive(Clone)]

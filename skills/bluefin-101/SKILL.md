@@ -87,8 +87,8 @@ Each *connection* additionally spawns:
 
 - **One `ConnReaderHandler`** ([`worker/conn_reader.rs`](../../bluefin/src/worker/conn_reader.rs)) on a *new* connected UDP socket. Spawns N tx tasks (1 on macOS, num_cpus on Linux) that `recv` and forward parsed packets via mpsc to one `rx_impl` task that buffers them.
 - **One `WriterHandler`** ([`worker/writer.rs`](../../bluefin/src/worker/writer.rs)) with two children:
-  - `read_data` task: receives `Vec<u8>` payloads from user, packetizes into datagrams, hands off to a *third* spawned task that does the actual `socket.try_send`.
-  - `read_ack` task: receives `AckData` records, builds ack-only datagrams, sends directly with `try_send` (no second hop).
+  - `read_data` task: receives `Bytes` payloads from user, packetizes into datagrams, hands off to a *third* spawned task that does the actual `socket.try_send`. The user-facing channel is `mpsc::channel(4096)` (bounded — ~6 MiB cap, ~since 2026-05/#10); enqueueing carries an owned `Bytes` (refcount bump, not a copy, ~since 2026-05/#2).
+  - `read_ack` task: receives `AckData` records, builds ack-only datagrams, sends directly with `try_send` (no second hop). Ack channel is unbounded — low-volume, no need to add a new failure mode.
 - **One `AckConsumer`** ([`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs)) that wakes on every ack batch and writes `largest_recv_acked_packet_num` (currently no readers — dead code, kept for future retransmission).
 
 ## Public API surface
@@ -98,18 +98,33 @@ BluefinClient::new(src) → connect(dst).await → BluefinConnection
 BluefinServer::new(src) → bind().await → loop { accept().await → BluefinConnection }
 
 BluefinConnection {
-    fn send(&mut self, &[u8]) -> BluefinResult<usize>          // sync, returns immediately after enqueue
+    // Borrow-and-copy. Allocates + memcpys once into a fresh `Bytes`.
+    fn send(&mut self, &[u8]) -> BluefinResult<usize>
+
+    // Hand-off ownership. Cheap (refcount bump if the caller holds a `Bytes`
+    // already). Sync: returns `WriteError` if the bounded send queue is full.
+    fn send_bytes(&mut self, Bytes) -> BluefinResult<usize>
+
+    // Same as `send_bytes` but awaits backpressure when the queue is full.
+    // Preferred for high-throughput producers.
+    async fn send_bytes_async(&mut self, Bytes) -> BluefinResult<usize>
+
     async fn recv(&mut self, &mut [u8], len: usize) -> BluefinResult<usize>
 }
 ```
 
-Note: `send` is synchronous. It enqueues into an `mpsc::UnboundedSender<Vec<u8>>` after `to_vec`-ing the payload; the actual UDP send happens later on a worker task.
+The sync `send`/`send_bytes` variants enqueue into the writer's bounded
+`mpsc::Sender<Bytes>` (cap 4096) and return immediately; the actual UDP send
+happens later on a worker task. If the queue is full (slow consumer or stalled
+socket), they return `BluefinError::WriteError`. The async `send_bytes_async`
+awaits the channel slot instead of failing — use it on the hot path of bursty
+producers so the producer naturally synchronises with the writer's drain rate.
 
 ## Wakers
 
 `ConnectionBuffer` and `AckBuffer` each store an `Option<Waker>`. Every poll calls `set_waker_if_changed` ([`net/connection.rs`](../../bluefin/src/net/connection.rs)) which compares with `Waker::will_wake` to avoid cloning when the same task re-polls.
 
-The producer side (the worker task that buffers in a packet) calls `wake_by_ref()` on the stored waker after buffering. **Currently this happens while still holding the buffer's mutex** — see the performance skill for why that matters.
+The producer side (the worker task that buffers in a packet) wakes the consumer via the buffer's `take_waker_clone()` helper: clone the `Waker` out (cheap, atomic refcount), `drop(guard)`, then call `wake()`. **Never call `wake_by_ref()` while still holding the buffer's mutex** — the woken consumer immediately tries to `lock()` it and bounces. This was a real bug fixed in 2026-05/#7; if you find yourself adding a new producer-side site, follow the same pattern.
 
 ## Reading order for new contributors
 

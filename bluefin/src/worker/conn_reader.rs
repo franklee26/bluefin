@@ -102,23 +102,32 @@ impl ConnReaderHandler {
         // Use MaybeUninit to skip zeroing - recv will initialize before reading
         let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> =
             MaybeUninit::uninit();
-        
-        // Pre-allocate packet buffer to reuse across iterations
-        let mut packets = Vec::with_capacity(76);
+
+        // Capacity for the parsed-packet carrier. 76 is a safe upper bound for
+        // MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM / minimum packet size.
+        const PACKETS_VEC_CAPACITY: usize = 76;
+        let mut packets: Vec<BluefinPacket> = Vec::with_capacity(PACKETS_VEC_CAPACITY);
 
         loop {
             // SAFETY: recv will initialize the buffer before we read from it
             let buf = unsafe { &mut *buf_storage.as_mut_ptr() };
 
             let size = socket.recv(buf).await?;
-            
-            // Zero-copy packet parsing into pre-allocated buffer
-            packets.clear();
+
+            // Zero-copy packet parsing into the (currently empty) carrier vec.
             BluefinPacket::from_bytes_into(&buf[..size], &mut packets)?;
 
-            // Clone only the parsed packets (not the buffer itself) to send through channel
-            // The packets have to be cloned because we're sending through mpsc and reusing buffer
-            let _ = tx.send(packets.clone()).await;
+            // Hand the populated vec to the consumer without cloning the
+            // payloads. We then re-create an empty vec for the next iteration;
+            // this is one small allocation per datagram instead of cloning
+            // every parsed packet's payload (each up to ~1500 B).
+            //
+            // `mem::take` leaves `packets` as an empty Vec with no capacity,
+            // so the subsequent `with_capacity` is necessary to keep the
+            // amortised behaviour we had before.
+            let to_send = std::mem::take(&mut packets);
+            packets = Vec::with_capacity(PACKETS_VEC_CAPACITY);
+            let _ = tx.send(to_send).await;
         }
     }
 
@@ -178,7 +187,16 @@ impl ConnReaderHandler {
                 e = Some(err);
             }
         }
-        guard.wake()?;
+        // Clone the waker out (cheap atomic refcount), then drop the guard
+        // BEFORE waking. Waking while still holding the lock causes the woken
+        // task to immediately bounce on `lock()`.
+        let waker = guard.take_waker_clone();
+        drop(guard);
+
+        match waker {
+            Some(w) => w.wake(),
+            None => return Err(BluefinError::NoSuchWakerError),
+        }
 
         if e.is_some() {
             return Err(e.unwrap());
@@ -198,10 +216,15 @@ impl ConnReaderHandler {
             }
         }
 
-        if let Some(w) = guard.get_waker() {
-            w.wake_by_ref();
-        } else {
-            return Err(BluefinError::NoSuchWakerError);
+        // Clone the waker out (cheap atomic refcount), then drop the guard
+        // BEFORE waking. Waking while still holding the lock causes the woken
+        // task to immediately bounce on `lock()`.
+        let waker = guard.take_waker_clone();
+        drop(guard);
+
+        match waker {
+            Some(w) => w.wake(),
+            None => return Err(BluefinError::NoSuchWakerError),
         }
 
         if e.is_some() {

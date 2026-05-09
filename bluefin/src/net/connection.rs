@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
+
 use super::{
     build_and_start_ack_consumer_workers, build_and_start_conn_reader_tx_channels,
     get_connected_udp_socket,
@@ -187,6 +189,15 @@ impl ConnectionBuffer {
         self.waker.as_ref()
     }
 
+    /// Returns a `Waker` clone (cheap; atomic refcount bump on the inner Arc)
+    /// so the caller can drop any held mutex guard before issuing `wake()`.
+    /// Calling `wake_by_ref()` while still holding the buffer's mutex causes
+    /// the woken task to immediately bounce on `lock()`.
+    #[inline]
+    pub(crate) fn take_waker_clone(&self) -> Option<Waker> {
+        self.waker.clone()
+    }
+
     #[inline]
     pub(crate) fn set_waker(&mut self, waker: Waker) {
         self.waker = Some(waker);
@@ -284,5 +295,29 @@ impl BluefinConnection {
     #[inline]
     pub fn send(&mut self, buf: &[u8]) -> BluefinResult<usize> {
         self.writer_handler.send_data(buf)
+    }
+
+    /// Send an owned [`Bytes`]. Faster than [`Self::send`] when the caller
+    /// already holds a `Bytes` (e.g. from a buffer pool or via
+    /// `Bytes::clone()`), because the writer pipeline carries `Bytes`
+    /// internally and a clone is just a refcount bump.
+    ///
+    /// Synchronous: returns an error if the writer's bounded send queue is
+    /// full. Use [`Self::send_bytes_async`] on the hot path of high-throughput
+    /// producers; it awaits backpressure instead, so callers don't need to
+    /// sleep at the end of the run waiting for the queue to drain.
+    #[inline]
+    pub fn send_bytes(&mut self, payload: Bytes) -> BluefinResult<usize> {
+        self.writer_handler.send_bytes(payload)
+    }
+
+    /// Async variant of [`Self::send_bytes`] that awaits backpressure when
+    /// the writer's send queue is full. Preferred for tight high-throughput
+    /// loops because the caller and the writer task naturally synchronise:
+    /// once the loop returns, the writer has drained roughly everything that
+    /// was enqueued, so no end-of-run drain sleep is needed.
+    #[inline]
+    pub async fn send_bytes_async(&mut self, payload: Bytes) -> BluefinResult<usize> {
+        self.writer_handler.send_bytes_async(payload).await
     }
 }

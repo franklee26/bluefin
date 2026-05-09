@@ -32,11 +32,11 @@ user code
 kernel UDP queue
   → ConnReaderHandler::tx_impl                                 (one or more tasks)
   → BluefinPacket::from_bytes_into                             (ALLOCATES one Vec per packet)
-  → mpsc::Sender<Vec<BluefinPacket>>                           (CLONES packets vec — bug)
+  → mpsc::Sender<Vec<BluefinPacket>>                           (mem::take, no clone since 2026-05/#1)
   → ConnReaderHandler::rx_impl
   → buffers.conn_buff.lock()                                   (Mutex)
   → OrderedBytes::buffer_in_packet
-  → waker.wake_by_ref()                                        (called WHILE LOCKED)
+  → guard.take_waker_clone(); drop(guard); waker.wake()        (wake AFTER drop since 2026-05/#7)
   → ReaderRxChannelFuture::poll → ReaderRxChannel::read
   → buffers.conn_buff.lock()                                   (Mutex again)
   → OrderedBytes::consume → buf.copy_from_slice(payload)       (memcpy)
@@ -47,16 +47,16 @@ kernel UDP queue
 
 Full prioritized list lives in [`THROUGHPUT_ANALYSIS_2026.md`](../../THROUGHPUT_ANALYSIS_2026.md). Headlines:
 
-1. **`tx.send(packets.clone())`** in [`worker/conn_reader.rs:121`](../../bluefin/src/worker/conn_reader.rs) — duplicates every payload (~1500 B × 10) per datagram. **~3 GB/s of pure waste.** Replace with `std::mem::take(&mut packets)` + reset.
-2. **`payload.to_vec()`** in [`worker/writer.rs:212`](../../bluefin/src/worker/writer.rs) `WriterHandler::send_data` — one alloc + copy per user `send` call. Channel should carry `bytes::Bytes` or `Box<[u8]>`.
+1. ~~**`tx.send(packets.clone())`**~~ — **DONE 2026-05 (#1).** `mem::take(&mut packets)` + new `Vec::with_capacity(76)` per datagram in [`worker/conn_reader.rs`](../../bluefin/src/worker/conn_reader.rs). No measurable Δ on send-bound bench but kept (correct shape, recv-side win).
+2. ~~**`payload.to_vec()`**~~ — **DONE 2026-05 (#2, +5.6%).** Writer's data mpsc carries `bytes::Bytes`; new `BluefinConnection::send_bytes(Bytes)` for callers that already own a buffer. ([`worker/writer.rs`](../../bluefin/src/worker/writer.rs), [`net/connection.rs`](../../bluefin/src/net/connection.rs))
 3. **`from_bytes_into` allocates one `Vec<u8>` per packet** ([`core/packet.rs`](../../bluefin/src/core/packet.rs)) — make payload a `bytes::Bytes` slice over the recv buffer.
-4. **Two-hop async path in `read_data`** ([`worker/writer.rs`](../../bluefin/src/worker/writer.rs)) — packetize task → mpsc → sender task. Inline the `try_send` like `read_ack` already does.
+4. **Two-hop async path in `read_data`** ([`worker/writer.rs`](../../bluefin/src/worker/writer.rs)) — packetize task → mpsc → sender task. Inline the `try_send` like `read_ack` already does. *Note: a prior attempt to unify with `tokio::select!` was unstable at 2.9 GB/s (see "Tried & rejected"). The second hop was deliberately introduced for +8.6% in `b8c0489`. Tread carefully.*
 5. **Vectorized I/O is dead code**. [`bluefin-io/src/socket/udp_socket.rs`](../../bluefin-io/src/socket/udp_socket.rs) has `recvmsg_x`/`sendmsg_x` (macOS, behind `macos-fast` feature) and could have `recvmmsg`/`sendmmsg` (Linux), but `BluefinSocket` is **not wired into the runtime** — only used in tests. Highest single lever. Also: the existing `recvmsg_x` returns `Ok(1)` after receiving up to 8 messages — bug.
 6. **Per-connection reader `connect()`s the socket** ([`net/connection.rs`](../../bluefin/src/net/connection.rs)), defeating `SO_REUSEPORT`. Multiple recv tasks on a connected socket race for the same datagram → no parallelism.
-7. **Wake-while-holding-lock** in [`worker/conn_reader.rs`](../../bluefin/src/worker/conn_reader.rs) `buffer_in_data_packets` — woken task immediately bounces on the mutex.
+7. ~~**Wake-while-holding-lock**~~ — **DONE 2026-05 (#7).** `buffer_in_data_packets` and `buffer_in_ack_packets` in [`worker/conn_reader.rs`](../../bluefin/src/worker/conn_reader.rs) now `take_waker_clone()` → `drop(guard)` → `wake()`. Flat on bench (already send-bound), correct shape.
 8. **`SlidingWindow::insert_packet_number` per-packet** ([`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs)) — for an ack covering 200 packets that's 200 VecDeque insertions. Add `insert_range`.
 9. **`AckConsumer` is dead weight** — wakes on every ack batch to write an `AtomicU64` that nothing reads. Remove or wire to retransmission.
-10. **Unbounded send channel** — no backpressure means queued payloads can be dropped at process exit and the producer can starve other tasks. Switch to bounded.
+10. ~~**Unbounded send channel**~~ — **DONE 2026-05 (#10).** Writer's data channel is `mpsc::channel(4096)` (~6 MiB cap). Sync `BluefinConnection::send_bytes` returns `WriteError` on full; new async `send_bytes_async` awaits backpressure. Server peak unchanged within noise; delivered-bytes per run +~50% because the unbounded version was dropping ~half the bench's payloads at process exit. Ack channel left unbounded — low-volume, don't want a new failure mode. The 2 s drain sleep in the bench client stays for now (no public `flush()` API yet — there's still in-flight data in the writer's internal `data_queue` and mid-`socket.send()`).
 11. **Server handshake race (correctness, not throughput, but visible in benches)** — when two clients hello within ~100 ms of each other on macOS loopback, the second client's `connect()` times out at 3 s with `TimedOut("Failed to read from handshake connection buffer")`. Reproduces ~1 in 3 with 100 ms inter-client stagger; ~0 with 500 ms. Root cause is in [`bluefin/src/net/server.rs`](../../bluefin/src/net/server.rs) / [`bluefin/src/net/connection.rs`](../../bluefin/src/net/connection.rs): a hello arriving before the next `accept()` slot is wired up gets dropped. The accept-before-spawn fix in [`docs/archive/BINARY_RACE_CONDITIONS.md`](../../docs/archive/BINARY_RACE_CONDITIONS.md) closed the *processing* race but not the *buffering* race. Bench script papers over it with `--stagger 0.5` + `--retry`.
 
 ## Historical timeline (commits, what worked)
@@ -72,6 +72,10 @@ Full prioritized list lives in [`THROUGHPUT_ANALYSIS_2026.md`](../../THROUGHPUT_
 | Tier 1 | — | — | `parking_lot::Mutex` attempted then reverted |
 | Tier 2 | — | — | Unsafe `copy_nonoverlapping` in writer + `split_off` for chunking (replaced `drain`/`extend`) |
 | Tier 3 | — | — | `VecDeque::with_capacity(64/128)`; lock scope tightened in `ReaderRxChannel::read`; `arrayvec`/`smallvec` deps added |
+| **2026-05** (#1) | local | ~3.6–3.8 GB/s peak (no measurable Δ) | Recv-side: `mem::take(&mut packets)` instead of `clone`. Kept anyway: send-bound bench can't see the recv-side win. |
+| **2026-05** (#2) | local | +5.6% client-side mb/s | Writer's data mpsc carries `Bytes` (not `Vec<u8>`); `BluefinConnection::send_bytes(Bytes)` gives callers a refcount-bump fast path. Bench client switched. |
+| **2026-05** (#7) | local | flat (within noise) | `conn_reader.rs` now clones the `Waker` out of the buffer guard, drops the guard, *then* fires `wake()`. Stops the woken receiver task from immediately bouncing on `lock()`. Same fix on `ConnectionBuffer` and `AckBuffer`. Helper: `take_waker_clone()` on each. |
+| **2026-05** (#10) | local | server flat; client-side +65–85% (was lying); delivered bytes +50% | Writer's data channel is now `mpsc::channel(4096)` (was `unbounded_channel`). New `send_bytes_async` on `BluefinConnection` awaits backpressure; sync `send_bytes` returns `WriteError` on full. Caps memory to ~6 MiB and surfaces a slow consumer instead of swallowing arbitrary backlog (the unbounded version was eating ~half the bench's payloads at process exit). Ack channel left unbounded — low-volume, don't want a new failure mode. |
 
 **Total documented gain**: 2.50 → 3.03 GB/s = **+21.6%**.
 
@@ -202,7 +206,7 @@ The server prints two columns per connection:
 - Same machine, same load (close browser, IDE indexing).
 - Pin server and client to different cores if your OS supports it. macOS: see [`utils/cpu_affinity.rs`](../../bluefin/src/utils/cpu_affinity.rs) (best-effort affinity tags, not currently called).
 - The client yields every 256 sends via `yield_now()`. Don't remove the yield — without it a tight `for` loop monopolises the worker and starves other tasks.
-- The 2 s post-loop sleep in the client is a hack to drain the unbounded send queue before exit. With a real bounded channel this would be unnecessary.
+- The 2 s post-loop sleep in the client is a drain wait, not a hack to mask a starvation bug. Even with the bounded channel from #10, the writer task has its own internal `data_queue` deque plus bytes mid-`socket.send()` when the producer's loop returns. Until there's a public `flush()` API on `BluefinConnection`, the sleep stays. *Don't* delete it.
 - Spawned-task errors are silent unless the binary explicitly handles them. `let _ = task.await` swallows both `JoinError` and the task's own `Result::Err`. As of 2026-05-09 the benchmark client `eprintln!`s `connect()` failures and exits non-zero — keep it that way or you'll be debugging by guesswork (this is exactly how the handshake race went unnoticed for so long).
 
 ## Profiling

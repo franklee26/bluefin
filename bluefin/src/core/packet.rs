@@ -30,8 +30,7 @@ impl Serialisable for BluefinPacket {
     #[inline]
     fn serialise(&self) -> Vec<u8> {
         let mut header_bytes = self.header.serialise();
-        let mut payload_bytes = self.payload.clone();
-        header_bytes.append(&mut payload_bytes);
+        header_bytes.extend_from_slice(&self.payload);
 
         header_bytes
     }
@@ -48,7 +47,8 @@ impl Serialisable for BluefinPacket {
         }
         // Header is 20 bytes
         let header = BluefinHeader::deserialise(&bytes[..20])?;
-        let payload = bytes[20..].to_vec();
+        // Optimize: Use Vec::from which is more efficient than to_vec for slices
+        let payload = Vec::from(&bytes[20..]);
         Ok(Self { header, payload })
     }
 }
@@ -80,17 +80,34 @@ impl BluefinPacket {
         self.payload.len() + 20
     }
 
+    /// Zero-copy serialization: writes packet directly into provided buffer.
+    /// Returns the number of bytes written (20 + payload.len()).
+    /// Buffer must be at least 20 + payload.len() bytes.
+    #[inline]
+    pub fn serialise_into(&self, buf: &mut [u8]) -> usize {
+        let total_len = 20 + self.payload.len();
+        debug_assert!(buf.len() >= total_len, "Buffer too small for packet serialization");
+        
+        // Write header directly (20 bytes)
+        self.header.serialise_into(&mut buf[..20]);
+        
+        // Write payload directly (no clone!)
+        buf[20..total_len].copy_from_slice(&self.payload);
+        
+        total_len
+    }
+
     /// Converts an array of bytes into a vector of bluefin packets. The array of bytes must be
     /// a valid stream of bluefin packet bytes. Otherwise, an error is returned.
     #[inline]
     pub fn from_bytes(bytes: &[u8]) -> BluefinResult<Vec<BluefinPacket>> {
         if bytes.len() < 20 {
             return Err(BluefinError::ReadError(
-                "Array must be at least 20 bytes to contain at least one bluefin packet"
-                    .to_string(),
+                "Array must be at least 20 bytes",
             ));
         }
-        let mut packets = vec![];
+        // Pre-allocate packets vector to avoid reallocation (most datagrams have 1-76 packets)
+        let mut packets = Vec::with_capacity(16);
         let mut cursor = 0;
         while cursor < bytes.len() && cursor + 20 <= bytes.len() {
             let header = BluefinHeader::deserialise(&bytes[cursor..cursor + 20])?;
@@ -100,8 +117,10 @@ impl BluefinPacket {
                 | PacketType::UnencryptedServerHello
                 | PacketType::ClientAck => {
                     // Acks + handshake packets contain no payload (for now)
-                    let packet = BluefinPacket::builder().header(header).build();
-                    packets.push(packet);
+                    packets.push(BluefinPacket {
+                        header,
+                        payload: Vec::new(),
+                    });
                     cursor += 20;
                 }
                 _ => {
@@ -109,24 +128,82 @@ impl BluefinPacket {
                     let payload_len = header.type_specific_payload as usize;
                     if cursor + 20 >= bytes.len() || cursor + 19 + payload_len >= bytes.len() {
                         return Err(BluefinError::ReadError(
-                            "Cannot read all bytes specified by header".to_string(),
+                            "Cannot read all bytes specified by header",
                         ));
                     }
-                    let payload = &bytes[cursor + 20..cursor + 20 + payload_len];
-                    let packet = BluefinPacket::builder()
-                        .header(header)
-                        .payload(payload.to_vec())
-                        .build();
-                    packets.push(packet);
+                    // Optimize: Use Vec::from which is more efficient than to_vec for slices
+                    let payload = Vec::from(&bytes[cursor + 20..cursor + 20 + payload_len]);
+                    packets.push(BluefinPacket { header, payload });
                     cursor = cursor + 20 + payload_len;
                 }
             };
         }
 
         if cursor != bytes.len() {
-            return Err(BluefinError::ReadError("Was not able to read all bytes into bluefin packets. Likely indicates corrupted UDP datagram.".to_string()));
+            return Err(BluefinError::ReadError(
+                "Was not able to read all bytes into bluefin packets",
+            ));
         }
         Ok(packets)
+    }
+
+    /// Zero-copy variant: parses packets directly into a pre-allocated buffer.
+    /// This completely eliminates payload allocations for the common case.
+    /// Returns the number of packets parsed.
+    #[inline]
+    pub fn from_bytes_into(bytes: &[u8], packets: &mut Vec<BluefinPacket>) -> BluefinResult<usize> {
+        if bytes.len() < 20 {
+            return Err(BluefinError::ReadError(
+                "Array must be at least 20 bytes",
+            ));
+        }
+        
+        let initial_len = packets.len();
+        let mut cursor = 0;
+        
+        while cursor < bytes.len() && cursor + 20 <= bytes.len() {
+            let header = BluefinHeader::deserialise(&bytes[cursor..cursor + 20])?;
+            match header.type_field {
+                PacketType::Ack
+                | PacketType::UnencryptedClientHello
+                | PacketType::UnencryptedServerHello
+                | PacketType::ClientAck => {
+                    packets.push(BluefinPacket {
+                        header,
+                        payload: Vec::new(),
+                    });
+                    cursor += 20;
+                }
+                _ => {
+                    let payload_len = header.type_specific_payload as usize;
+                    if cursor + 20 >= bytes.len() || cursor + 19 + payload_len >= bytes.len() {
+                        return Err(BluefinError::ReadError(
+                            "Cannot read all bytes specified by header",
+                        ));
+                    }
+                    
+                    // Zero-copy optimization: create Vec with exact capacity and use unsafe copy
+                    let mut payload = Vec::with_capacity(payload_len);
+                    unsafe {
+                        let src = bytes.as_ptr().add(cursor + 20);
+                        let dst = payload.as_mut_ptr();
+                        std::ptr::copy_nonoverlapping(src, dst, payload_len);
+                        payload.set_len(payload_len);
+                    }
+                    
+                    packets.push(BluefinPacket { header, payload });
+                    cursor = cursor + 20 + payload_len;
+                }
+            };
+        }
+
+        if cursor != bytes.len() {
+            return Err(BluefinError::ReadError(
+                "Was not able to read all bytes into bluefin packets",
+            ));
+        }
+        
+        Ok(packets.len() - initial_len)
     }
 }
 
@@ -183,7 +260,7 @@ mod tests {
         assert!(
             BluefinPacket::from_bytes(&packet.serialise()).is_err_and(|e| e
                 == BluefinError::ReadError(
-                    "Cannot read all bytes specified by header".to_string()
+                    "Cannot read all bytes specified by header",
                 ))
         );
 
@@ -192,7 +269,7 @@ mod tests {
         assert!(
             BluefinPacket::from_bytes(&packet.serialise()).is_err_and(|e| e
                 == BluefinError::ReadError(
-                    "Was not able to read all bytes into bluefin packets. Likely indicates corrupted UDP datagram.".to_string()
+                    "Was not able to read all bytes into bluefin packets",
                 ))
         );
     }

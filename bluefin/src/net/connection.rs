@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     future::Future,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -22,8 +21,7 @@ use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
 use tokio::time::timeout;
 
-pub const MAX_BUFFER_SIZE: usize = 2000;
-pub const MAX_BUFFER_CONSUME: usize = 1000;
+pub const MAX_BUFFER_SIZE: usize = 10_000;
 
 /// HandshakeConnectionBuffer is a wrapper around the shared ConnectionBuffer. We need this
 /// wrapper as it serves as a special future for handling handshake scenarios.
@@ -58,10 +56,9 @@ impl HandshakeConnectionBuffer {
             return Ok(res);
         }
 
-        Err(BluefinError::TimedOut(format!(
-            "Failed to read from handshake connection buffer after {:?}",
-            timeout_duration
-        )))
+        Err(BluefinError::TimedOut(
+            "Failed to read from handshake connection buffer",
+        ))
     }
 }
 
@@ -76,7 +73,7 @@ impl Future for HandshakeConnectionBuffer {
         if let (Some(packet), Some(addr)) = (guard.packet.take(), guard.addr) {
             return Poll::Ready((packet, addr));
         }
-        guard.set_waker(cx.waker().clone());
+        guard.set_waker_if_changed(cx.waker());
         drop(guard);
 
         Poll::Pending
@@ -194,57 +191,33 @@ impl ConnectionBuffer {
     pub(crate) fn set_waker(&mut self, waker: Waker) {
         self.waker = Some(waker);
     }
+
+    /// Sets the waker only if it's different from the current one.
+    /// This avoids unnecessary cloning when the same task is polling repeatedly.
+    #[inline]
+    pub(crate) fn set_waker_if_changed(&mut self, new_waker: &Waker) {
+        if let Some(ref existing) = self.waker {
+            if existing.will_wake(new_waker) {
+                return; // Same waker, no need to clone
+            }
+        }
+        self.waker = Some(new_waker.clone());
+    }
 }
 
 /// ConnectionManager is what allows a single bluefin server to maintain multiple connections.
-/// This struct is essentially a [mapping](Self::map) between a unique bidirectional connection key and its
+/// This is a lock-free concurrent mapping between a unique bidirectional connection key and its
 /// connection buffer, which contains any bytes received during the connection. The unique key
 /// has the form `{src_conn_id}_{dst_conn_id}`. If we are a client attempting to connect to a
 /// server, then we do not know the dst_conn_id key. By protocol, the client must set the dst
 /// id to 0x0.
 /// This structure is used by all bluefin hosts to 'register' any new connections and is also
 /// used by the reader TX worker to determine where to buffer a newly received packet.
-pub(crate) struct ConnectionManager {
-    /// Key: {src_conn_id}_{dst_conn_id}
-    /// Value: The connection buffer
-    map: HashMap<String, ConnectionManagedBuffers>,
-}
-
-impl ConnectionManager {
-    pub(crate) fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn insert(
-        &mut self,
-        key: &str,
-        element: ConnectionManagedBuffers,
-    ) -> BluefinResult<()> {
-        if self.map.contains_key(key) {
-            return Err(BluefinError::ConnectionAlreadyExists);
-        }
-
-        self.map.insert(key.to_string(), element);
-
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) fn get(&self, key: &str) -> Option<ConnectionManagedBuffers> {
-        self.map.get(key).cloned()
-    }
-
-    #[inline]
-    pub(crate) fn remove(&mut self, key: &str) -> BluefinResult<()> {
-        if self.map.remove(key).is_none() {
-            return Err(BluefinError::NoSuchConnectionError);
-        }
-        Ok(())
-    }
-}
+///
+/// Uses DashMap for lock-free concurrent access - eliminates Arc<Mutex<HashMap>> contention.
+/// Key: (src_conn_id, dst_conn_id)
+/// Value: The connection buffer
+pub(crate) type ConnectionManager = dashmap::DashMap<(u32, u32), ConnectionManagedBuffers>;
 
 /// BluefinConnection represents a successful bluefin connection i.e. a bidirectional
 /// connection established between a client and server after the handshake process

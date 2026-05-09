@@ -5,7 +5,7 @@ use std::fmt;
 
 /// Represents the maximum number of *packets* we can buffer in memory. When bytes are consumed
 /// via [OrderedBytes::consume()], we can only consume at most [MAX_BUFFER_SIZE] number of packets.
-pub const MAX_BUFFER_SIZE: usize = 10000000;
+pub const MAX_BUFFER_SIZE: usize = 2000;
 
 /// [OrderedBytes] represents the connection's buffered packets. OrderedBytes stores at most
 /// [MAX_BUFFER_SIZE] number of bluefin packets and maintains their intended consumption
@@ -16,7 +16,7 @@ pub(crate) struct OrderedBytes {
     /// The connection id that owns the ordered bytes. Used for debugging.
     conn_id: u32,
     /// Represents the in-ordered buffer of packets. This is a circular buffer.
-    packets: Box<[Option<BluefinPacket>; MAX_BUFFER_SIZE]>,
+    packets: [Option<BluefinPacket>; MAX_BUFFER_SIZE],
     /// Pointer to the where the packet with the smallest packet number is buffered
     smallest_packet_number_index: usize,
     /// The packet number of the packet that *should* be buffered at packets\[start_index\] and
@@ -91,12 +91,9 @@ impl fmt::Display for OrderedBytes {
 impl OrderedBytes {
     pub(crate) fn new(conn_id: u32, start_packet_number: u64) -> Self {
         const ARRAY_REPEAT_VALUE: Option<BluefinPacket> = None;
-        let packets = vec![ARRAY_REPEAT_VALUE; MAX_BUFFER_SIZE]
-            .try_into()
-            .unwrap();
         Self {
             conn_id,
-            packets,
+            packets: [ARRAY_REPEAT_VALUE; MAX_BUFFER_SIZE],
             smallest_packet_number_index: 0,
             smallest_packet_number: start_packet_number,
             carry_over_bytes: None,
@@ -195,9 +192,10 @@ impl OrderedBytes {
                 self.carry_over_bytes = None;
             // We still have some bytes left over in the carry over...
             } else {
-                let drained = c_bytes.drain(len..).collect();
-                buf[writer_ix..writer_ix + len].copy_from_slice(&c_bytes);
-                self.carry_over_bytes = Some(drained);
+                // Use split_off to avoid drain().collect() temporary allocation
+                buf[writer_ix..writer_ix + len].copy_from_slice(&c_bytes[..len]);
+                let remaining = c_bytes.split_off(len);
+                self.carry_over_bytes = Some(remaining);
                 return Ok(ConsumeResult::new(0, 0, len as u64));
             }
         }
@@ -229,7 +227,9 @@ impl OrderedBytes {
                 buf[writer_ix..writer_ix + bytes_remaining]
                     .copy_from_slice(&packet.payload[..bytes_remaining]);
                 writer_ix += bytes_remaining;
-                self.carry_over_bytes = Some(packet.payload[bytes_remaining..].to_vec());
+                // Move payload out and split to avoid to_vec() allocation
+                let mut payload = std::mem::take(&mut packet.payload);
+                self.carry_over_bytes = Some(payload.split_off(bytes_remaining));
                 num_bytes += bytes_remaining;
             // We have enough space left to consume the entirity of this buffer
             } else {

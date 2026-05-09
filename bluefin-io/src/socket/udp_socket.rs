@@ -1,6 +1,7 @@
 use crate::error::{BluefinIoError, BluefinIoResult};
 use crate::socket::set_sock_opt;
 use libc::{c_int, sockaddr_storage};
+#[cfg(macos_fast)]
 use std::cmp::min;
 use std::io;
 use std::io::IoSliceMut;
@@ -66,7 +67,7 @@ extern "C" {
 }
 
 impl TransmitData<'_> {
-    pub fn new(src_addr: SocketAddr, dst_addr: SocketAddr, data: &[u8]) -> TransmitData {
+    pub fn new(src_addr: SocketAddr, dst_addr: SocketAddr, data: &'_ [u8]) -> TransmitData<'_> {
         TransmitData {
             src_addr,
             dst_addr,
@@ -90,8 +91,17 @@ impl BluefinSocket {
 
         let fd = udp_sock.as_raw_fd();
         set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, 1)?;
+        
+        // Increase socket buffer sizes for higher throughput (512KB each)
+        set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, 524288)?;
+        set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, 524288)?;
+        
         #[cfg(macos)]
-        set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, 1)?;
+        {
+            set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, 1)?;
+            // Prevent SIGPIPE on macOS
+            set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1)?;
+        }
 
         #[cfg(linux)]
         {

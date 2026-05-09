@@ -10,6 +10,7 @@ use crate::net::connection::ConnectionBuffer;
 use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
+use std::mem::MaybeUninit;
 use std::sync::{Arc, MutexGuard};
 
 /// This is arbitrary number of worker tasks to use if we cannot decide how many worker tasks
@@ -98,12 +99,26 @@ impl ConnReaderHandler {
         socket: Arc<UdpSocket>,
         tx: mpsc::Sender<Vec<BluefinPacket>>,
     ) -> BluefinResult<()> {
-        let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
-        loop {
-            let size = socket.recv(&mut buf).await?;
-            let packets = BluefinPacket::from_bytes(&buf[..size])?;
+        // Use MaybeUninit to skip zeroing - recv will initialize before reading
+        let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> =
+            MaybeUninit::uninit();
+        
+        // Pre-allocate packet buffer to reuse across iterations
+        let mut packets = Vec::with_capacity(76);
 
-            let _ = tx.send(packets).await;
+        loop {
+            // SAFETY: recv will initialize the buffer before we read from it
+            let buf = unsafe { &mut *buf_storage.as_mut_ptr() };
+
+            let size = socket.recv(buf).await?;
+            
+            // Zero-copy packet parsing into pre-allocated buffer
+            packets.clear();
+            BluefinPacket::from_bytes_into(&buf[..size], &mut packets)?;
+
+            // Clone only the parsed packets (not the buffer itself) to send through channel
+            // The packets have to be cloned because we're sending through mpsc and reusing buffer
+            let _ = tx.send(packets.clone()).await;
         }
     }
 

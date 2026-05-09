@@ -30,10 +30,10 @@ pub enum BluefinError {
     LargePayloadError(String),
 
     #[error("Encountered error while reading from socket: `{0}`")]
-    ReadError(String),
+    ReadError(&'static str),
 
     #[error("Encountered error while writing to socket: `{0}`")]
-    WriteError(String),
+    WriteError(&'static str),
 
     #[error("Cannot currently open stream for given connection")]
     CannotOpenStreamError,
@@ -72,7 +72,7 @@ pub enum BluefinError {
     Unexpected(String),
 
     #[error("`{0}`")]
-    TimedOut(String),
+    TimedOut(&'static str),
 
     #[error("`{0}`")]
     InvalidState(String),

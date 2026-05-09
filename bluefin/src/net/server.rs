@@ -25,7 +25,7 @@ const NUM_TX_WORKERS_FOR_SERVER_DEFAULT: u16 = 1;
 pub struct BluefinServer {
     socket: Option<Arc<UdpSocket>>,
     src_addr: SocketAddr,
-    conn_manager: Arc<Mutex<ConnectionManager>>,
+    conn_manager: Arc<ConnectionManager>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     num_reader_workers: u16,
 }
@@ -34,7 +34,7 @@ impl BluefinServer {
     pub fn new(src_addr: SocketAddr) -> Self {
         Self {
             socket: None,
-            conn_manager: Arc::new(Mutex::new(ConnectionManager::new())),
+            conn_manager: Arc::new(dashmap::DashMap::new()),
             pending_accept_ids: Arc::new(Mutex::new(Vec::new())),
             src_addr,
             num_reader_workers: NUM_TX_WORKERS_FOR_SERVER_DEFAULT,
@@ -82,18 +82,16 @@ impl BluefinServer {
             ack_buff: Arc::clone(&ack_buffer),
         };
 
-        let hello_key = format!("{}_0", src_conn_id);
-        let _ = self
-            .conn_manager
-            .lock()
-            .unwrap()
-            .insert(&hello_key, conn_mgr_buffers.clone());
+        let hello_key = (src_conn_id, 0);
+        if self.conn_manager.insert(hello_key, conn_mgr_buffers.clone()).is_some() {
+            return Err(BluefinError::ConnectionAlreadyExists);
+        }
         self.pending_accept_ids.lock().unwrap().push(src_conn_id);
 
         let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
         let (packet, addr) = handshake_buf.read().await;
         let dst_conn_id = packet.header.source_connection_id;
-        let key = format!("{}_{}", src_conn_id, dst_conn_id);
+        let key = (src_conn_id, dst_conn_id);
         let client_packet_num = packet.header.packet_number;
 
         // The packet number must be non-zero. Otherwise, we cannot accept the connection
@@ -103,10 +101,11 @@ impl BluefinServer {
         }
 
         // delete the old hello entry and insert the new connection entry
-        {
-            let mut guard = self.conn_manager.lock().unwrap();
-            let _ = guard.remove(&hello_key);
-            let _ = guard.insert(&key, conn_mgr_buffers);
+        if self.conn_manager.remove(&hello_key).is_none() {
+            return Err(BluefinError::NoSuchConnectionError);
+        }
+        if self.conn_manager.insert(key, conn_mgr_buffers).is_some() {
+            return Err(BluefinError::ConnectionAlreadyExists);
         }
 
         // send server hello

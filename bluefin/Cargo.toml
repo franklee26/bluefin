@@ -8,11 +8,16 @@ repository.workspace = true
 
 [dependencies]
 bluefin-proto = { path = "../bluefin-proto" }
+bluefin-io = { path = "../bluefin-io" }
 local-ip-address = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true, features = ["full", "tracing"] }
 libc = { workspace = true }
 socket2 = { workspace = true }
+bytes = { workspace = true }
+dashmap = "6.1"
+arrayvec = "0.7"
+smallvec = "1.13"
 
 [dev-dependencies]
 local-ip-address = "0.6.3"

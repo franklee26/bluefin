@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    mem::MaybeUninit,
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::Poll,
@@ -30,7 +31,7 @@ use tokio::net::UdpSocket;
 pub(crate) struct ReaderTxChannel {
     pub(crate) id: u16,
     socket: Arc<UdpSocket>,
-    conn_manager: Arc<Mutex<ConnectionManager>>,
+    conn_manager: Arc<ConnectionManager>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     host_type: BluefinHost,
 }
@@ -64,7 +65,7 @@ impl Future for ReaderRxChannelFuture {
             return Poll::Ready(());
         }
 
-        guard.set_waker(cx.waker().clone());
+        guard.set_waker_if_changed(cx.waker());
         Poll::Pending
     }
 }
@@ -87,9 +88,9 @@ impl ReaderRxChannel {
         buf: &mut [u8],
     ) -> BluefinResult<(u64, SocketAddr)> {
         let _ = self.future.clone().await;
+        // Minimize lock scope - only hold lock during consume operation
         let (consume_res, addr) = {
-            let mut guard = self.future.buffer.lock().unwrap();
-            guard.consume(bytes_to_read, buf).unwrap()
+            self.future.buffer.lock().unwrap().consume(bytes_to_read, buf).unwrap()
         };
         let num_packets_consumed = consume_res.get_num_packets_consumed();
         let base_packet_num = consume_res.get_base_packet_number();
@@ -100,15 +101,9 @@ impl ReaderRxChannel {
             && base_packet_num != 0
             && self.packets_consumed >= self.packets_consumed_before_ack
         {
-            if let Err(e) = self
+            let _ = self
                 .writer_handler
-                .send_ack(base_packet_num, num_packets_consumed)
-            {
-                eprintln!(
-                    "Failed to send ack packet after reads due to error: {:?}",
-                    e
-                );
-            }
+                .send_ack(base_packet_num, num_packets_consumed);
             self.packets_consumed = 0;
         }
 
@@ -119,7 +114,7 @@ impl ReaderRxChannel {
 impl ReaderTxChannel {
     pub(crate) fn new(
         socket: Arc<UdpSocket>,
-        conn_manager: Arc<Mutex<ConnectionManager>>,
+        conn_manager: Arc<ConnectionManager>,
         pending_accept_ids: Arc<Mutex<Vec<u32>>>,
         host_type: BluefinHost,
     ) -> Self {
@@ -142,9 +137,11 @@ impl ReaderTxChannel {
         if is_hello_packet(self.host_type, &packet) {
             match self.host_type {
                 BluefinHost::PackLeader => {
-                    // Choose a conn id to buffer this in FIFO
-                    if let Some(id) = self.pending_accept_ids.lock().unwrap().pop() {
-                        *src_conn_id = id;
+                    // Choose a conn id to buffer this in FIFO order
+                    // Use remove(0) instead of pop() to get first element (FIFO)
+                    let mut pending = self.pending_accept_ids.lock().unwrap();
+                    if !pending.is_empty() {
+                        *src_conn_id = pending.remove(0);
                         *is_hello = true;
                         return Ok(());
                     } else {
@@ -169,11 +166,11 @@ impl ReaderTxChannel {
     }
 
     #[inline]
-    fn build_conn_buff_key(is_hello: bool, src_conn_id: u32, dst_conn_id: u32) -> String {
+    fn build_conn_buff_key(is_hello: bool, src_conn_id: u32, dst_conn_id: u32) -> (u32, u32) {
         if !is_hello {
-            format!("{}_{}", src_conn_id, dst_conn_id)
+            (src_conn_id, dst_conn_id)
         } else {
-            format!("{}_0", src_conn_id)
+            (src_conn_id, 0)
         }
     }
 
@@ -232,64 +229,72 @@ impl ReaderTxChannel {
     /// The [TxChannel]'s engine runner. This method will run forever and is responsible for reading bytes
     /// from the udp socket into a connection buffer. This method should be run its own asynchronous task.
     pub(crate) async fn run(&mut self) -> BluefinResult<()> {
-        let mut buf = [0u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM];
+        // Use MaybeUninit to skip zeroing - we declare it uninit but recv_from will initialize before reading
+        let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> =
+            MaybeUninit::uninit();
+        
+        // Pre-allocate packet buffer to reuse across iterations (eliminates Vec allocation overhead)
+        let mut packets = Vec::with_capacity(76); // Max packets per datagram
 
         loop {
-            let (size, addr) = self.socket.recv_from(&mut buf).await?;
-            let packets_res = BluefinPacket::from_bytes(&buf[..size]);
+            // SAFETY: We get a mutable reference to the buffer storage and recv_from will initialize it.
+            // The buffer is reused across iterations but always initialized by recv_from before reading.
+            let buf = unsafe { &mut *buf_storage.as_mut_ptr() };
 
-            // Not bluefin packet(s) or it's invalid.
-            if let Err(e) = packets_res {
-                eprintln!("Encountered err: {:?}", e);
+            // Try non-blocking recv first for lower latency when packets are queued
+            let (size, addr) = match self.socket.try_recv_from(buf) {
+                Ok(result) => result,
+                Err(_) => self.socket.recv_from(buf).await?,
+            };
+            
+            // Zero-copy packet parsing into pre-allocated buffer
+            packets.clear();
+            if BluefinPacket::from_bytes_into(&buf[..size], &mut packets).is_err() {
                 continue;
             }
 
-            // Acquire lock and buffer in data
-            let packets = packets_res.unwrap();
-            if packets.len() == 0 {
+            if packets.is_empty() {
                 continue;
             }
 
+            // Copy the header data we need BEFORE any borrowing issues
             // Because all bluefin packets bundled in a datagram must come from the same host, we just peek
             // at the first one
-            let mut src_conn_id = packets[0].header.destination_connection_id;
-            let dst_conn_id = packets[0].header.source_connection_id;
+            let first_pkt_hdr = packets[0].header;
+            let mut src_conn_id = first_pkt_hdr.destination_connection_id;
+            let dst_conn_id = first_pkt_hdr.source_connection_id;
             let mut is_hello = false;
 
             // If there is only one packet, then it's possible it is a handshake packet. Handshakes are sent
             // via one udp datagram carries exactly one bluefin packet
             if packets.len() == 1 {
-                if let Err(e) =
-                    self.handle_for_handshake(&packets[0], &mut is_hello, &mut src_conn_id)
+                if self
+                    .handle_for_handshake(&packets[0], &mut is_hello, &mut src_conn_id)
+                    .is_err()
                 {
-                    eprintln!("{}", e);
                     continue;
                 }
             }
 
             let key = ReaderTxChannel::build_conn_buff_key(is_hello, src_conn_id, dst_conn_id);
             let _conn_buf = {
-                // ACQUIRE LOCK FOR CONN MANAGER
-                let guard = self.conn_manager.lock().unwrap();
-                guard.get(&key)
-                // We just need the conn buffer, which is behind its own lock. We don't need the
-                // conn manager anymore.
-                // RELEASE LOCK FOR CONN MANAGER
+                // Lock-free lookup with DashMap - no contention!
+                self.conn_manager
+                    .get(&key)
+                    .map(|entry| entry.value().clone())
             };
 
             if _conn_buf.is_none() {
-                eprintln!("Could not find connection {}", &key);
                 continue;
             }
 
             let buffers = _conn_buf.unwrap();
-            for p in packets {
-                if let Err(e) =
-                    ReaderTxChannel::buffer_in_data(is_hello, self.host_type, p, addr, &buffers)
-                {
-                    eprintln!("Failed to buffer in data: {}", e);
-                }
+            // Use drain to consume packets while keeping the Vec allocated for next iteration
+            for p in packets.drain(..) {
+                let _ =
+                    ReaderTxChannel::buffer_in_data(is_hello, self.host_type, p, addr, &buffers);
             }
+            // packets is now empty but still has its capacity - will be reused in next iteration
         }
     }
 }

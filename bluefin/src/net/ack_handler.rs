@@ -1,8 +1,10 @@
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     task::{Poll, Waker},
-    time::Duration,
 };
 
 use crate::{
@@ -11,7 +13,6 @@ use crate::{
 };
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
-use tokio::{sync::RwLock, time::sleep};
 
 #[derive(Clone)]
 pub(crate) struct AckBuffer {
@@ -66,6 +67,12 @@ impl Future for AckConsumerFuture {
         if let Some(res) = guard.consume() {
             return Poll::Ready(res);
         }
+        // Only clone waker if it changed
+        if let Some(ref existing) = guard.waker {
+            if existing.will_wake(cx.waker()) {
+                return Poll::Pending;
+            }
+        }
         guard.waker = Some(cx.waker().clone());
         Poll::Pending
     }
@@ -74,13 +81,13 @@ impl Future for AckConsumerFuture {
 #[derive(Clone)]
 pub(crate) struct AckConsumer {
     future: AckConsumerFuture,
-    largest_recv_acked_packet_num: Arc<RwLock<u64>>,
+    largest_recv_acked_packet_num: Arc<AtomicU64>,
 }
 
 impl AckConsumer {
     pub(crate) fn new(
         ack_buff: Arc<Mutex<AckBuffer>>,
-        largest_recv_acked_packet_num: Arc<RwLock<u64>>,
+        largest_recv_acked_packet_num: Arc<AtomicU64>,
     ) -> Self {
         let future = AckConsumerFuture { ack_buff };
         Self {
@@ -93,12 +100,9 @@ impl AckConsumer {
         loop {
             let res = self.future.clone().await;
 
-            {
-                let mut guard = self.largest_recv_acked_packet_num.write().await;
-                *guard = res.largest_packet_number;
-            }
-
-            sleep(Duration::from_micros(5)).await;
+            // Use atomic store - much faster than RwLock and no sleep needed
+            self.largest_recv_acked_packet_num
+                .store(res.largest_packet_number, Ordering::Release);
         }
     }
 }

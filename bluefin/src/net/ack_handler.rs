@@ -101,10 +101,8 @@ impl AckConsumer {
             let res = self.future.clone().await;
 
             // Use atomic store - much faster than RwLock and no sleep needed
-            self.largest_recv_acked_packet_num.store(
-                res.largest_packet_number,
-                Ordering::Release,
-            );
+            self.largest_recv_acked_packet_num
+                .store(res.largest_packet_number, Ordering::Release);
         }
     }
 }

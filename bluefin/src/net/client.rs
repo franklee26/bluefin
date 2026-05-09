@@ -86,7 +86,11 @@ impl BluefinClient {
 
         // Register the connection
         let hello_key = (src_conn_id, 0);
-        if self.conn_manager.insert(hello_key, conn_mgrs_buffs.clone()).is_some() {
+        if self
+            .conn_manager
+            .insert(hello_key, conn_mgrs_buffs.clone())
+            .is_some()
+        {
             return Err(BluefinError::ConnectionAlreadyExists);
         }
 

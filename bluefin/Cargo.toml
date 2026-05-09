@@ -16,6 +16,8 @@ libc = { workspace = true }
 socket2 = { workspace = true }
 bytes = { workspace = true }
 dashmap = "6.1"
+arrayvec = "0.7"
+smallvec = "1.13"
 
 [dev-dependencies]
 local-ip-address = "0.6.3"

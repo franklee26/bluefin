@@ -23,7 +23,7 @@ impl SlidingWindow {
     pub(crate) fn new(smallest_expected_packet_number: u64) -> Self {
         Self {
             smallest_expected_packet_number,
-            ordered_packet_numbers: VecDeque::new(),
+            ordered_packet_numbers: VecDeque::with_capacity(128),
         }
     }
 

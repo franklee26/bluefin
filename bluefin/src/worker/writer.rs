@@ -2,9 +2,7 @@ use std::{cmp::min, collections::VecDeque, sync::Arc};
 
 use crate::core::Extract;
 use crate::{
-    core::{
-        header::{BluefinHeader, BluefinSecurityFields, PacketType},
-    },
+    core::header::{BluefinHeader, BluefinSecurityFields, PacketType},
     net::{MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM, MAX_BLUEFIN_PAYLOAD_SIZE_BYTES},
 };
 use bluefin_proto::error::BluefinError;
@@ -83,7 +81,7 @@ impl WriterHandler {
         src_conn_id: u32,
         dst_conn_id: u32,
     ) {
-        let mut ack_queue = VecDeque::new();
+        let mut ack_queue = VecDeque::with_capacity(64);
         let limit = 20;
         let mut b = Vec::with_capacity(limit);
         let mut pending_send: Option<Vec<u8>> = None;
@@ -115,7 +113,12 @@ impl WriterHandler {
             // try_send will fail fast if not writable, no need to check first
             for i in 0..12 {
                 datagram_pool[i].clear();
-                if Self::consume_acks_into(&mut ack_queue, src_conn_id, dst_conn_id, &mut datagram_pool[i]) {
+                if Self::consume_acks_into(
+                    &mut ack_queue,
+                    src_conn_id,
+                    dst_conn_id,
+                    &mut datagram_pool[i],
+                ) {
                     if socket.try_send(&datagram_pool[i]).is_err() {
                         // Move buffer out to pending_send
                         pending_send = Some(std::mem::replace(
@@ -139,7 +142,7 @@ impl WriterHandler {
         dst_conn_id: u32,
         socket: Arc<UdpSocket>,
     ) {
-        let mut data_queue = VecDeque::new();
+        let mut data_queue = VecDeque::with_capacity(64);
         let mut next_packet_num = next_packet_num;
         let limit = 20;
         // Pre-allocated buffer pool for datagrams (eliminates allocation overhead)
@@ -147,10 +150,10 @@ impl WriterHandler {
             .map(|_| Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM))
             .collect();
         let mut b = Vec::with_capacity(limit);
-        
+
         // Channel for parallel sends - decouple packetization from sending
         let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        
+
         // Spawn dedicated sender task
         let socket_clone = Arc::clone(&socket);
         spawn(async move {
@@ -166,7 +169,7 @@ impl WriterHandler {
                 }
             }
         });
-        
+
         loop {
             b.clear();
             let size = rx.recv_many(&mut b, limit).await;
@@ -189,8 +192,12 @@ impl WriterHandler {
                     dst_conn_id,
                     &mut datagram_pool[i],
                 ) {
-                    // Send asynchronously via channel - non-blocking
-                    let _ = send_tx.send(datagram_pool[i].clone());
+                    // Send asynchronously via channel - move ownership to avoid clone
+                    let datagram = std::mem::replace(
+                        &mut datagram_pool[i],
+                        Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM)
+                    );
+                    let _ = send_tx.send(datagram);
                 } else {
                     break;
                 }
@@ -218,9 +225,7 @@ impl WriterHandler {
         num_packets_consumed: usize,
     ) -> BluefinResult<()> {
         if self.ack_sender.is_none() {
-            return Err(BluefinError::WriteError(
-                "Ack sender is not available",
-            ));
+            return Err(BluefinError::WriteError("Ack sender is not available"));
         }
 
         let data = AckData {
@@ -236,11 +241,7 @@ impl WriterHandler {
 
     /// Direct serialization: serialize header + payload into buffer without BluefinPacket allocation
     #[inline(always)]
-    fn serialize_packet_direct(
-        ans: &mut Vec<u8>,
-        header: &BluefinHeader,
-        payload: &[u8],
-    ) {
+    fn serialize_packet_direct(ans: &mut Vec<u8>, header: &BluefinHeader, payload: &[u8]) {
         let current_len = ans.len();
         let packet_len = 20 + payload.len();
         ans.reserve(packet_len);
@@ -266,6 +267,8 @@ impl WriterHandler {
         }
 
         let mut running_payload = queue.pop_front().unwrap();
+        // Pre-allocate extra capacity to prevent reallocation when merging payloads
+        running_payload.reserve(MAX_BLUEFIN_PAYLOAD_SIZE_BYTES);
         let mut bytes_remaining = MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM;
         // Create header once and reuse (only update packet_number and type_specific_payload)
         let mut header = BluefinHeader::new(
@@ -288,7 +291,9 @@ impl WriterHandler {
                     // Write header directly
                     let current_len = ans.len();
                     ans.reserve(20 + max_bytes_to_take);
-                    unsafe { ans.set_len(current_len + 20); }
+                    unsafe {
+                        ans.set_len(current_len + 20);
+                    }
                     header.serialise_into(&mut ans[current_len..]);
                     // Copy payload bytes directly - avoid bounds check with get_unchecked
                     unsafe {
@@ -319,11 +324,19 @@ impl WriterHandler {
                 // Write header directly
                 let current_len = ans.len();
                 ans.reserve(20 + max_bytes_to_take);
-                unsafe { ans.set_len(current_len + 20); }
+                unsafe {
+                    ans.set_len(current_len + 20);
+                }
                 header.serialise_into(&mut ans[current_len..]);
-                // Copy payload bytes directly
-                ans.extend_from_slice(&running_payload[..max_bytes_to_take]);
-                running_payload.drain(..max_bytes_to_take);
+                // Copy payload bytes directly - use unsafe copy for better performance
+                unsafe {
+                    let src = running_payload.as_ptr();
+                    let dst = ans.as_mut_ptr().add(current_len + 20);
+                    std::ptr::copy_nonoverlapping(src, dst, max_bytes_to_take);
+                    ans.set_len(current_len + 20 + max_bytes_to_take);
+                }
+                // Use split_off to avoid shifting elements
+                running_payload = running_payload.split_off(max_bytes_to_take);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
                 continue;
@@ -332,7 +345,17 @@ impl WriterHandler {
             let data = queue.pop_front().unwrap();
             let potential_bytes_len = data.len();
             if potential_bytes_len + running_payload.len() > MAX_BLUEFIN_PAYLOAD_SIZE_BYTES {
-                running_payload.extend(data);
+                // Optimize extend with unsafe copy - eliminate bounds checks
+                let old_len = running_payload.len();
+                running_payload.reserve(data.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        running_payload.as_mut_ptr().add(old_len),
+                        data.len()
+                    );
+                    running_payload.set_len(old_len + data.len());
+                }
 
                 let max_bytes_to_take = min(
                     running_payload.len(),
@@ -343,15 +366,34 @@ impl WriterHandler {
                 // Write header directly
                 let current_len = ans.len();
                 ans.reserve(20 + max_bytes_to_take);
-                unsafe { ans.set_len(current_len + 20); }
+                unsafe {
+                    ans.set_len(current_len + 20);
+                }
                 header.serialise_into(&mut ans[current_len..]);
-                // Copy payload bytes directly
-                ans.extend_from_slice(&running_payload[..max_bytes_to_take]);
-                running_payload.drain(..max_bytes_to_take);
+                // Copy payload bytes directly - use unsafe copy for better performance
+                unsafe {
+                    let src = running_payload.as_ptr();
+                    let dst = ans.as_mut_ptr().add(current_len + 20);
+                    std::ptr::copy_nonoverlapping(src, dst, max_bytes_to_take);
+                    ans.set_len(current_len + 20 + max_bytes_to_take);
+                }
+                // Use split_off to avoid shifting elements
+                running_payload = running_payload.split_off(max_bytes_to_take);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
             } else {
-                running_payload.extend(data);
+                // We can fit both the payload and the left over bytes
+                // Optimize extend with unsafe copy - eliminate bounds checks
+                let old_len = running_payload.len();
+                running_payload.reserve(data.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        running_payload.as_mut_ptr().add(old_len),
+                        data.len()
+                    );
+                    running_payload.set_len(old_len + data.len());
+                }
             }
         }
 
@@ -365,11 +407,19 @@ impl WriterHandler {
             // Write header directly
             let current_len = ans.len();
             ans.reserve(20 + max_bytes_to_take);
-            unsafe { ans.set_len(current_len + 20); }
+            unsafe {
+                ans.set_len(current_len + 20);
+            }
             header.serialise_into(&mut ans[current_len..]);
-            // Copy payload bytes directly
-            ans.extend_from_slice(&running_payload[..max_bytes_to_take]);
-            running_payload.drain(..max_bytes_to_take);
+            // Copy payload bytes directly - use unsafe copy for better performance
+            unsafe {
+                let src = running_payload.as_ptr();
+                let dst = ans.as_mut_ptr().add(current_len + 20);
+                std::ptr::copy_nonoverlapping(src, dst, max_bytes_to_take);
+                ans.set_len(current_len + 20 + max_bytes_to_take);
+            }
+            // Use split_off to avoid shifting elements
+            running_payload = running_payload.split_off(max_bytes_to_take);
             *next_packet_num += 1;
             bytes_remaining -= max_bytes_to_take + 20;
         }
@@ -389,7 +439,8 @@ impl WriterHandler {
     ) -> Option<Vec<u8>> {
         let mut ans = Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
         let mut bytes_remaining = MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM;
-        let mut running_payload = Vec::with_capacity(MAX_BLUEFIN_PAYLOAD_SIZE_BYTES);
+        // Pre-allocate extra capacity to prevent reallocation when merging payloads
+        let mut running_payload = Vec::with_capacity(MAX_BLUEFIN_PAYLOAD_SIZE_BYTES * 2);
 
         let security_fields = BluefinSecurityFields::new(false, 0x0);
         // Reuse header struct - just update fields instead of creating new ones
@@ -413,8 +464,9 @@ impl WriterHandler {
                     );
                     header.with_packet_number(*next_packet_num);
                     header.type_specific_payload = max_bytes_to_take as u16;
-                    // Collect drained bytes to avoid clone
-                    let payload: Vec<u8> = running_payload.drain(..max_bytes_to_take).collect();
+                    // Use split_off to avoid drain().collect() allocation
+                    let remaining = running_payload.split_off(max_bytes_to_take);
+                    let payload = std::mem::replace(&mut running_payload, remaining);
                     // Direct serialization - no BluefinPacket allocation
                     Self::serialize_packet_direct(&mut ans, &header, &payload);
                     *next_packet_num += 1;
@@ -436,8 +488,9 @@ impl WriterHandler {
                 );
                 header.with_packet_number(*next_packet_num);
                 header.type_specific_payload = max_bytes_to_take as u16;
-                // Collect drained bytes to avoid clone
-                let payload: Vec<u8> = running_payload.drain(..max_bytes_to_take).collect();
+                // Use split_off to avoid drain().collect() allocation
+                let remaining = running_payload.split_off(max_bytes_to_take);
+                let payload = std::mem::replace(&mut running_payload, remaining);
                 // Direct serialization - no BluefinPacket allocation
                 Self::serialize_packet_direct(&mut ans, &header, &payload);
                 *next_packet_num += 1;
@@ -450,7 +503,17 @@ impl WriterHandler {
             let potential_bytes_len = data.len();
             if potential_bytes_len + running_payload.len() > MAX_BLUEFIN_PAYLOAD_SIZE_BYTES {
                 // We cannot simply fit both payloads into this packet.
-                running_payload.extend(data);
+                // Optimize extend with unsafe copy - eliminate bounds checks
+                let old_len = running_payload.len();
+                running_payload.reserve(data.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        running_payload.as_mut_ptr().add(old_len),
+                        data.len()
+                    );
+                    running_payload.set_len(old_len + data.len());
+                }
 
                 // Try to take as much as we can
                 let max_bytes_to_take = min(
@@ -459,15 +522,26 @@ impl WriterHandler {
                 );
                 header.with_packet_number(*next_packet_num);
                 header.type_specific_payload = max_bytes_to_take as u16;
-                // Collect drained bytes to avoid clone
-                let payload: Vec<u8> = running_payload.drain(..max_bytes_to_take).collect();
+                // Use split_off to avoid drain().collect() allocation
+                let remaining = running_payload.split_off(max_bytes_to_take);
+                let payload = std::mem::replace(&mut running_payload, remaining);
                 // Direct serialization - no BluefinPacket allocation
                 Self::serialize_packet_direct(&mut ans, &header, &payload);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
             } else {
                 // We can fit both the payload and the left over bytes
-                running_payload.extend(data);
+                // Optimize extend with unsafe copy - eliminate bounds checks
+                let old_len = running_payload.len();
+                running_payload.reserve(data.len());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        running_payload.as_mut_ptr().add(old_len),
+                        data.len()
+                    );
+                    running_payload.set_len(old_len + data.len());
+                }
             }
         }
 

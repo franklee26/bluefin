@@ -14,3 +14,6 @@ Cargo.lock
 
 .idea/
 *.svg
+
+# Per-run output from bench_two_process.sh
+bench_logs/

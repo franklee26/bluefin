@@ -192,9 +192,10 @@ impl OrderedBytes {
                 self.carry_over_bytes = None;
             // We still have some bytes left over in the carry over...
             } else {
-                let drained = c_bytes.drain(len..).collect();
-                buf[writer_ix..writer_ix + len].copy_from_slice(&c_bytes);
-                self.carry_over_bytes = Some(drained);
+                // Use split_off to avoid drain().collect() temporary allocation
+                buf[writer_ix..writer_ix + len].copy_from_slice(&c_bytes[..len]);
+                let remaining = c_bytes.split_off(len);
+                self.carry_over_bytes = Some(remaining);
                 return Ok(ConsumeResult::new(0, 0, len as u64));
             }
         }
@@ -226,7 +227,9 @@ impl OrderedBytes {
                 buf[writer_ix..writer_ix + bytes_remaining]
                     .copy_from_slice(&packet.payload[..bytes_remaining]);
                 writer_ix += bytes_remaining;
-                self.carry_over_bytes = Some(packet.payload[bytes_remaining..].to_vec());
+                // Move payload out and split to avoid to_vec() allocation
+                let mut payload = std::mem::take(&mut packet.payload);
+                self.carry_over_bytes = Some(payload.split_off(bytes_remaining));
                 num_bytes += bytes_remaining;
             // We have enough space left to consume the entirity of this buffer
             } else {

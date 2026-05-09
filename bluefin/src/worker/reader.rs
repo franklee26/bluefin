@@ -88,9 +88,9 @@ impl ReaderRxChannel {
         buf: &mut [u8],
     ) -> BluefinResult<(u64, SocketAddr)> {
         let _ = self.future.clone().await;
+        // Minimize lock scope - only hold lock during consume operation
         let (consume_res, addr) = {
-            let mut guard = self.future.buffer.lock().unwrap();
-            guard.consume(bytes_to_read, buf).unwrap()
+            self.future.buffer.lock().unwrap().consume(bytes_to_read, buf).unwrap()
         };
         let num_packets_consumed = consume_res.get_num_packets_consumed();
         let base_packet_num = consume_res.get_base_packet_number();
@@ -230,35 +230,39 @@ impl ReaderTxChannel {
     /// from the udp socket into a connection buffer. This method should be run its own asynchronous task.
     pub(crate) async fn run(&mut self) -> BluefinResult<()> {
         // Use MaybeUninit to skip zeroing - we declare it uninit but recv_from will initialize before reading
-        let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> = MaybeUninit::uninit();
+        let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> =
+            MaybeUninit::uninit();
+        
+        // Pre-allocate packet buffer to reuse across iterations (eliminates Vec allocation overhead)
+        let mut packets = Vec::with_capacity(76); // Max packets per datagram
 
         loop {
             // SAFETY: We get a mutable reference to the buffer storage and recv_from will initialize it.
             // The buffer is reused across iterations but always initialized by recv_from before reading.
             let buf = unsafe { &mut *buf_storage.as_mut_ptr() };
-            
+
             // Try non-blocking recv first for lower latency when packets are queued
             let (size, addr) = match self.socket.try_recv_from(buf) {
                 Ok(result) => result,
                 Err(_) => self.socket.recv_from(buf).await?,
             };
-            let packets_res = BluefinPacket::from_bytes(&buf[..size]);
-
-            // Not bluefin packet(s) or it's invalid.
-            if packets_res.is_err() {
+            
+            // Zero-copy packet parsing into pre-allocated buffer
+            packets.clear();
+            if BluefinPacket::from_bytes_into(&buf[..size], &mut packets).is_err() {
                 continue;
             }
 
-            // Acquire lock and buffer in data
-            let packets = packets_res.unwrap();
-            if packets.len() == 0 {
+            if packets.is_empty() {
                 continue;
             }
 
+            // Copy the header data we need BEFORE any borrowing issues
             // Because all bluefin packets bundled in a datagram must come from the same host, we just peek
             // at the first one
-            let mut src_conn_id = packets[0].header.destination_connection_id;
-            let dst_conn_id = packets[0].header.source_connection_id;
+            let first_pkt_hdr = packets[0].header;
+            let mut src_conn_id = first_pkt_hdr.destination_connection_id;
+            let dst_conn_id = first_pkt_hdr.source_connection_id;
             let mut is_hello = false;
 
             // If there is only one packet, then it's possible it is a handshake packet. Handshakes are sent
@@ -275,7 +279,9 @@ impl ReaderTxChannel {
             let key = ReaderTxChannel::build_conn_buff_key(is_hello, src_conn_id, dst_conn_id);
             let _conn_buf = {
                 // Lock-free lookup with DashMap - no contention!
-                self.conn_manager.get(&key).map(|entry| entry.value().clone())
+                self.conn_manager
+                    .get(&key)
+                    .map(|entry| entry.value().clone())
             };
 
             if _conn_buf.is_none() {
@@ -283,10 +289,12 @@ impl ReaderTxChannel {
             }
 
             let buffers = _conn_buf.unwrap();
-            for p in packets {
+            // Use drain to consume packets while keeping the Vec allocated for next iteration
+            for p in packets.drain(..) {
                 let _ =
                     ReaderTxChannel::buffer_in_data(is_hello, self.host_type, p, addr, &buffers);
             }
+            // packets is now empty but still has its capacity - will be reused in next iteration
         }
     }
 }

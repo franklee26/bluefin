@@ -91,8 +91,17 @@ impl BluefinSocket {
 
         let fd = udp_sock.as_raw_fd();
         set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, 1)?;
+        
+        // Increase socket buffer sizes for higher throughput (512KB each)
+        set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, 524288)?;
+        set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, 524288)?;
+        
         #[cfg(macos)]
-        set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, 1)?;
+        {
+            set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVDSTADDR, 1)?;
+            // Prevent SIGPIPE on macOS
+            set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_NOSIGPIPE, 1)?;
+        }
 
         #[cfg(linux)]
         {

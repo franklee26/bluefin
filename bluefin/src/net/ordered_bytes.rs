@@ -1,6 +1,7 @@
 use crate::core::packet::BluefinPacket;
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
+use bytes::Bytes;
 use std::fmt;
 
 /// Represents the maximum number of *packets* we can buffer in memory. When bytes are consumed
@@ -24,7 +25,10 @@ pub(crate) struct OrderedBytes {
     smallest_packet_number: u64,
     /// Stores any potential carry over bytes from a previous consume. These bytes belong to
     /// a packet we have already consumed.
-    carry_over_bytes: Option<Vec<u8>>,
+    ///
+    /// Stored as [`Bytes`] so the carry-over remains a refcount view over
+    /// the original recv buffer (no copy on `split_off`).
+    carry_over_bytes: Option<Bytes>,
 }
 
 /// The result returned when [OrderedBytes are consumed](OrderedBytes::consume()). This result

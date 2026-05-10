@@ -1,4 +1,11 @@
-use std::{cmp::min, collections::VecDeque, sync::Arc};
+use std::{
+    cmp::min,
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use crate::core::Extract;
 use crate::{
@@ -12,6 +19,7 @@ use tokio::{
     net::UdpSocket,
     spawn,
     sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    sync::Notify,
 };
 
 /// Internal representation of an ack. These fields will be used to build a Bluefin ack packet.
@@ -43,6 +51,22 @@ pub(crate) struct WriterHandler {
     ack_sender: Option<UnboundedSender<AckData>>,
     src_conn_id: u32,
     dst_conn_id: u32,
+    /// Number of user-payload bytes that have been accepted by
+    /// [`Self::send_bytes`] / [`Self::send_bytes_async`] / [`Self::send_data`]
+    /// but have NOT yet been written to the socket. Incremented on enqueue,
+    /// decremented inside the spawned sender task immediately after
+    /// `socket.try_send` returns `Ok`. Read by [`Self::flush`] to know when
+    /// every accepted payload byte is actually on the wire.
+    ///
+    /// Note: only DATA payload bytes are tracked; ack-channel bytes are not.
+    /// `flush()` is a user-facing operation and the user only ever asks
+    /// about data they sent.
+    pending_bytes: Arc<AtomicUsize>,
+    /// Notified by the spawned sender task whenever `pending_bytes` reaches 0.
+    /// Paired with the double-check loop in [`Self::flush`] so that a waiter
+    /// registering after the notify-call but before pending becomes non-zero
+    /// again is still woken correctly.
+    flush_notify: Arc<Notify>,
 }
 
 impl WriterHandler {
@@ -59,6 +83,8 @@ impl WriterHandler {
             next_packet_num,
             data_sender: None,
             ack_sender: None,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            flush_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -72,8 +98,19 @@ impl WriterHandler {
         let src_conn_id = self.src_conn_id;
         let dst_conn_id = self.dst_conn_id;
         let socket = Arc::clone(&self.socket);
+        let pending_bytes = Arc::clone(&self.pending_bytes);
+        let flush_notify = Arc::clone(&self.flush_notify);
         spawn(async move {
-            Self::read_data(data_r, next_packet_num, src_conn_id, dst_conn_id, socket).await;
+            Self::read_data(
+                data_r,
+                next_packet_num,
+                src_conn_id,
+                dst_conn_id,
+                socket,
+                pending_bytes,
+                flush_notify,
+            )
+            .await;
         });
 
         let socket = Arc::clone(&self.socket);
@@ -151,6 +188,8 @@ impl WriterHandler {
         src_conn_id: u32,
         dst_conn_id: u32,
         socket: Arc<UdpSocket>,
+        pending_bytes: Arc<AtomicUsize>,
+        flush_notify: Arc<Notify>,
     ) {
         let mut data_queue: VecDeque<Bytes> = VecDeque::with_capacity(64);
         let mut next_packet_num = next_packet_num;
@@ -164,7 +203,10 @@ impl WriterHandler {
         // Channel for parallel sends - decouple packetization from sending
         let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
-        // Spawn dedicated sender task
+        // Spawn dedicated sender task. This task is the *only* place that
+        // decrements `pending_bytes`, and it does so AFTER `socket.try_send`
+        // returns `Ok` for a given datagram. That gives `flush()` a true
+        // "on the wire" guarantee, not a "in the channel" guarantee.
         let socket_clone = Arc::clone(&socket);
         spawn(async move {
             while let Some(datagram) = send_rx.recv().await {
@@ -175,6 +217,22 @@ impl WriterHandler {
                         Err(_) => {
                             let _ = socket_clone.writable().await;
                         }
+                    }
+                }
+                // Bytes are on the wire; account for them and notify any
+                // waiters in `flush()` if the in-flight count just hit zero.
+                let payload_bytes = Self::payload_bytes_in_datagram(&datagram);
+                if payload_bytes > 0 {
+                    let prev = pending_bytes.fetch_sub(payload_bytes, Ordering::Relaxed);
+                    debug_assert!(
+                        prev >= payload_bytes,
+                        "pending_bytes underflow: prev={}, sub={}",
+                        prev,
+                        payload_bytes,
+                    );
+                    if prev == payload_bytes {
+                        // Counter reached zero on this decrement.
+                        flush_notify.notify_waiters();
                     }
                 }
             }
@@ -227,7 +285,14 @@ impl WriterHandler {
         match self.data_sender {
             Some(ref sender) => {
                 let len = payload.len();
+                // Increment the in-flight counter BEFORE the enqueue so that
+                // `flush()` cannot observe a stale zero between enqueue and
+                // the writer task reading the message off the channel. If
+                // the enqueue fails (channel full / closed), undo the
+                // increment.
+                self.pending_bytes.fetch_add(len, Ordering::Relaxed);
                 if sender.try_send(payload).is_err() {
+                    self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
                     return Err(BluefinError::WriteError(
                         "Failed to send data (channel full or closed)",
                     ));
@@ -247,7 +312,11 @@ impl WriterHandler {
         match self.data_sender {
             Some(ref sender) => {
                 let len = payload.len();
+                // Same accounting as `send_bytes`: pre-increment so `flush()`
+                // never observes a stale zero, undo on enqueue failure.
+                self.pending_bytes.fetch_add(len, Ordering::Relaxed);
                 if sender.send(payload).await.is_err() {
+                    self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
                     return Err(BluefinError::WriteError(
                         "Failed to send data (channel closed)",
                     ));
@@ -262,18 +331,85 @@ impl WriterHandler {
     pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<usize> {
         match self.data_sender {
             Some(ref sender) => {
+                let len = payload.len();
+                self.pending_bytes.fetch_add(len, Ordering::Relaxed);
                 // We don't own the caller's buffer, so this still allocates +
                 // copies once. Callers who *do* own a `Bytes` should call
                 // `send_bytes` instead and pay only a refcount bump.
                 if sender.try_send(Bytes::copy_from_slice(payload)).is_err() {
+                    self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
                     return Err(BluefinError::WriteError(
                         "Failed to send data (channel full or closed)",
                     ));
                 }
-                Ok(payload.len())
+                Ok(len)
             }
             None => Err(BluefinError::WriteError("Sender is not available")),
         }
+    }
+
+    /// Awaits until every byte that has been accepted by
+    /// [`Self::send_bytes`] / [`Self::send_bytes_async`] / [`Self::send_data`]
+    /// before the call has been written to the underlying socket.
+    ///
+    /// More precisely: at the moment `flush()` is invoked, snapshot the set
+    /// of bytes that are pending. The future resolves when the in-flight
+    /// counter — covering channel-queue, internal `data_queue`, and the
+    /// spawned sender task's mid-flight datagrams — reaches zero.
+    ///
+    /// Calls made *after* `flush().await` begins may extend the wait if
+    /// they keep the counter non-zero; in practice that's fine because the
+    /// canonical use is "call this before exit / before sleeping the task".
+    ///
+    /// Returns immediately if there is nothing pending.
+    pub(crate) async fn flush(&self) -> BluefinResult<()> {
+        loop {
+            if self.pending_bytes.load(Ordering::Relaxed) == 0 {
+                return Ok(());
+            }
+            // Register for notification BEFORE rechecking. This is the
+            // standard `tokio::sync::Notify` double-check pattern: if the
+            // sender notifies between the load and `.notified()` being
+            // ready, the registration captures the wake. We then re-check
+            // because `notify_waiters` only wakes already-registered
+            // waiters — a wake that fired before we registered would have
+            // been lost otherwise, but the recheck below catches it.
+            let notified = self.flush_notify.notified();
+            if self.pending_bytes.load(Ordering::Relaxed) == 0 {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    /// Walks an outgoing datagram (formatted as a stream of 20-byte Bluefin
+    /// headers each followed by a payload) and returns the total number of
+    /// USER PAYLOAD bytes it carries. This is what was originally accepted
+    /// from the user via `send_bytes*` / `send_data` and is what we need to
+    /// subtract from `pending_bytes` once the datagram is on the wire.
+    ///
+    /// All packets emitted by `read_data` are `UnencryptedData` (the writer
+    /// never multiplexes other types into this path), so we can skip the
+    /// type check and just sum the `type_specific_payload` fields. We still
+    /// validate the cursor stays in-bounds in case a future change broadens
+    /// what flows through here.
+    #[inline]
+    fn payload_bytes_in_datagram(datagram: &[u8]) -> usize {
+        let mut total = 0usize;
+        let mut cursor = 0usize;
+        while cursor + 20 <= datagram.len() {
+            // type_specific_payload is the 16 bits at [1..3] of the header.
+            let payload_len =
+                u16::from_be_bytes([datagram[cursor + 1], datagram[cursor + 2]]) as usize;
+            // Sanity: malformed datagrams shouldn't happen on this path, but
+            // refuse to walk past the end if they did.
+            if cursor + 20 + payload_len > datagram.len() {
+                break;
+            }
+            total += payload_len;
+            cursor += 20 + payload_len;
+        }
+        total
     }
 
     #[inline]

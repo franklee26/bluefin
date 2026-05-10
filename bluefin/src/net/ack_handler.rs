@@ -9,6 +9,7 @@ use std::{
 
 use crate::{
     core::packet::BluefinPacket,
+    net::Wakeable,
     utils::window::{SlidingWindow, SlidingWindowConsumeResult},
 };
 use bluefin_proto::error::BluefinError;
@@ -32,10 +33,11 @@ impl AckBuffer {
     pub(crate) fn buffer_in_ack_packet(&mut self, packet: BluefinPacket) -> BluefinResult<()> {
         let num_packets_to_ack = packet.header.type_specific_payload;
         let base_packet_num = packet.header.packet_number;
-        for ix in 0..num_packets_to_ack {
-            self.received_acks
-                .insert_packet_number(base_packet_num + ix as u64)?;
-        }
+        // One bounds check + one tight extend on the in-order fast path,
+        // versus N method calls + N bounds checks. Typical N is ~200 (the
+        // ack cadence in `ReaderRxChannel::read`).
+        self.received_acks
+            .insert_range(base_packet_num, num_packets_to_ack)?;
         Ok(())
     }
 
@@ -52,13 +54,11 @@ impl AckBuffer {
         }
         Err(BluefinError::NoSuchWakerError)
     }
+}
 
-    /// Returns a `Waker` clone (cheap; atomic refcount bump on the inner Arc)
-    /// so the caller can drop the `AckBuffer` mutex guard before issuing
-    /// `wake()`. Calling `wake_by_ref()` while still holding the mutex causes
-    /// the woken task to immediately bounce on `lock()`.
+impl Wakeable for AckBuffer {
     #[inline]
-    pub(crate) fn take_waker_clone(&self) -> Option<Waker> {
+    fn take_waker_clone(&self) -> Option<Waker> {
         self.waker.clone()
     }
 }

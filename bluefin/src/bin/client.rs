@@ -145,13 +145,13 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
         }
     }
 
-    // Wait for the writer pipeline to drain before exiting. The bounded send
-    // channel only bounds the channel itself; the writer's internal
-    // `data_queue` deque and bytes mid-`socket.send()` can still be in flight
-    // when this loop returns. There's no public flush API yet, so a fixed
-    // sleep is the simplest correct choice. (Without this, the process exits
-    // mid-flight and the server reports a sharp delivered-bytes shortfall.)
-    sleep(Duration::from_secs(2)).await;
+    // Wait for the writer pipeline to drain before exiting. `flush().await`
+    // returns exactly when every byte we handed to `send_bytes_async` is on
+    // the wire (channel-queue + writer's internal `data_queue` + spawned
+    // sender's mid-`socket.send()` bytes). Replaces the old fixed
+    // `sleep(2 s)`, which was visibly too short on contended runs (server
+    // received a fraction of the bytes the client claimed to send).
+    conn.flush().await?;
 
     let elapsed = start.elapsed().as_secs_f64();
     let mb_per_sec = (total_bytes as f64 / elapsed) / 1e6;

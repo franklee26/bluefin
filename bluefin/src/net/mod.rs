@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::task::Waker;
 
 use crate::{
     core::{
@@ -25,6 +26,32 @@ pub(crate) const MAX_BLUEFIN_PAYLOAD_SIZE_BYTES: usize = 1500;
 pub(crate) const MAX_BLUEFIN_PACKETS_IN_UDP_DATAGRAM: usize = 10;
 pub(crate) const MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM: usize = MAX_BLUEFIN_PACKETS_IN_UDP_DATAGRAM
     * (BLUEFIN_HEADER_SIZE_BYTES + MAX_BLUEFIN_PAYLOAD_SIZE_BYTES);
+
+/// Implemented by every buffer type that owns an `Option<Waker>` and is
+/// shared between a producer task and a consumer task via `Arc<Mutex<...>>`.
+///
+/// The contract for producers is always:
+///
+/// 1. Lock the buffer.
+/// 2. Mutate it (push a packet, advance a counter, etc.).
+/// 3. Call [`Wakeable::take_waker_clone`] to lift a `Waker` clone out.
+/// 4. **Drop the mutex guard.**
+/// 5. Call `wake()` (or `wake_by_ref()`) on the cloned waker.
+///
+/// Steps 3–5 — in that order — are what stop the woken consumer task from
+/// immediately bouncing on `lock()` while the producer is still holding the
+/// guard. See `bluefin-architecture` §5 (the buffer-with-waker pattern) and
+/// the `bluefin-performance` historical timeline (#7).
+pub(crate) trait Wakeable {
+    /// Returns a clone of the stored `Waker`, or `None` if no consumer has
+    /// registered one yet.
+    ///
+    /// Cloning a `Waker` is cheap — internally it bumps an atomic refcount
+    /// on a vtable + data pointer; no allocation, no syscall. The clone
+    /// exists so the producer can release the buffer's mutex *before*
+    /// firing the wake, without losing the right to wake.
+    fn take_waker_clone(&self) -> Option<Waker>;
+}
 
 #[derive(Clone)]
 pub(crate) struct ConnectionManagedBuffers {

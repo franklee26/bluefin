@@ -88,7 +88,11 @@ impl SomeBuffer {
     fn buffer_in(&mut self, item: T) -> Result<(), Err> { ... }   // producer
     fn consume(&mut self) -> Option<U> { ... }                    // consumer probe
     fn set_waker_if_changed(&mut self, w: &Waker) { ... }         // poll-side
-    fn take_waker_clone(&self) -> Option<Waker> { ... }           // wake-side
+}
+
+// Shared trait \u2014 one method, see `bluefin/src/net/mod.rs::Wakeable`
+impl Wakeable for SomeBuffer {
+    fn take_waker_clone(&self) -> Option<Waker> { self.waker.clone() }
 }
 ```
 

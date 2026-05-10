@@ -12,7 +12,7 @@ use super::{
     build_and_start_ack_consumer_workers, build_and_start_conn_reader_tx_channels,
     get_connected_udp_socket,
     ordered_bytes::{ConsumeResult, OrderedBytes},
-    AckBuffer, ConnectionManagedBuffers,
+    AckBuffer, ConnectionManagedBuffers, Wakeable,
 };
 use crate::{
     core::packet::BluefinPacket,
@@ -189,15 +189,6 @@ impl ConnectionBuffer {
         self.waker.as_ref()
     }
 
-    /// Returns a `Waker` clone (cheap; atomic refcount bump on the inner Arc)
-    /// so the caller can drop any held mutex guard before issuing `wake()`.
-    /// Calling `wake_by_ref()` while still holding the buffer's mutex causes
-    /// the woken task to immediately bounce on `lock()`.
-    #[inline]
-    pub(crate) fn take_waker_clone(&self) -> Option<Waker> {
-        self.waker.clone()
-    }
-
     #[inline]
     pub(crate) fn set_waker(&mut self, waker: Waker) {
         self.waker = Some(waker);
@@ -213,6 +204,13 @@ impl ConnectionBuffer {
             }
         }
         self.waker = Some(new_waker.clone());
+    }
+}
+
+impl Wakeable for ConnectionBuffer {
+    #[inline]
+    fn take_waker_clone(&self) -> Option<Waker> {
+        self.waker.clone()
     }
 }
 
@@ -319,5 +317,22 @@ impl BluefinConnection {
     #[inline]
     pub async fn send_bytes_async(&mut self, payload: Bytes) -> BluefinResult<usize> {
         self.writer_handler.send_bytes_async(payload).await
+    }
+
+    /// Awaits until every byte previously accepted by [`Self::send`],
+    /// [`Self::send_bytes`], or [`Self::send_bytes_async`] has actually
+    /// been written to the underlying socket.
+    ///
+    /// This is the only correct way to drain the writer pipeline before
+    /// dropping the connection or exiting the process. Prior to this API,
+    /// callers (including the bench client) had to fall back on a fixed
+    /// `tokio::time::sleep` and hope it was long enough \u2014 visibly wrong
+    /// under load. With `flush().await`, the wait is exactly as long as
+    /// the writer needs and never longer.
+    ///
+    /// Returns immediately if there is nothing pending. Cheap to call.
+    #[inline]
+    pub async fn flush(&self) -> BluefinResult<()> {
+        self.writer_handler.flush().await
     }
 }

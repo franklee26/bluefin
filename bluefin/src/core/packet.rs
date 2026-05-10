@@ -1,18 +1,34 @@
 use crate::core::header::BluefinHeader;
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
+use bytes::Bytes;
 
 use super::{header::PacketType, Serialisable};
 
 #[derive(Clone, Debug)]
 pub struct BluefinPacket {
     pub header: BluefinHeader,
-    pub payload: Vec<u8>,
+    /// The packet's user-payload bytes.
+    ///
+    /// Stored as [`Bytes`] (not `Vec<u8>`) so that the hot recv path can share
+    /// one heap allocation across all packets parsed out of a single UDP
+    /// datagram. [`Self::from_bytes_into`] takes ownership of the recv
+    /// buffer as `Bytes` and `slice()`s into it for each packet payload — a
+    /// refcount bump rather than the per-packet `Vec::with_capacity` +
+    /// `copy_nonoverlapping` we used before. With ~10 packets per 15 KiB
+    /// datagram on the loopback bench that's a 10× reduction in recv-side
+    /// allocations.
+    ///
+    /// `Bytes` derefs to `&[u8]` so reads (slicing, `len`, `extend_from_slice`)
+    /// are unchanged. `mem::take(&mut payload)` returns an empty `Bytes`
+    /// (no alloc), preserving the [`crate::core::Extract`] semantics used in
+    /// `OrderedBytes::consume`.
+    pub payload: Bytes,
 }
 
 pub struct BluefinPacketBuilder {
     header: Option<BluefinHeader>,
-    payload: Option<Vec<u8>>,
+    payload: Option<Bytes>,
 }
 
 /// Entire packet representation, including the ip + udp metadata
@@ -47,8 +63,10 @@ impl Serialisable for BluefinPacket {
         }
         // Header is 20 bytes
         let header = BluefinHeader::deserialise(&bytes[..20])?;
-        // Optimize: Use Vec::from which is more efficient than to_vec for slices
-        let payload = Vec::from(&bytes[20..]);
+        // Cold path (handshake / tests): the caller hands us a `&[u8]` so
+        // we have no recv-buffer to share into. Allocate a one-off `Bytes`
+        // for the payload — hot recv path uses `from_bytes_into` instead.
+        let payload = Bytes::copy_from_slice(&bytes[20..]);
         Ok(Self { header, payload })
     }
 }
@@ -59,7 +77,8 @@ impl Default for BluefinPacket {
     fn default() -> Self {
         Self {
             header: Default::default(),
-            payload: vec![],
+            // Empty `Bytes` is a const, no alloc.
+            payload: Bytes::new(),
         }
     }
 }
@@ -99,6 +118,10 @@ impl BluefinPacket {
 
     /// Converts an array of bytes into a vector of bluefin packets. The array of bytes must be
     /// a valid stream of bluefin packet bytes. Otherwise, an error is returned.
+    ///
+    /// **Cold path.** Used by handshake and tests. Each packet payload pays
+    /// one `Bytes::copy_from_slice` allocation. The hot recv path uses
+    /// [`Self::from_bytes_into`] which is allocation-free per payload.
     #[inline]
     pub fn from_bytes(bytes: &[u8]) -> BluefinResult<Vec<BluefinPacket>> {
         if bytes.len() < 20 {
@@ -119,7 +142,7 @@ impl BluefinPacket {
                     // Acks + handshake packets contain no payload (for now)
                     packets.push(BluefinPacket {
                         header,
-                        payload: Vec::new(),
+                        payload: Bytes::new(),
                     });
                     cursor += 20;
                 }
@@ -131,8 +154,8 @@ impl BluefinPacket {
                             "Cannot read all bytes specified by header",
                         ));
                     }
-                    // Optimize: Use Vec::from which is more efficient than to_vec for slices
-                    let payload = Vec::from(&bytes[cursor + 20..cursor + 20 + payload_len]);
+                    let payload =
+                        Bytes::copy_from_slice(&bytes[cursor + 20..cursor + 20 + payload_len]);
                     packets.push(BluefinPacket { header, payload });
                     cursor = cursor + 20 + payload_len;
                 }
@@ -147,22 +170,36 @@ impl BluefinPacket {
         Ok(packets)
     }
 
-    /// Zero-copy variant: parses packets directly into a pre-allocated buffer.
-    /// This completely eliminates payload allocations for the common case.
-    /// Returns the number of packets parsed.
+    /// Hot-path zero-copy parse: walks an owned [`Bytes`] (typically a frozen
+    /// recv buffer) and produces a vector of [`BluefinPacket`] whose
+    /// `payload` fields are `slice()` views over the same underlying
+    /// allocation. Each payload field becomes a refcount bump on `buf`'s
+    /// backing buffer rather than a fresh allocation + memcpy.
+    ///
+    /// Practical impact on the bench: a 15 KiB UDP datagram carrying ten
+    /// 1500 B payloads goes from 10 `Vec::with_capacity(1500)` +
+    /// `copy_nonoverlapping` calls per recv to zero (just ten `Arc` increments
+    /// on the shared `Bytes`). The single allocation we *do* pay (the recv
+    /// buffer itself) is amortised across all ten packets.
+    ///
+    /// The function returns the number of packets it pushed into `packets`
+    /// (i.e. excludes anything already present from previous calls).
     #[inline]
-    pub fn from_bytes_into(bytes: &[u8], packets: &mut Vec<BluefinPacket>) -> BluefinResult<usize> {
-        if bytes.len() < 20 {
+    pub fn from_bytes_into(buf: Bytes, packets: &mut Vec<BluefinPacket>) -> BluefinResult<usize> {
+        if buf.len() < 20 {
             return Err(BluefinError::ReadError(
                 "Array must be at least 20 bytes",
             ));
         }
-        
+
         let initial_len = packets.len();
+        let len = buf.len();
         let mut cursor = 0;
-        
-        while cursor < bytes.len() && cursor + 20 <= bytes.len() {
-            let header = BluefinHeader::deserialise(&bytes[cursor..cursor + 20])?;
+
+        while cursor < len && cursor + 20 <= len {
+            // Header parse is a copy out of the buffer (20 bytes, fixed),
+            // not a slice; the saving here is on payload copies, not header.
+            let header = BluefinHeader::deserialise(&buf[cursor..cursor + 20])?;
             match header.type_field {
                 PacketType::Ack
                 | PacketType::UnencryptedClientHello
@@ -170,39 +207,31 @@ impl BluefinPacket {
                 | PacketType::ClientAck => {
                     packets.push(BluefinPacket {
                         header,
-                        payload: Vec::new(),
+                        payload: Bytes::new(),
                     });
                     cursor += 20;
                 }
                 _ => {
                     let payload_len = header.type_specific_payload as usize;
-                    if cursor + 20 >= bytes.len() || cursor + 19 + payload_len >= bytes.len() {
+                    if cursor + 20 >= len || cursor + 19 + payload_len >= len {
                         return Err(BluefinError::ReadError(
                             "Cannot read all bytes specified by header",
                         ));
                     }
-                    
-                    // Zero-copy optimization: create Vec with exact capacity and use unsafe copy
-                    let mut payload = Vec::with_capacity(payload_len);
-                    unsafe {
-                        let src = bytes.as_ptr().add(cursor + 20);
-                        let dst = payload.as_mut_ptr();
-                        std::ptr::copy_nonoverlapping(src, dst, payload_len);
-                        payload.set_len(payload_len);
-                    }
-                    
+                    // Refcount bump on the shared buffer, not a copy.
+                    let payload = buf.slice(cursor + 20..cursor + 20 + payload_len);
                     packets.push(BluefinPacket { header, payload });
                     cursor = cursor + 20 + payload_len;
                 }
             };
         }
 
-        if cursor != bytes.len() {
+        if cursor != len {
             return Err(BluefinError::ReadError(
                 "Was not able to read all bytes into bluefin packets",
             ));
         }
-        
+
         Ok(packets.len() - initial_len)
     }
 }
@@ -214,9 +243,14 @@ impl BluefinPacketBuilder {
         self
     }
 
+    /// Accepts anything cheaply convertible into [`Bytes`] — in particular
+    /// `Vec<u8>` (zero-copy: takes ownership of the buffer), `&'static [u8]`,
+    /// or an existing `Bytes`. This keeps every existing call site
+    /// (`.payload(some_vec)`, `.payload(arr.to_vec())`) compiling without
+    /// touching them.
     #[inline]
-    pub fn payload(mut self, payload: Vec<u8>) -> Self {
-        self.payload = Some(payload);
+    pub fn payload<P: Into<Bytes>>(mut self, payload: P) -> Self {
+        self.payload = Some(payload.into());
         self
     }
 
@@ -224,7 +258,7 @@ impl BluefinPacketBuilder {
     pub fn build(self) -> BluefinPacket {
         BluefinPacket {
             header: self.header.unwrap(),
-            payload: self.payload.unwrap_or(vec![]),
+            payload: self.payload.unwrap_or_else(Bytes::new),
         }
     }
 }

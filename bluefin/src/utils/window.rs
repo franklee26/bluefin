@@ -66,6 +66,71 @@ impl SlidingWindow {
         Ok(())
     }
 
+    /// Inserts a contiguous range of packet numbers `[base, base + count)` in
+    /// one shot.
+    ///
+    /// This exists so that ack packets (which carry a `(base, count)` pair on
+    /// the wire and typically cover ~200 packets) don't pay 200 separate
+    /// `insert_packet_number` calls — each of which re-checks bounds, walks
+    /// the deque, and writes a single `u64`. With the fast path below, the
+    /// in-order case becomes a single bounds check + one tight `extend`.
+    ///
+    /// Semantics match calling `insert_packet_number` `count` times in
+    /// ascending order:
+    ///
+    /// * `count == 0` is a no-op.
+    /// * If `base < smallest_expected_packet_number`, the call errors and
+    ///   nothing is inserted (`UnexpectedPacketNumberError`).
+    /// * If the range would extend past `MAX_SLIDING_WINDOW_SIZE` slots from
+    ///   the smallest expected packet number, the call errors and nothing is
+    ///   inserted (`BufferFullError`).
+    /// * If the range overlaps any packet number already buffered, the
+    ///   overlap is treated as a duplicate and the call errors. The fast
+    ///   path catches `base <= last_buffered`; the slow path falls through
+    ///   to per-element inserts, which preserve the existing duplicate
+    ///   semantics.
+    pub(crate) fn insert_range(&mut self, base: u64, count: u16) -> BluefinResult<()> {
+        if count == 0 {
+            return Ok(());
+        }
+
+        // Bounds check the whole range up front so a partial insert can never
+        // happen on the fast path.
+        if base < self.smallest_expected_packet_number {
+            return Err(BluefinError::UnexpectedPacketNumberError);
+        }
+        let last = base + (count as u64) - 1;
+        if last - self.smallest_expected_packet_number
+            >= MAX_SLIDING_WINDOW_SIZE.try_into().unwrap()
+        {
+            return Err(BluefinError::BufferFullError(
+                "Sliding window buffer is full".to_string(),
+            ));
+        }
+
+        // Fast path: range is strictly after the current back (or the deque
+        // is empty). This is the common case — acks ack packets the receiver
+        // hasn't seen yet, in order.
+        let extends_cleanly = self
+            .ordered_packet_numbers
+            .back()
+            .map_or(true, |&back| base > back);
+        if extends_cleanly {
+            self.ordered_packet_numbers.reserve(count as usize);
+            self.ordered_packet_numbers.extend(base..=last);
+            return Ok(());
+        }
+
+        // Slow path: out-of-order or overlapping range. Fall back to
+        // per-element insert; this preserves the existing duplicate-detection
+        // semantics. Partial inserts on overlap match what a sequential loop
+        // of `insert_packet_number` calls would have produced.
+        for n in base..=last {
+            self.insert_packet_number(n)?;
+        }
+        Ok(())
+    }
+
     /// If present, returns the largest packet number that we have contiguously buffered. For example,
     /// if Some(10) were returned, that means we have accounted for all packet numbers 10 and below.
     /// We may have packet numbers larger than 10 but they are disjointed from the contiguous set.
@@ -186,5 +251,47 @@ mod tests {
         assert!(sliding_window
             .insert_packet_number(107 + u64::try_from(MAX_SLIDING_WINDOW_SIZE).unwrap())
             .is_ok());
+    }
+
+    #[test]
+    fn sliding_window_insert_range_behaves_like_repeated_insert() {
+        let mut window = SlidingWindow::new(1000);
+
+        // count == 0 is a no-op and does not error.
+        assert_eq!(window.insert_range(1000, 0), Ok(()));
+        assert_eq!(window.consume(), None);
+
+        // Fast path: empty deque, in-order range. After this, [1000..1010)
+        // should be buffered contiguously.
+        assert_eq!(window.insert_range(1000, 10), Ok(()));
+        let consumed = window.consume().unwrap();
+        assert_eq!(consumed.largest_packet_number, 1009);
+        assert_eq!(consumed.num_acks_consumed, 10);
+
+        // Fast path: non-empty deque, range strictly past the back. We
+        // advance smallest_expected to 1010, insert [1015..1020) (gap), then
+        // [1020..1025) (extends past back), expect a single contiguous
+        // [1015..1025) once the gap is filled.
+        assert_eq!(window.insert_range(1015, 5), Ok(()));
+        assert_eq!(window.insert_range(1020, 5), Ok(()));
+        assert_eq!(window.consume(), None); // missing 1010..1014
+        // Fill the gap with another range.
+        assert_eq!(window.insert_range(1010, 5), Ok(()));
+        let consumed = window.consume().unwrap();
+        assert_eq!(consumed.largest_packet_number, 1024);
+        assert_eq!(consumed.num_acks_consumed, 15);
+
+        // Below smallest_expected -> error.
+        assert!(window.insert_range(0, 1).is_err());
+
+        // Range that walks past MAX_SLIDING_WINDOW_SIZE -> error, no partial
+        // insert.
+        let big = MAX_SLIDING_WINDOW_SIZE as u64;
+        assert!(window.insert_range(1025, (big + 1) as u16).is_err());
+
+        // Slow path: range that overlaps an already-buffered number errors
+        // partway through (matches what a sequential loop would have done).
+        assert_eq!(window.insert_range(1100, 3), Ok(())); // 1100, 1101, 1102
+        assert!(window.insert_range(1100, 5).is_err()); // 1100 is a dup
     }
 }

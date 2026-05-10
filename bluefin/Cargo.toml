@@ -33,3 +33,6 @@ path = "src/bin/server.rs"
 
 [lints]
 workspace = true
+
+[profile.release]
+debug = true

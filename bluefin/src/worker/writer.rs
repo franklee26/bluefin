@@ -200,16 +200,56 @@ impl WriterHandler {
             .collect();
         let mut b: Vec<Bytes> = Vec::with_capacity(limit);
 
-        // Channel for parallel sends - decouple packetization from sending
-        let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Channel for parallel sends - decouple packetization from sending.
+        // Carries `(datagram, payload_bytes)` so the sender task does NOT
+        // need to re-walk the formatted datagram to recover the user-payload
+        // count for `pending_bytes` accounting. The packetiser computes that
+        // number for free as a side-effect of `consume_data_into`.
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel::<(Vec<u8>, usize)>();
+
+        // Return channel — sender ships emptied `Vec<u8>` allocations back
+        // to the packetiser instead of letting them drop. Without this the
+        // "buffer pool" is a lie: every iteration `mem::replace`'d the slot
+        // with a fresh `Vec::with_capacity(15200)` and the just-sent vec
+        // was dropped after `try_send`. Net: ~one 15 KiB heap allocation
+        // per outgoing datagram. With this, allocations cap at ~12 (the
+        // initial pool) at steady state.
+        //
+        // Unbounded is fine: at steady state cycle is 1:1 so the channel
+        // sits near-empty, and the bound is naturally the in-flight set
+        // (≤ 12 + the writer's mpsc::channel(4096) cap). Bounded would
+        // just introduce a dead-lock risk if recycle ever blocked on full.
+        let (recycle_tx, mut recycle_rx) = mpsc::unbounded_channel::<Vec<u8>>();
 
         // Spawn dedicated sender task. This task is the *only* place that
         // decrements `pending_bytes`, and it does so AFTER `socket.try_send`
         // returns `Ok` for a given datagram. That gives `flush()` a true
         // "on the wire" guarantee, not a "in the channel" guarantee.
+        //
+        // Two failed experiments are documented in the SKILL file:
+        //
+        // - Round I (2026-05-10): replaced this loop with a `sendmsg_x`
+        //   batch syscall on macOS. The syscall itself was genuinely faster
+        //   (peak 4.5 → 6.0 GB/s) but unpaced bursts overran the server's
+        //   8 MB recv buffer (`kern.ipc.maxsockbuf` cap). Server silently
+        //   dropped UDP datagrams; *delivered* throughput regressed.
+        //
+        // - Round K (2026-05-10): paired sendmsg_x writer (PACE_BATCH=4
+        //   with `tokio::task::yield_now()` pacing) with `recvmsg_x` reader
+        //   in conn_reader.rs. Improved healthy-run peak by +9 % but
+        //   bilateral reliability dropped 7/10 → 5/10 even after bumping
+        //   `kern.ipc.maxsockbuf` and SO_RCVBUF/SO_SNDBUF to 32 MB. The
+        //   bottleneck wasn't the recv-buffer cap; `yield_now` is a no-op
+        //   when no other task is queued on the worker, so the writer
+        //   still outpaced the reader's drain.
+        //
+        // The `macos_io::sendmsg_x_connected` and `macos_io::recvmsg_x_into`
+        // bindings remain in tree for a future round that adds proper
+        // application-level pacing (e.g. token bucket calibrated to the
+        // measured drain rate).
         let socket_clone = Arc::clone(&socket);
         spawn(async move {
-            while let Some(datagram) = send_rx.recv().await {
+            while let Some((mut datagram, payload_bytes)) = send_rx.recv().await {
                 // Keep retrying until sent
                 loop {
                     match socket_clone.try_send(&datagram) {
@@ -221,7 +261,8 @@ impl WriterHandler {
                 }
                 // Bytes are on the wire; account for them and notify any
                 // waiters in `flush()` if the in-flight count just hit zero.
-                let payload_bytes = Self::payload_bytes_in_datagram(&datagram);
+                // `payload_bytes` was computed by `consume_data_into` so we
+                // avoid a second pass over the ~15 KiB datagram here.
                 if payload_bytes > 0 {
                     let prev = pending_bytes.fetch_sub(payload_bytes, Ordering::Relaxed);
                     debug_assert!(
@@ -235,6 +276,13 @@ impl WriterHandler {
                         flush_notify.notify_waiters();
                     }
                 }
+                // Recycle the buffer back to the packetiser. `clear()` keeps
+                // capacity (it's a `len = 0` write, no realloc). If the
+                // packetiser has gone away (shouldn't happen — it's the
+                // upstream of this very task), `send` errors and the Vec
+                // drops naturally.
+                datagram.clear();
+                let _ = recycle_tx.send(datagram);
             }
         });
 
@@ -253,19 +301,23 @@ impl WriterHandler {
             // Batch packetization: create up to 12 datagrams per iteration
             for i in 0..12 {
                 datagram_pool[i].clear();
-                if Self::consume_data_into(
+                let payload_bytes = Self::consume_data_into(
                     &mut data_queue,
                     &mut next_packet_num,
                     src_conn_id,
                     dst_conn_id,
                     &mut datagram_pool[i],
-                ) {
-                    // Send asynchronously via channel - move ownership to avoid clone
-                    let datagram = std::mem::replace(
-                        &mut datagram_pool[i],
-                        Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM)
-                    );
-                    let _ = send_tx.send(datagram);
+                );
+                if payload_bytes > 0 {
+                    // Pull a recycled buffer (cap-preserving, zero-alloc) out
+                    // of the return channel before falling back to a fresh
+                    // allocation. At steady state the recycle channel always
+                    // has a Vec ready, so this branch never allocates.
+                    let replacement = recycle_rx
+                        .try_recv()
+                        .unwrap_or_else(|_| Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM));
+                    let datagram = std::mem::replace(&mut datagram_pool[i], replacement);
+                    let _ = send_tx.send((datagram, payload_bytes));
                 } else {
                     break;
                 }
@@ -384,15 +436,21 @@ impl WriterHandler {
 
     /// Walks an outgoing datagram (formatted as a stream of 20-byte Bluefin
     /// headers each followed by a payload) and returns the total number of
-    /// USER PAYLOAD bytes it carries. This is what was originally accepted
-    /// from the user via `send_bytes*` / `send_data` and is what we need to
-    /// subtract from `pending_bytes` once the datagram is on the wire.
+    /// USER PAYLOAD bytes it carries.
+    ///
+    /// Was previously called by the spawned sender task to recover the
+    /// payload count for `pending_bytes` accounting; that walk now happens
+    /// at zero cost inside [`Self::consume_data_into`] and the count is
+    /// piped through the channel as `(Vec<u8>, usize)`. Kept around as a
+    /// post-hoc audit helper (e.g. asserting a malformed datagram in tests
+    /// or ad-hoc debug). Don't reintroduce it on the hot path.
     ///
     /// All packets emitted by `read_data` are `UnencryptedData` (the writer
     /// never multiplexes other types into this path), so we can skip the
     /// type check and just sum the `type_specific_payload` fields. We still
     /// validate the cursor stays in-bounds in case a future change broadens
     /// what flows through here.
+    #[allow(dead_code)]
     #[inline]
     fn payload_bytes_in_datagram(datagram: &[u8]) -> usize {
         let mut total = 0usize;
@@ -448,6 +506,17 @@ impl WriterHandler {
         ans[current_len + 20..current_len + packet_len].copy_from_slice(payload);
     }
 
+    /// Packs as many queued payloads as fit into a single Bluefin UDP datagram
+    /// in `ans` and returns the total number of USER PAYLOAD bytes packed
+    /// (i.e. excluding header bytes). A return of `0` means nothing was
+    /// produced (queue empty or — pathologically — only zero-length payloads).
+    ///
+    /// Returning the byte count here avoids a second pass over the formatted
+    /// datagram in the spawned sender task: the sender used to call
+    /// `payload_bytes_in_datagram(&datagram)` which walks the entire ~15 KiB
+    /// buffer header-by-header just to decrement `pending_bytes`. The count
+    /// is computed for free here as a side-effect of the `max_bytes_to_take`
+    /// arithmetic we already do per packet.
     #[inline(always)]
     fn consume_data_into(
         queue: &mut VecDeque<Bytes>,
@@ -455,9 +524,9 @@ impl WriterHandler {
         src_conn_id: u32,
         dst_conn_id: u32,
         ans: &mut Vec<u8>,
-    ) -> bool {
+    ) -> usize {
         if queue.is_empty() {
-            return false;
+            return 0;
         }
 
         // `running_payload` is a `Bytes` so we can `split_to` chunks in O(1)
@@ -466,6 +535,7 @@ impl WriterHandler {
         // `BytesMut` (cold path; the bench never hits it).
         let mut running_payload: Bytes = queue.pop_front().unwrap();
         let mut bytes_remaining = MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM;
+        let mut payload_bytes_packed: usize = 0;
         // Create header once and reuse (only update packet_number and type_specific_payload)
         let mut header = BluefinHeader::new(
             src_conn_id,
@@ -490,12 +560,13 @@ impl WriterHandler {
                     Self::serialize_packet_direct(ans, &header, &chunk);
                     *next_packet_num += 1;
                     bytes_remaining -= max_bytes_to_take + 20;
+                    payload_bytes_packed += max_bytes_to_take;
                 }
 
                 if !running_payload.is_empty() {
                     queue.push_front(running_payload);
                 }
-                return !ans.is_empty();
+                return payload_bytes_packed;
             }
 
             if running_payload.len() >= MAX_BLUEFIN_PAYLOAD_SIZE_BYTES {
@@ -509,6 +580,7 @@ impl WriterHandler {
                 Self::serialize_packet_direct(ans, &header, &chunk);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
+                payload_bytes_packed += max_bytes_to_take;
                 continue;
             }
 
@@ -533,6 +605,7 @@ impl WriterHandler {
                 Self::serialize_packet_direct(ans, &header, &chunk);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
+                payload_bytes_packed += max_bytes_to_take;
             } else {
                 // We can fit both the payload and the left over bytes
                 let mut merged =
@@ -554,13 +627,14 @@ impl WriterHandler {
             Self::serialize_packet_direct(ans, &header, &chunk);
             *next_packet_num += 1;
             bytes_remaining -= max_bytes_to_take + 20;
+            payload_bytes_packed += max_bytes_to_take;
         }
 
         if !running_payload.is_empty() {
             queue.push_front(running_payload);
         }
 
-        !ans.is_empty()
+        payload_bytes_packed
     }
 
     /// Legacy non-`*_into` packetizer kept around because the `#[cfg(test)]`

@@ -5,6 +5,8 @@ use bluefin_proto::BluefinResult;
 use tokio::net::UdpSocket;
 
 pub mod common;
+#[cfg(target_os = "macos")]
+pub mod macos_io;
 pub mod ring_buffer;
 pub mod window;
 
@@ -38,12 +40,16 @@ fn get_udp_socket_impl(src_addr: SocketAddr) -> BluefinResult<socket2::Socket> {
     udp_sock.set_reuse_port(true)?;
     udp_sock.set_cloexec(true)?;
     udp_sock.set_nonblocking(true).unwrap();
-    
-    // Set large socket buffers for high-throughput HFT scenarios
-    // 8MB buffers prevent packet drops during burst traffic
-    udp_sock.set_recv_buffer_size(8 * 1024 * 1024)?;  // 8MB recv buffer
-    udp_sock.set_send_buffer_size(8 * 1024 * 1024)?;  // 8MB send buffer
-    
+
+    // Request 32 MB recv/send buffers. The kernel will cap at
+    // `kern.ipc.maxsockbuf` (8 MB on macOS by default; bump with
+    // `sudo sysctl -w kern.ipc.maxsockbuf=33554432` to actually get 32 MB).
+    // Round K (sendmsg_x writer + recvmsg_x reader, 2026-05-10) showed
+    // recv-buffer pressure is the headline blocker for vectorised I/O on
+    // macOS — 8 MB only buffers ~1.6 ms of payload at 5 GB/s.
+    udp_sock.set_recv_buffer_size(32 * 1024 * 1024)?;
+    udp_sock.set_send_buffer_size(32 * 1024 * 1024)?;
+
     udp_sock.bind(&socket2::SockAddr::from(src_addr))?;
     Ok(udp_sock)
 }

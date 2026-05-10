@@ -6,11 +6,13 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
+
 use super::{
     build_and_start_ack_consumer_workers, build_and_start_conn_reader_tx_channels,
     get_connected_udp_socket,
     ordered_bytes::{ConsumeResult, OrderedBytes},
-    AckBuffer, ConnectionManagedBuffers,
+    AckBuffer, ConnectionManagedBuffers, Wakeable,
 };
 use crate::{
     core::packet::BluefinPacket,
@@ -205,6 +207,13 @@ impl ConnectionBuffer {
     }
 }
 
+impl Wakeable for ConnectionBuffer {
+    #[inline]
+    fn take_waker_clone(&self) -> Option<Waker> {
+        self.waker.clone()
+    }
+}
+
 /// ConnectionManager is what allows a single bluefin server to maintain multiple connections.
 /// This is a lock-free concurrent mapping between a unique bidirectional connection key and its
 /// connection buffer, which contains any bytes received during the connection. The unique key
@@ -284,5 +293,46 @@ impl BluefinConnection {
     #[inline]
     pub fn send(&mut self, buf: &[u8]) -> BluefinResult<usize> {
         self.writer_handler.send_data(buf)
+    }
+
+    /// Send an owned [`Bytes`]. Faster than [`Self::send`] when the caller
+    /// already holds a `Bytes` (e.g. from a buffer pool or via
+    /// `Bytes::clone()`), because the writer pipeline carries `Bytes`
+    /// internally and a clone is just a refcount bump.
+    ///
+    /// Synchronous: returns an error if the writer's bounded send queue is
+    /// full. Use [`Self::send_bytes_async`] on the hot path of high-throughput
+    /// producers; it awaits backpressure instead, so callers don't need to
+    /// sleep at the end of the run waiting for the queue to drain.
+    #[inline]
+    pub fn send_bytes(&mut self, payload: Bytes) -> BluefinResult<usize> {
+        self.writer_handler.send_bytes(payload)
+    }
+
+    /// Async variant of [`Self::send_bytes`] that awaits backpressure when
+    /// the writer's send queue is full. Preferred for tight high-throughput
+    /// loops because the caller and the writer task naturally synchronise:
+    /// once the loop returns, the writer has drained roughly everything that
+    /// was enqueued, so no end-of-run drain sleep is needed.
+    #[inline]
+    pub async fn send_bytes_async(&mut self, payload: Bytes) -> BluefinResult<usize> {
+        self.writer_handler.send_bytes_async(payload).await
+    }
+
+    /// Awaits until every byte previously accepted by [`Self::send`],
+    /// [`Self::send_bytes`], or [`Self::send_bytes_async`] has actually
+    /// been written to the underlying socket.
+    ///
+    /// This is the only correct way to drain the writer pipeline before
+    /// dropping the connection or exiting the process. Prior to this API,
+    /// callers (including the bench client) had to fall back on a fixed
+    /// `tokio::time::sleep` and hope it was long enough \u2014 visibly wrong
+    /// under load. With `flush().await`, the wait is exactly as long as
+    /// the writer needs and never longer.
+    ///
+    /// Returns immediately if there is nothing pending. Cheap to call.
+    #[inline]
+    pub async fn flush(&self) -> BluefinResult<()> {
+        self.writer_handler.flush().await
     }
 }

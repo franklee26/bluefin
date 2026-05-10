@@ -8,6 +8,7 @@ use std::{
 use bluefin::net::client::BluefinClient;
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
+use bytes::Bytes;
 use tokio::{spawn, task::yield_now, time::sleep};
 
 /// Client-side source ports. One per spawned connection task.
@@ -118,11 +119,24 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
     total_bytes += conn.send(&[14, 14, 14, 14, 14, 14])?;
 
     // Main payload loop.
-    let my_array = [0u8; 1500];
+    //
+    // Build the payload once as a `Bytes` and `clone()` it per send. Cloning a
+    // `Bytes` is a refcount bump, NOT a copy, so the only per-iteration cost
+    // is the mpsc enqueue inside `send_bytes_async`. This is what unlocks the
+    // win from the writer-channel `Vec<u8>` -> `Bytes` migration: the bench
+    // can hand the writer an already-owned buffer instead of forcing it to
+    // allocate + memcpy 1500 B every send.
+    //
+    // We use the async variant because the writer's send channel is now
+    // bounded: when the queue fills, `send_bytes_async` awaits backpressure
+    // instead of erroring or dropping. This caps memory growth on bursty
+    // producers; without it, an unbounded channel could swallow gigabytes of
+    // payloads that the writer hasn't shipped yet.
+    let payload: Bytes = Bytes::from_static(&[0u8; 1500]);
     let start = Instant::now();
     const NUM_SENDS: usize = 10_000_000;
     for i in 0..NUM_SENDS {
-        total_bytes += conn.send(&my_array)?;
+        total_bytes += conn.send_bytes_async(payload.clone()).await?;
         // Yield often enough that other tasks (the other connection, the
         // writer pump, the reader, etc.) can actually run. Without this, a
         // tight `for` loop monopolises the worker thread.
@@ -131,14 +145,18 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
         }
     }
 
-    // Give the writer task a chance to drain the (currently unbounded) send
-    // queue before the process exits and drops still-queued payloads.
-    sleep(Duration::from_secs(2)).await;
+    // Wait for the writer pipeline to drain before exiting. `flush().await`
+    // returns exactly when every byte we handed to `send_bytes_async` is on
+    // the wire (channel-queue + writer's internal `data_queue` + spawned
+    // sender's mid-`socket.send()` bytes). Replaces the old fixed
+    // `sleep(2 s)`, which was visibly too short on contended runs (server
+    // received a fraction of the bytes the client claimed to send).
+    conn.flush().await?;
 
     let elapsed = start.elapsed().as_secs_f64();
     let mb_per_sec = (total_bytes as f64 / elapsed) / 1e6;
     eprintln!(
-        "(client #{}) sent {} bytes ({} sends) in {:.3} s ~ {:.2} mb/s (queue may not have fully drained)",
+        "(client #{}) sent {} bytes ({} sends) in {:.3} s ~ {:.2} mb/s",
         task_ix, total_bytes, NUM_SENDS, elapsed, mb_per_sec
     );
 

@@ -7,10 +7,10 @@ use crate::core::packet::BluefinPacket;
 use crate::core::Extract;
 use crate::net::ack_handler::AckBuffer;
 use crate::net::connection::ConnectionBuffer;
-use crate::net::{ConnectionManagedBuffers, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
+use crate::net::{ConnectionManagedBuffers, Wakeable, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
-use std::mem::MaybeUninit;
+use bytes::BytesMut;
 use std::sync::{Arc, MutexGuard};
 
 /// This is arbitrary number of worker tasks to use if we cannot decide how many worker tasks
@@ -37,11 +37,31 @@ impl ConnReaderHandler {
     /// channel for processing. Then second kind of worker is the processing channel, which receives
     /// bytes, attempts to deserialise them into bluefin packets and buffer them in the correct
     /// buffer.
+    ///
+    /// On platforms where [`Self::get_number_of_tx_tasks`] returns 1 (macOS —
+    /// `SO_REUSEPORT` doesn't fan packets across sockets the way it does on
+    /// Linux), we collapse the two-task tx → mpsc → rx pipeline into a single
+    /// task that recvs and buffers in-line. That removes one waker hop and
+    /// one channel send per recv, and keeps the parsed-packet carrier vec
+    /// alive across iterations so we don't alloc a fresh `Vec<BluefinPacket>`
+    /// for every datagram. Linux still uses the multi-producer mpsc shape so
+    /// N parallel recv tasks can fan into one buffer task.
     pub(crate) fn start(&self) -> BluefinResult<()> {
+        let n = Self::get_number_of_tx_tasks();
+
+        if n == 1 {
+            let socket = self.socket.clone();
+            let conn_bufs = self.conn_bufs.clone();
+            spawn(async move {
+                let _ = ConnReaderHandler::recv_and_buffer_inline(socket, conn_bufs).await;
+            });
+            return Ok(());
+        }
+
         let (tx, rx) = mpsc::channel::<Vec<BluefinPacket>>(1024);
 
         // Spawn n-number of UDP-recv tasks.
-        for _ in 0..Self::get_number_of_tx_tasks() {
+        for _ in 0..n {
             let tx_cloned = tx.clone();
             let socket_cloned = self.socket.clone();
             spawn(async move {
@@ -99,26 +119,51 @@ impl ConnReaderHandler {
         socket: Arc<UdpSocket>,
         tx: mpsc::Sender<Vec<BluefinPacket>>,
     ) -> BluefinResult<()> {
-        // Use MaybeUninit to skip zeroing - recv will initialize before reading
-        let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> =
-            MaybeUninit::uninit();
-        
-        // Pre-allocate packet buffer to reuse across iterations
-        let mut packets = Vec::with_capacity(76);
+        // Capacity for the parsed-packet carrier. 76 is a safe upper bound for
+        // MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM / minimum packet size.
+        const PACKETS_VEC_CAPACITY: usize = 76;
+        let mut packets: Vec<BluefinPacket> = Vec::with_capacity(PACKETS_VEC_CAPACITY);
 
         loop {
-            // SAFETY: recv will initialize the buffer before we read from it
-            let buf = unsafe { &mut *buf_storage.as_mut_ptr() };
+            // One heap allocation per recv. We trade up to ~10 small
+            // per-payload `Vec::with_capacity` allocations inside
+            // `from_bytes_into` for a single 15 KiB `BytesMut` here. Every
+            // packet payload sliced out of `frozen` below is a refcount
+            // bump on this same allocation, so the buffer lives exactly as
+            // long as the longest-held payload.
+            let mut buf = BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
 
-            let size = socket.recv(buf).await?;
-            
-            // Zero-copy packet parsing into pre-allocated buffer
-            packets.clear();
-            BluefinPacket::from_bytes_into(&buf[..size], &mut packets)?;
+            // Hand recv a `&mut [u8]` over the spare capacity. We use
+            // `set_len(MAX)` rather than `BytesMut::zeroed(MAX)` to skip
+            // the 15 KiB memset on the hot path (mirrors the previous
+            // `MaybeUninit<[u8; MAX]>` idiom). The bytes are formally
+            // uninit until recv writes them; we never read past `size`.
+            //
+            // SAFETY: `recv` writes `size` bytes into the buffer before
+            // returning; `truncate(size)` immediately drops the
+            // still-uninit tail so no consumer can ever observe it via the
+            // `Bytes` API.
+            unsafe { buf.set_len(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM); }
+            let size = socket.recv(&mut buf[..]).await?;
+            buf.truncate(size);
 
-            // Clone only the parsed packets (not the buffer itself) to send through channel
-            // The packets have to be cloned because we're sending through mpsc and reusing buffer
-            let _ = tx.send(packets.clone()).await;
+            // `freeze()` converts the BytesMut into an immutable Bytes that
+            // can be cheaply sliced into refcount views — one per parsed
+            // packet payload.
+            let frozen = buf.freeze();
+            BluefinPacket::from_bytes_into(frozen, &mut packets)?;
+
+            // Hand the populated vec to the consumer without cloning the
+            // payloads. We then re-create an empty vec for the next iteration;
+            // this is one small allocation per datagram instead of cloning
+            // every parsed packet's payload (each up to ~1500 B).
+            //
+            // `mem::take` leaves `packets` as an empty Vec with no capacity,
+            // so the subsequent `with_capacity` is necessary to keep the
+            // amortised behaviour we had before.
+            let to_send = std::mem::take(&mut packets);
+            packets = Vec::with_capacity(PACKETS_VEC_CAPACITY);
+            let _ = tx.send(to_send).await;
         }
     }
 
@@ -130,15 +175,64 @@ impl ConnReaderHandler {
         conn_bufs: &ConnectionManagedBuffers,
     ) {
         loop {
-            if let Some(packets) = rx.recv().await {
-                let _ = Self::buffer_in_packets(packets, conn_bufs);
+            if let Some(mut packets) = rx.recv().await {
+                let _ = Self::buffer_in_packets(&mut packets, conn_bufs);
             }
+        }
+    }
+
+    /// Single-task hot loop: recv, parse, and buffer in one go. Used when
+    /// only one tx task would have been spawned (macOS) so the mpsc channel
+    /// + dedicated buffer task were pure overhead. Saves one waker hop per
+    /// recv and reuses the parsed-packet carrier vec across iterations.
+    ///
+    /// Two reverted experiments are documented in the SKILL file:
+    /// - Round J (recvmsg_x reader on its own): regressed delivered
+    ///   throughput by 9 % because the writer rarely produced multi-datagram
+    ///   bursts, so each `recvmsg_x` returned 1 datagram and paid the
+    ///   per-call setup overhead for nothing.
+    /// - Round K (paired sendmsg_x writer + recvmsg_x reader, with
+    ///   `tokio::task::yield_now()` pacing): healthy peak +9 % but
+    ///   bilateral reliability dropped to 5/10 even with `kern.ipc.maxsockbuf`
+    ///   bumped to 32 MB. `yield_now` is a no-op when no other task is
+    ///   queued, so the writer outpaced the reader.
+    ///
+    /// `macos_io::recvmsg_x_into` is preserved for a future round that
+    /// pairs with proper application-level pacing.
+    #[inline]
+    async fn recv_and_buffer_inline(
+        socket: Arc<UdpSocket>,
+        conn_bufs: Arc<ConnectionManagedBuffers>,
+    ) -> BluefinResult<()> {
+        const PACKETS_VEC_CAPACITY: usize = 76;
+        let mut packets: Vec<BluefinPacket> = Vec::with_capacity(PACKETS_VEC_CAPACITY);
+
+        loop {
+            // One heap allocation per recv (see `tx_impl` for the rationale).
+            let mut buf = BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
+            // SAFETY: `recv` writes `size` bytes into the buffer before
+            // returning; `truncate(size)` immediately drops the still-uninit
+            // tail.
+            unsafe { buf.set_len(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM); }
+            let size = socket.recv(&mut buf[..]).await?;
+            buf.truncate(size);
+            let frozen = buf.freeze();
+
+            // Reuse the carrier vec; `from_bytes_into` only ever appends.
+            packets.clear();
+            if BluefinPacket::from_bytes_into(frozen, &mut packets).is_err() {
+                continue;
+            }
+
+            // Buffer in-place via `&mut packets` so the Vec keeps its
+            // capacity for the next iteration. No mpsc, no waker hop.
+            let _ = Self::buffer_in_packets(&mut packets, &conn_bufs);
         }
     }
 
     #[inline]
     fn buffer_in_packets(
-        packets: Vec<BluefinPacket>,
+        packets: &mut Vec<BluefinPacket>,
         conn_bufs: &ConnectionManagedBuffers,
     ) -> BluefinResult<()> {
         // Nothing to do if empty
@@ -154,8 +248,8 @@ impl ConnReaderHandler {
         //    contains all data-type packets or ack-packets.
         // Therefore, with these assumptions, we can just peek at the first packet in the datagram
         // and then acquire the appropriate lock before processing.
-        let p = packets.first().unwrap();
-        match p.header.type_field {
+        let first_type = packets.first().unwrap().header.type_field;
+        match first_type {
             PacketType::Ack => {
                 let guard = conn_bufs.ack_buff.lock().unwrap();
                 Self::buffer_in_ack_packets(guard, packets)
@@ -170,15 +264,26 @@ impl ConnReaderHandler {
     #[inline]
     fn buffer_in_ack_packets(
         mut guard: MutexGuard<'_, AckBuffer>,
-        packets: Vec<BluefinPacket>,
+        packets: &mut Vec<BluefinPacket>,
     ) -> BluefinResult<()> {
         let mut e: Option<BluefinError> = None;
-        for p in packets {
+        // `drain(..)` empties the vec but keeps its capacity, so the caller's
+        // carrier vec is reusable for the next datagram without realloc.
+        for p in packets.drain(..) {
             if let Err(err) = guard.buffer_in_ack_packet(p) {
                 e = Some(err);
             }
         }
-        guard.wake()?;
+        // Clone the waker out (cheap atomic refcount), then drop the guard
+        // BEFORE waking. Waking while still holding the lock causes the woken
+        // task to immediately bounce on `lock()`.
+        let waker = guard.take_waker_clone();
+        drop(guard);
+
+        match waker {
+            Some(w) => w.wake(),
+            None => return Err(BluefinError::NoSuchWakerError),
+        }
 
         if e.is_some() {
             return Err(e.unwrap());
@@ -189,19 +294,24 @@ impl ConnReaderHandler {
     #[inline]
     fn buffer_in_data_packets(
         mut guard: MutexGuard<'_, ConnectionBuffer>,
-        packets: Vec<BluefinPacket>,
+        packets: &mut Vec<BluefinPacket>,
     ) -> BluefinResult<()> {
         let mut e: Option<BluefinError> = None;
-        for mut p in packets {
+        for mut p in packets.drain(..) {
             if let Err(err) = guard.buffer_in_bytes(p.extract()) {
                 e = Some(err);
             }
         }
 
-        if let Some(w) = guard.get_waker() {
-            w.wake_by_ref();
-        } else {
-            return Err(BluefinError::NoSuchWakerError);
+        // Clone the waker out (cheap atomic refcount), then drop the guard
+        // BEFORE waking. Waking while still holding the lock causes the woken
+        // task to immediately bounce on `lock()`.
+        let waker = guard.take_waker_clone();
+        drop(guard);
+
+        match waker {
+            Some(w) => w.wake(),
+            None => return Err(BluefinError::NoSuchWakerError),
         }
 
         if e.is_some() {

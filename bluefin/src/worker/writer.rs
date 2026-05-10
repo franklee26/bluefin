@@ -1,4 +1,11 @@
-use std::{cmp::min, collections::VecDeque, sync::Arc};
+use std::{
+    cmp::min,
+    collections::VecDeque,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use crate::core::Extract;
 use crate::{
@@ -7,10 +14,12 @@ use crate::{
 };
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
+use bytes::{Bytes, BytesMut};
 use tokio::{
     net::UdpSocket,
     spawn,
-    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    sync::Notify,
 };
 
 /// Internal representation of an ack. These fields will be used to build a Bluefin ack packet.
@@ -19,6 +28,15 @@ struct AckData {
     base_packet_num: u64,
     num_packets_consumed: usize,
 }
+
+/// Bound for the data send channel. Must be large enough that the writer
+/// pump can keep up under bursts (so callers rarely hit `WriteError`/await
+/// backpressure), but small enough to put a hard cap on memory usage and
+/// surface a slow consumer instead of accumulating arbitrary backlog.
+///
+/// At 4096 * 1500 B ≈ 6 MiB, this absorbs a fairly long stall while still
+/// being well-bounded.
+const DATA_CHANNEL_BOUND: usize = 4096;
 
 /// [WriterHandler] is a handle for all write operations to the network. The writer handler is
 /// responsible for accepting bytes, dividing them into Bluefin packets and then eventually sending
@@ -29,10 +47,26 @@ struct AckData {
 pub(crate) struct WriterHandler {
     socket: Arc<UdpSocket>,
     next_packet_num: u64,
-    data_sender: Option<UnboundedSender<Vec<u8>>>,
+    data_sender: Option<Sender<Bytes>>,
     ack_sender: Option<UnboundedSender<AckData>>,
     src_conn_id: u32,
     dst_conn_id: u32,
+    /// Number of user-payload bytes that have been accepted by
+    /// [`Self::send_bytes`] / [`Self::send_bytes_async`] / [`Self::send_data`]
+    /// but have NOT yet been written to the socket. Incremented on enqueue,
+    /// decremented inside the spawned sender task immediately after
+    /// `socket.try_send` returns `Ok`. Read by [`Self::flush`] to know when
+    /// every accepted payload byte is actually on the wire.
+    ///
+    /// Note: only DATA payload bytes are tracked; ack-channel bytes are not.
+    /// `flush()` is a user-facing operation and the user only ever asks
+    /// about data they sent.
+    pending_bytes: Arc<AtomicUsize>,
+    /// Notified by the spawned sender task whenever `pending_bytes` reaches 0.
+    /// Paired with the double-check loop in [`Self::flush`] so that a waiter
+    /// registering after the notify-call but before pending becomes non-zero
+    /// again is still woken correctly.
+    flush_notify: Arc<Notify>,
 }
 
 impl WriterHandler {
@@ -49,11 +83,13 @@ impl WriterHandler {
             next_packet_num,
             data_sender: None,
             ack_sender: None,
+            pending_bytes: Arc::new(AtomicUsize::new(0)),
+            flush_notify: Arc::new(Notify::new()),
         }
     }
 
     pub(crate) fn start(&mut self) -> BluefinResult<()> {
-        let (data_s, data_r) = mpsc::unbounded_channel();
+        let (data_s, data_r) = mpsc::channel::<Bytes>(DATA_CHANNEL_BOUND);
         let (ack_s, ack_r) = mpsc::unbounded_channel();
         self.data_sender = Some(data_s);
         self.ack_sender = Some(ack_s);
@@ -62,8 +98,19 @@ impl WriterHandler {
         let src_conn_id = self.src_conn_id;
         let dst_conn_id = self.dst_conn_id;
         let socket = Arc::clone(&self.socket);
+        let pending_bytes = Arc::clone(&self.pending_bytes);
+        let flush_notify = Arc::clone(&self.flush_notify);
         spawn(async move {
-            Self::read_data(data_r, next_packet_num, src_conn_id, dst_conn_id, socket).await;
+            Self::read_data(
+                data_r,
+                next_packet_num,
+                src_conn_id,
+                dst_conn_id,
+                socket,
+                pending_bytes,
+                flush_notify,
+            )
+            .await;
         });
 
         let socket = Arc::clone(&self.socket);
@@ -136,28 +183,73 @@ impl WriterHandler {
 
     #[inline]
     async fn read_data(
-        mut rx: UnboundedReceiver<Vec<u8>>,
+        mut rx: Receiver<Bytes>,
         next_packet_num: u64,
         src_conn_id: u32,
         dst_conn_id: u32,
         socket: Arc<UdpSocket>,
+        pending_bytes: Arc<AtomicUsize>,
+        flush_notify: Arc<Notify>,
     ) {
-        let mut data_queue = VecDeque::with_capacity(64);
+        let mut data_queue: VecDeque<Bytes> = VecDeque::with_capacity(64);
         let mut next_packet_num = next_packet_num;
         let limit = 20;
         // Pre-allocated buffer pool for datagrams (eliminates allocation overhead)
         let mut datagram_pool: Vec<Vec<u8>> = (0..12)
             .map(|_| Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM))
             .collect();
-        let mut b = Vec::with_capacity(limit);
+        let mut b: Vec<Bytes> = Vec::with_capacity(limit);
 
-        // Channel for parallel sends - decouple packetization from sending
-        let (send_tx, mut send_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Channel for parallel sends - decouple packetization from sending.
+        // Carries `(datagram, payload_bytes)` so the sender task does NOT
+        // need to re-walk the formatted datagram to recover the user-payload
+        // count for `pending_bytes` accounting. The packetiser computes that
+        // number for free as a side-effect of `consume_data_into`.
+        let (send_tx, mut send_rx) = mpsc::unbounded_channel::<(Vec<u8>, usize)>();
 
-        // Spawn dedicated sender task
+        // Return channel — sender ships emptied `Vec<u8>` allocations back
+        // to the packetiser instead of letting them drop. Without this the
+        // "buffer pool" is a lie: every iteration `mem::replace`'d the slot
+        // with a fresh `Vec::with_capacity(15200)` and the just-sent vec
+        // was dropped after `try_send`. Net: ~one 15 KiB heap allocation
+        // per outgoing datagram. With this, allocations cap at ~12 (the
+        // initial pool) at steady state.
+        //
+        // Unbounded is fine: at steady state cycle is 1:1 so the channel
+        // sits near-empty, and the bound is naturally the in-flight set
+        // (≤ 12 + the writer's mpsc::channel(4096) cap). Bounded would
+        // just introduce a dead-lock risk if recycle ever blocked on full.
+        let (recycle_tx, mut recycle_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
+        // Spawn dedicated sender task. This task is the *only* place that
+        // decrements `pending_bytes`, and it does so AFTER `socket.try_send`
+        // returns `Ok` for a given datagram. That gives `flush()` a true
+        // "on the wire" guarantee, not a "in the channel" guarantee.
+        //
+        // Two failed experiments are documented in the SKILL file:
+        //
+        // - Round I (2026-05-10): replaced this loop with a `sendmsg_x`
+        //   batch syscall on macOS. The syscall itself was genuinely faster
+        //   (peak 4.5 → 6.0 GB/s) but unpaced bursts overran the server's
+        //   8 MB recv buffer (`kern.ipc.maxsockbuf` cap). Server silently
+        //   dropped UDP datagrams; *delivered* throughput regressed.
+        //
+        // - Round K (2026-05-10): paired sendmsg_x writer (PACE_BATCH=4
+        //   with `tokio::task::yield_now()` pacing) with `recvmsg_x` reader
+        //   in conn_reader.rs. Improved healthy-run peak by +9 % but
+        //   bilateral reliability dropped 7/10 → 5/10 even after bumping
+        //   `kern.ipc.maxsockbuf` and SO_RCVBUF/SO_SNDBUF to 32 MB. The
+        //   bottleneck wasn't the recv-buffer cap; `yield_now` is a no-op
+        //   when no other task is queued on the worker, so the writer
+        //   still outpaced the reader's drain.
+        //
+        // The `macos_io::sendmsg_x_connected` and `macos_io::recvmsg_x_into`
+        // bindings remain in tree for a future round that adds proper
+        // application-level pacing (e.g. token bucket calibrated to the
+        // measured drain rate).
         let socket_clone = Arc::clone(&socket);
         spawn(async move {
-            while let Some(datagram) = send_rx.recv().await {
+            while let Some((mut datagram, payload_bytes)) = send_rx.recv().await {
                 // Keep retrying until sent
                 loop {
                     match socket_clone.try_send(&datagram) {
@@ -167,6 +259,30 @@ impl WriterHandler {
                         }
                     }
                 }
+                // Bytes are on the wire; account for them and notify any
+                // waiters in `flush()` if the in-flight count just hit zero.
+                // `payload_bytes` was computed by `consume_data_into` so we
+                // avoid a second pass over the ~15 KiB datagram here.
+                if payload_bytes > 0 {
+                    let prev = pending_bytes.fetch_sub(payload_bytes, Ordering::Relaxed);
+                    debug_assert!(
+                        prev >= payload_bytes,
+                        "pending_bytes underflow: prev={}, sub={}",
+                        prev,
+                        payload_bytes,
+                    );
+                    if prev == payload_bytes {
+                        // Counter reached zero on this decrement.
+                        flush_notify.notify_waiters();
+                    }
+                }
+                // Recycle the buffer back to the packetiser. `clear()` keeps
+                // capacity (it's a `len = 0` write, no realloc). If the
+                // packetiser has gone away (shouldn't happen — it's the
+                // upstream of this very task), `send` errors and the Vec
+                // drops naturally.
+                datagram.clear();
+                let _ = recycle_tx.send(datagram);
             }
         });
 
@@ -176,8 +292,8 @@ impl WriterHandler {
             if size == 0 {
                 continue;
             }
-            // Extract is a small optimization. We avoid a (potentially) costly clone by
-            // moving the bytes out of the vec and replacing it via a zeroed default value.
+            // `Bytes` is cheap to move out of the Vec slot via `extract` (mem::replace
+            // with `Bytes::default()`, which is an empty Bytes).
             for i in 0..size {
                 let _ = data_queue.push_back(b[i].extract());
             }
@@ -185,19 +301,23 @@ impl WriterHandler {
             // Batch packetization: create up to 12 datagrams per iteration
             for i in 0..12 {
                 datagram_pool[i].clear();
-                if Self::consume_data_into(
+                let payload_bytes = Self::consume_data_into(
                     &mut data_queue,
                     &mut next_packet_num,
                     src_conn_id,
                     dst_conn_id,
                     &mut datagram_pool[i],
-                ) {
-                    // Send asynchronously via channel - move ownership to avoid clone
-                    let datagram = std::mem::replace(
-                        &mut datagram_pool[i],
-                        Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM)
-                    );
-                    let _ = send_tx.send(datagram);
+                );
+                if payload_bytes > 0 {
+                    // Pull a recycled buffer (cap-preserving, zero-alloc) out
+                    // of the return channel before falling back to a fresh
+                    // allocation. At steady state the recycle channel always
+                    // has a Vec ready, so this branch never allocates.
+                    let replacement = recycle_rx
+                        .try_recv()
+                        .unwrap_or_else(|_| Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM));
+                    let datagram = std::mem::replace(&mut datagram_pool[i], replacement);
+                    let _ = send_tx.send((datagram, payload_bytes));
                 } else {
                     break;
                 }
@@ -205,17 +325,149 @@ impl WriterHandler {
         }
     }
 
+    /// Public send taking an owned [`Bytes`]. Zero-copy when the caller already
+    /// holds a `Bytes` (e.g. from a buffer pool or `Bytes::clone()`); cheap
+    /// regardless. Prefer this over [`Self::send_data`] on the hot path.
+    ///
+    /// Synchronous: returns [`BluefinError::WriteError`] (the channel-full case)
+    /// instead of awaiting backpressure. Use [`Self::send_bytes_async`] if you
+    /// want to block until the writer drains.
+    #[inline]
+    pub(crate) fn send_bytes(&self, payload: Bytes) -> BluefinResult<usize> {
+        match self.data_sender {
+            Some(ref sender) => {
+                let len = payload.len();
+                // Increment the in-flight counter BEFORE the enqueue so that
+                // `flush()` cannot observe a stale zero between enqueue and
+                // the writer task reading the message off the channel. If
+                // the enqueue fails (channel full / closed), undo the
+                // increment.
+                self.pending_bytes.fetch_add(len, Ordering::Relaxed);
+                if sender.try_send(payload).is_err() {
+                    self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
+                    return Err(BluefinError::WriteError(
+                        "Failed to send data (channel full or closed)",
+                    ));
+                }
+                Ok(len)
+            }
+            None => Err(BluefinError::WriteError("Sender is not available")),
+        }
+    }
+
+    /// Async send taking an owned [`Bytes`]. Awaits backpressure when the
+    /// channel is full (preferred for high-throughput producers; the `for`
+    /// loop in the bench client uses this so it doesn't have to sleep at
+    /// the end to let the writer task drain).
+    #[inline]
+    pub(crate) async fn send_bytes_async(&self, payload: Bytes) -> BluefinResult<usize> {
+        match self.data_sender {
+            Some(ref sender) => {
+                let len = payload.len();
+                // Same accounting as `send_bytes`: pre-increment so `flush()`
+                // never observes a stale zero, undo on enqueue failure.
+                self.pending_bytes.fetch_add(len, Ordering::Relaxed);
+                if sender.send(payload).await.is_err() {
+                    self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
+                    return Err(BluefinError::WriteError(
+                        "Failed to send data (channel closed)",
+                    ));
+                }
+                Ok(len)
+            }
+            None => Err(BluefinError::WriteError("Sender is not available")),
+        }
+    }
+
     #[inline]
     pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<usize> {
         match self.data_sender {
             Some(ref sender) => {
-                if sender.send(payload.to_vec()).is_err() {
-                    return Err(BluefinError::WriteError("Failed to send data"));
+                let len = payload.len();
+                self.pending_bytes.fetch_add(len, Ordering::Relaxed);
+                // We don't own the caller's buffer, so this still allocates +
+                // copies once. Callers who *do* own a `Bytes` should call
+                // `send_bytes` instead and pay only a refcount bump.
+                if sender.try_send(Bytes::copy_from_slice(payload)).is_err() {
+                    self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
+                    return Err(BluefinError::WriteError(
+                        "Failed to send data (channel full or closed)",
+                    ));
                 }
-                Ok(payload.len())
+                Ok(len)
             }
             None => Err(BluefinError::WriteError("Sender is not available")),
         }
+    }
+
+    /// Awaits until every byte that has been accepted by
+    /// [`Self::send_bytes`] / [`Self::send_bytes_async`] / [`Self::send_data`]
+    /// before the call has been written to the underlying socket.
+    ///
+    /// More precisely: at the moment `flush()` is invoked, snapshot the set
+    /// of bytes that are pending. The future resolves when the in-flight
+    /// counter — covering channel-queue, internal `data_queue`, and the
+    /// spawned sender task's mid-flight datagrams — reaches zero.
+    ///
+    /// Calls made *after* `flush().await` begins may extend the wait if
+    /// they keep the counter non-zero; in practice that's fine because the
+    /// canonical use is "call this before exit / before sleeping the task".
+    ///
+    /// Returns immediately if there is nothing pending.
+    pub(crate) async fn flush(&self) -> BluefinResult<()> {
+        loop {
+            if self.pending_bytes.load(Ordering::Relaxed) == 0 {
+                return Ok(());
+            }
+            // Register for notification BEFORE rechecking. This is the
+            // standard `tokio::sync::Notify` double-check pattern: if the
+            // sender notifies between the load and `.notified()` being
+            // ready, the registration captures the wake. We then re-check
+            // because `notify_waiters` only wakes already-registered
+            // waiters — a wake that fired before we registered would have
+            // been lost otherwise, but the recheck below catches it.
+            let notified = self.flush_notify.notified();
+            if self.pending_bytes.load(Ordering::Relaxed) == 0 {
+                return Ok(());
+            }
+            notified.await;
+        }
+    }
+
+    /// Walks an outgoing datagram (formatted as a stream of 20-byte Bluefin
+    /// headers each followed by a payload) and returns the total number of
+    /// USER PAYLOAD bytes it carries.
+    ///
+    /// Was previously called by the spawned sender task to recover the
+    /// payload count for `pending_bytes` accounting; that walk now happens
+    /// at zero cost inside [`Self::consume_data_into`] and the count is
+    /// piped through the channel as `(Vec<u8>, usize)`. Kept around as a
+    /// post-hoc audit helper (e.g. asserting a malformed datagram in tests
+    /// or ad-hoc debug). Don't reintroduce it on the hot path.
+    ///
+    /// All packets emitted by `read_data` are `UnencryptedData` (the writer
+    /// never multiplexes other types into this path), so we can skip the
+    /// type check and just sum the `type_specific_payload` fields. We still
+    /// validate the cursor stays in-bounds in case a future change broadens
+    /// what flows through here.
+    #[allow(dead_code)]
+    #[inline]
+    fn payload_bytes_in_datagram(datagram: &[u8]) -> usize {
+        let mut total = 0usize;
+        let mut cursor = 0usize;
+        while cursor + 20 <= datagram.len() {
+            // type_specific_payload is the 16 bits at [1..3] of the header.
+            let payload_len =
+                u16::from_be_bytes([datagram[cursor + 1], datagram[cursor + 2]]) as usize;
+            // Sanity: malformed datagrams shouldn't happen on this path, but
+            // refuse to walk past the end if they did.
+            if cursor + 20 + payload_len > datagram.len() {
+                break;
+            }
+            total += payload_len;
+            cursor += 20 + payload_len;
+        }
+        total
     }
 
     #[inline]
@@ -254,22 +506,36 @@ impl WriterHandler {
         ans[current_len + 20..current_len + packet_len].copy_from_slice(payload);
     }
 
+    /// Packs as many queued payloads as fit into a single Bluefin UDP datagram
+    /// in `ans` and returns the total number of USER PAYLOAD bytes packed
+    /// (i.e. excluding header bytes). A return of `0` means nothing was
+    /// produced (queue empty or — pathologically — only zero-length payloads).
+    ///
+    /// Returning the byte count here avoids a second pass over the formatted
+    /// datagram in the spawned sender task: the sender used to call
+    /// `payload_bytes_in_datagram(&datagram)` which walks the entire ~15 KiB
+    /// buffer header-by-header just to decrement `pending_bytes`. The count
+    /// is computed for free here as a side-effect of the `max_bytes_to_take`
+    /// arithmetic we already do per packet.
     #[inline(always)]
     fn consume_data_into(
-        queue: &mut VecDeque<Vec<u8>>,
+        queue: &mut VecDeque<Bytes>,
         next_packet_num: &mut u64,
         src_conn_id: u32,
         dst_conn_id: u32,
         ans: &mut Vec<u8>,
-    ) -> bool {
+    ) -> usize {
         if queue.is_empty() {
-            return false;
+            return 0;
         }
 
-        let mut running_payload = queue.pop_front().unwrap();
-        // Pre-allocate extra capacity to prevent reallocation when merging payloads
-        running_payload.reserve(MAX_BLUEFIN_PAYLOAD_SIZE_BYTES);
+        // `running_payload` is a `Bytes` so we can `split_to` chunks in O(1)
+        // without ever copying or re-allocating. Only when we need to MERGE
+        // multiple sends into one outgoing packet do we materialise into a
+        // `BytesMut` (cold path; the bench never hits it).
+        let mut running_payload: Bytes = queue.pop_front().unwrap();
         let mut bytes_remaining = MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM;
+        let mut payload_bytes_packed: usize = 0;
         // Create header once and reuse (only update packet_number and type_specific_payload)
         let mut header = BluefinHeader::new(
             src_conn_id,
@@ -288,30 +554,19 @@ impl WriterHandler {
                     );
                     header.with_packet_number(*next_packet_num);
                     header.type_specific_payload = max_bytes_to_take as u16;
-                    // Write header directly
-                    let current_len = ans.len();
-                    ans.reserve(20 + max_bytes_to_take);
-                    unsafe {
-                        ans.set_len(current_len + 20);
-                    }
-                    header.serialise_into(&mut ans[current_len..]);
-                    // Copy payload bytes directly - avoid bounds check with get_unchecked
-                    unsafe {
-                        let src = running_payload.as_ptr();
-                        let dst = ans.as_mut_ptr().add(current_len + 20);
-                        std::ptr::copy_nonoverlapping(src, dst, max_bytes_to_take);
-                        ans.set_len(current_len + 20 + max_bytes_to_take);
-                    }
-                    // Use split_off to avoid shifting - faster than drain
-                    running_payload = running_payload.split_off(max_bytes_to_take);
+                    // O(1) zero-copy slice of the front bytes; `running_payload`
+                    // keeps the rest.
+                    let chunk = running_payload.split_to(max_bytes_to_take);
+                    Self::serialize_packet_direct(ans, &header, &chunk);
                     *next_packet_num += 1;
                     bytes_remaining -= max_bytes_to_take + 20;
+                    payload_bytes_packed += max_bytes_to_take;
                 }
 
                 if !running_payload.is_empty() {
                     queue.push_front(running_payload);
                 }
-                return !ans.is_empty();
+                return payload_bytes_packed;
             }
 
             if running_payload.len() >= MAX_BLUEFIN_PAYLOAD_SIZE_BYTES {
@@ -321,41 +576,24 @@ impl WriterHandler {
                 );
                 header.with_packet_number(*next_packet_num);
                 header.type_specific_payload = max_bytes_to_take as u16;
-                // Write header directly
-                let current_len = ans.len();
-                ans.reserve(20 + max_bytes_to_take);
-                unsafe {
-                    ans.set_len(current_len + 20);
-                }
-                header.serialise_into(&mut ans[current_len..]);
-                // Copy payload bytes directly - use unsafe copy for better performance
-                unsafe {
-                    let src = running_payload.as_ptr();
-                    let dst = ans.as_mut_ptr().add(current_len + 20);
-                    std::ptr::copy_nonoverlapping(src, dst, max_bytes_to_take);
-                    ans.set_len(current_len + 20 + max_bytes_to_take);
-                }
-                // Use split_off to avoid shifting elements
-                running_payload = running_payload.split_off(max_bytes_to_take);
+                let chunk = running_payload.split_to(max_bytes_to_take);
+                Self::serialize_packet_direct(ans, &header, &chunk);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
+                payload_bytes_packed += max_bytes_to_take;
                 continue;
             }
 
+            // Cold path: we need to merge the next queued payload onto the tail
+            // of `running_payload`. Allocate a `BytesMut` to hold the union.
             let data = queue.pop_front().unwrap();
             let potential_bytes_len = data.len();
             if potential_bytes_len + running_payload.len() > MAX_BLUEFIN_PAYLOAD_SIZE_BYTES {
-                // Optimize extend with unsafe copy - eliminate bounds checks
-                let old_len = running_payload.len();
-                running_payload.reserve(data.len());
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        running_payload.as_mut_ptr().add(old_len),
-                        data.len()
-                    );
-                    running_payload.set_len(old_len + data.len());
-                }
+                let mut merged =
+                    BytesMut::with_capacity(running_payload.len() + data.len());
+                merged.extend_from_slice(&running_payload);
+                merged.extend_from_slice(&data);
+                running_payload = merged.freeze();
 
                 let max_bytes_to_take = min(
                     running_payload.len(),
@@ -363,37 +601,18 @@ impl WriterHandler {
                 );
                 header.with_packet_number(*next_packet_num);
                 header.type_specific_payload = max_bytes_to_take as u16;
-                // Write header directly
-                let current_len = ans.len();
-                ans.reserve(20 + max_bytes_to_take);
-                unsafe {
-                    ans.set_len(current_len + 20);
-                }
-                header.serialise_into(&mut ans[current_len..]);
-                // Copy payload bytes directly - use unsafe copy for better performance
-                unsafe {
-                    let src = running_payload.as_ptr();
-                    let dst = ans.as_mut_ptr().add(current_len + 20);
-                    std::ptr::copy_nonoverlapping(src, dst, max_bytes_to_take);
-                    ans.set_len(current_len + 20 + max_bytes_to_take);
-                }
-                // Use split_off to avoid shifting elements
-                running_payload = running_payload.split_off(max_bytes_to_take);
+                let chunk = running_payload.split_to(max_bytes_to_take);
+                Self::serialize_packet_direct(ans, &header, &chunk);
                 *next_packet_num += 1;
                 bytes_remaining -= max_bytes_to_take + 20;
+                payload_bytes_packed += max_bytes_to_take;
             } else {
                 // We can fit both the payload and the left over bytes
-                // Optimize extend with unsafe copy - eliminate bounds checks
-                let old_len = running_payload.len();
-                running_payload.reserve(data.len());
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data.as_ptr(),
-                        running_payload.as_mut_ptr().add(old_len),
-                        data.len()
-                    );
-                    running_payload.set_len(old_len + data.len());
-                }
+                let mut merged =
+                    BytesMut::with_capacity(running_payload.len() + data.len());
+                merged.extend_from_slice(&running_payload);
+                merged.extend_from_slice(&data);
+                running_payload = merged.freeze();
             }
         }
 
@@ -404,33 +623,23 @@ impl WriterHandler {
             );
             header.with_packet_number(*next_packet_num);
             header.type_specific_payload = max_bytes_to_take as u16;
-            // Write header directly
-            let current_len = ans.len();
-            ans.reserve(20 + max_bytes_to_take);
-            unsafe {
-                ans.set_len(current_len + 20);
-            }
-            header.serialise_into(&mut ans[current_len..]);
-            // Copy payload bytes directly - use unsafe copy for better performance
-            unsafe {
-                let src = running_payload.as_ptr();
-                let dst = ans.as_mut_ptr().add(current_len + 20);
-                std::ptr::copy_nonoverlapping(src, dst, max_bytes_to_take);
-                ans.set_len(current_len + 20 + max_bytes_to_take);
-            }
-            // Use split_off to avoid shifting elements
-            running_payload = running_payload.split_off(max_bytes_to_take);
+            let chunk = running_payload.split_to(max_bytes_to_take);
+            Self::serialize_packet_direct(ans, &header, &chunk);
             *next_packet_num += 1;
             bytes_remaining -= max_bytes_to_take + 20;
+            payload_bytes_packed += max_bytes_to_take;
         }
 
         if !running_payload.is_empty() {
             queue.push_front(running_payload);
         }
 
-        !ans.is_empty()
+        payload_bytes_packed
     }
 
+    /// Legacy non-`*_into` packetizer kept around because the `#[cfg(test)]`
+    /// suite exercises it directly. The hot path uses [`Self::consume_data_into`].
+    #[allow(dead_code)]
     fn consume_data(
         queue: &mut VecDeque<Vec<u8>>,
         next_packet_num: &mut u64,
@@ -610,6 +819,10 @@ impl WriterHandler {
         !bytes.is_empty()
     }
 
+    /// Legacy non-`*_into` ack packetizer kept around because the
+    /// `#[cfg(test)]` suite exercises it directly. The hot path uses
+    /// [`Self::consume_acks_into`].
+    #[allow(dead_code)]
     fn consume_acks(
         queue: &mut VecDeque<AckData>,
         src_conn_id: u32,

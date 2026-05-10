@@ -1,6 +1,5 @@
 use std::{
     future::Future,
-    mem::MaybeUninit,
     net::SocketAddr,
     sync::{Arc, Mutex},
     task::Poll,
@@ -19,6 +18,7 @@ use crate::{
 use bluefin_proto::context::BluefinHost;
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
+use bytes::BytesMut;
 use tokio::net::UdpSocket;
 
 #[derive(Clone)]
@@ -53,6 +53,14 @@ struct ReaderRxChannelFuture {
     buffer: Arc<Mutex<ConnectionBuffer>>,
 }
 
+// NOTE: an earlier round (G, reverted) tried to merge the consumer's two
+// lock acquisitions — the brief peek-only one in `poll` and the longer
+// consume one in `read` — into a single peek+consume under the same lock.
+// That regressed peak throughput from 4.30 GB/s → 3.56 GB/s. The two-lock
+// shape is actually advantageous: the producer (`recv_and_buffer_inline`)
+// can grab the lock during the brief gap between the consumer's peek and
+// consume, so the consumer's longer consume hold doesn't fully starve the
+// producer's recv-loop fast path. Don't re-collapse without measuring.
 impl Future for ReaderRxChannelFuture {
     type Output = ();
 
@@ -229,27 +237,32 @@ impl ReaderTxChannel {
     /// The [TxChannel]'s engine runner. This method will run forever and is responsible for reading bytes
     /// from the udp socket into a connection buffer. This method should be run its own asynchronous task.
     pub(crate) async fn run(&mut self) -> BluefinResult<()> {
-        // Use MaybeUninit to skip zeroing - we declare it uninit but recv_from will initialize before reading
-        let mut buf_storage: MaybeUninit<[u8; MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM]> =
-            MaybeUninit::uninit();
-        
         // Pre-allocate packet buffer to reuse across iterations (eliminates Vec allocation overhead)
         let mut packets = Vec::with_capacity(76); // Max packets per datagram
 
         loop {
-            // SAFETY: We get a mutable reference to the buffer storage and recv_from will initialize it.
-            // The buffer is reused across iterations but always initialized by recv_from before reading.
-            let buf = unsafe { &mut *buf_storage.as_mut_ptr() };
+            // One heap allocation per recv (see `conn_reader::tx_impl` for
+            // the rationale). The freezed `Bytes` is sliced inside
+            // `from_bytes_into` so each parsed payload is a refcount view
+            // over this single buffer rather than its own allocation.
+            let mut buf = BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
+            // SAFETY: recv writes `size` bytes; `truncate(size)` immediately
+            // discards the still-uninit tail. Mirrors the previous
+            // `MaybeUninit<[u8; MAX]>` idiom this loop used.
+            unsafe { buf.set_len(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM); }
 
             // Try non-blocking recv first for lower latency when packets are queued
-            let (size, addr) = match self.socket.try_recv_from(buf) {
+            let (size, addr) = match self.socket.try_recv_from(&mut buf[..]) {
                 Ok(result) => result,
-                Err(_) => self.socket.recv_from(buf).await?,
+                Err(_) => self.socket.recv_from(&mut buf[..]).await?,
             };
-            
-            // Zero-copy packet parsing into pre-allocated buffer
+            buf.truncate(size);
+            let frozen = buf.freeze();
+
+            // Zero-copy packet parsing: each packet's payload is a refcount
+            // view over `frozen`.
             packets.clear();
-            if BluefinPacket::from_bytes_into(&buf[..size], &mut packets).is_err() {
+            if BluefinPacket::from_bytes_into(frozen, &mut packets).is_err() {
                 continue;
             }
 

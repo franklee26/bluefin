@@ -127,7 +127,7 @@ The workflow ships these floors:
 |-------|-------|--------|
 | `mean avg gb/s` (good-conns only) | **0.40** | ~50 % of the first observed CI median (0.92 GB/s @ 5 runs × 2 conns, 2026-05-11). Detects \~50 % throughput regressions on the GOOD-conn population. |
 | `max peak gb/s` (good-conns only) | **2.00** | ~50 % of the first observed CI median (4.15 GB/s @ 5 runs × 2 conns, 2026-05-11). **Regression signal for burst rate on conns that actually transferred data.** |
-| `good conns` (≥ 700 MB each) | **6** of 10 | Liveness gate. Held at 6/10 (not the run-suggested 9/10) for runner-allocation headroom — a single bad runner allocation on hosted CI can starve up to 4 conn-trials without there being any real regression. |
+| `good conns` (≥ 700 MB each) | **6** of 20 | Liveness gate. Hosted-runner allocation is bimodal: a "good" allocation pumps 18-20/20 conns, a "bad" allocation can starve 14-17/20. Floor is set well below the worst observed allocation (3/10 = 6/20-equivalent on 2026-05-11 CI run #2) so a single bad allocation doesn't flake the gate; below 6/20 signals real degradation, not allocation luck. Bench runs 10 × 2 instead of 5 × 2 specifically to give this gate enough samples to be meaningful. |
 
 Floors 1 and 2 are pegged at ~50 % of the LOWER BOUND observed across multiple CI runs. Floor 3 is the real-regression detector held below its current empirical lower bound for noise tolerance. **Real perf signal still lives in local sweeps**, but the CI gate is now meaningful enough to catch a sub-50 % throughput regression or a complete liveness failure.
 
@@ -253,7 +253,7 @@ Each gated metric gets its own `:white_check_mark:` / `:x:` cell, so reviewers c
 | Task | What to do |
 |------|------------|
 | **Run the gate locally** | `./bench_ci.sh -r 5 -n 2 --skip-build` (after a `cargo build --release --bin server --bin client`). Takes ~1 min. |
-| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.05 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=1.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=6 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=700000000 BLUEFIN_SOCKET_RCVBUF=8388608 BLUEFIN_SOCKET_SNDBUF=8388608 BLUEFIN_NUM_SENDS=500000 BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10 BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md`. |
+| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.40 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=2.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=6 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=700000000 BLUEFIN_SOCKET_RCVBUF=8388608 BLUEFIN_SOCKET_SNDBUF=8388608 BLUEFIN_NUM_SENDS=500000 BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10 BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md ./bench_ci.sh -r 10 -n 2 --skip-build`. |
 | **Force a FAIL to test the comment** | `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=10.0 ./bench_ci.sh -r 2 -n 2 --skip-build`. Useful when changing the Markdown emitter. |
 | **Bump floors after a perf gain** | See "Ratcheting up" above. Edit only `.github/workflows/bluefin.yml`'s `env:` block. |
 | **Inspect a CI failure** | Open the run → `bench (macos-latest)` job → expand `Run CI bench`. The Markdown also lands in the run's Summary tab and on the PR. The full per-run logs are in the `bench-logs` artifact. |

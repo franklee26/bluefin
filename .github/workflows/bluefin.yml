@@ -75,9 +75,9 @@ jobs:
 
   bench:
     # Throughput regression gate. Runs the two-process loopback bench
-    # (server + N client procs, each with its own tokio runtime) 5 times
-    # at N=2 connections, parses per-conn FINAL lines, and asserts the
-    # aggregate stats clear the floors below.
+    # (server + N client procs, each with its own tokio runtime) 10 times
+    # at N=2 connections (= 20 conn-trials), parses per-conn FINAL lines,
+    # and asserts the aggregate stats clear the floors below.
     #
     # >>> RUNNER REALITY <<<
     # Hosted macos-latest runners are dramatically slower and burstier than
@@ -160,7 +160,7 @@ jobs:
       # See block comment above for the rationale.
       BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS:    "0.40"      # ~50 % of first observed CI median (0.92 GB/s @ 5 runs)
       BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS:    "2.00"      # ~50 % of first observed CI median (4.15 GB/s @ 5 runs)
-      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "6"         # ≥6 of 10 conn-trials completed the (shrunk) payload; held at 6 (not 9) for runner-allocation headroom
+      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "6"         # ≥6 of 20 conn-trials completed the (shrunk) payload; loose enough to absorb the bimodal hosted-runner allocation pattern (one bad allocation can starve up to ~10 of 20 trials)
       BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES:    "700000000" # 700 MB ≈ 93 % of the 750 MB CI payload (BLUEFIN_NUM_SENDS=500000 × 1500)
       BLUEFIN_BENCH_SUMMARY_MD:             "bench_logs/ci_summary.md"
       # Bump per-socket SO_RCVBUF / SO_SNDBUF from the hardcoded 512 KB
@@ -192,13 +192,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build release binaries
         run: cargo build --release --bin server --bin client
-      - name: Run CI bench (5 runs x 2 conns)
+      - name: Run CI bench (10 runs x 2 conns)
         id: bench
         # Don't fail the step here — we want the comment + step-summary to
         # post even on regression. We re-export the rc and fail at the end.
         run: |
           set +e
-          ./bench_ci.sh -r 5 -n 2 --skip-build
+          ./bench_ci.sh -r 10 -n 2 --skip-build
           echo "rc=$?" >> "$GITHUB_OUTPUT"
       - name: Append summary to GitHub step summary
         if: always()

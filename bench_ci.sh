@@ -80,8 +80,9 @@ RUN_LOG_DIRS=()
 RUN_RC=()
 # Parallel arrays keyed by run index (0-based). Each slot is a space-joined
 # string for that run; empty if no FINAL lines were parsed.
-RUN_AVGS=()       # avg gb/s per conn, space-joined (all conns)
+RUN_AVGS=()       # avg gb/s per conn, space-joined (all conns; kept for reference / debugging)
 RUN_PEAKS=()      # peak gb/s per conn, space-joined (all conns, for reporting)
+RUN_GOOD_AVGS=()  # avg gb/s per GOOD conn only (per-run mean_avg column)
 RUN_GOOD_PEAKS=() # peak gb/s per GOOD conn only (per-run max_peak column)
 RUN_GOOD=()       # good-conn count for this run
 
@@ -151,12 +152,15 @@ for ((run = 1; run <= N_RUNS; run++)); do
         echo "  WARN: run $run server.log empty or missing ($server_log)"
         RUN_AVGS+=("")
         RUN_PEAKS+=("")
+        RUN_GOOD_AVGS+=("")
+        RUN_GOOD_PEAKS+=("")
         RUN_GOOD+=("0")
         continue
     fi
 
     run_avgs_local=()
     run_peaks_local=()
+    run_good_avgs_local=()
     run_good_peaks_local=()
     run_good_local=0
 
@@ -216,6 +220,7 @@ for ((run = 1; run <= N_RUNS; run++)); do
             GOOD_CONNS=$((GOOD_CONNS + 1))
             GOOD_AVGS+=("$avg")
             GOOD_PEAKS+=("$peak")
+            run_good_avgs_local+=("$avg")
             run_good_peaks_local+=("$peak")
             run_good_local=$((run_good_local + 1))
             verdict="GOOD"
@@ -227,6 +232,7 @@ for ((run = 1; run <= N_RUNS; run++)); do
 
     RUN_AVGS+=("${run_avgs_local[*]:-}")
     RUN_PEAKS+=("${run_peaks_local[*]:-}")
+    RUN_GOOD_AVGS+=("${run_good_avgs_local[*]:-}")
     RUN_GOOD_PEAKS+=("${run_good_peaks_local[*]:-}")
     RUN_GOOD+=("$run_good_local")
 done
@@ -335,18 +341,29 @@ esac
     echo
     echo "### Per-run"
     echo
-    echo "| run | good/N | mean avg gb/s | max peak gb/s (good) | raw max peak gb/s |"
+    echo "| run | good/N | mean avg gb/s (good) | max peak gb/s (good) | raw max peak gb/s |"
     echo "| ---: | :---: | ---: | ---: | ---: |"
     for ((i = 0; i < N_RUNS; i++)); do
         avgs="${RUN_AVGS[$i]}"
         peaks="${RUN_PEAKS[$i]}"
+        good_avgs="${RUN_GOOD_AVGS[$i]}"
         good_peaks="${RUN_GOOD_PEAKS[$i]}"
         good_n="${RUN_GOOD[$i]}"
         if [[ -z "$avgs" ]]; then
             echo "| $((i + 1)) | 0/$N_CONNS | — | — | — |"
             continue
         fi
-        run_mean_avg=$(printf '%s\n' $avgs | awk '{s+=$1;n++} END{printf "%.2f", s/n}')
+        # Per-run `mean avg gb/s` is filtered to GOOD conns only, mirroring
+        # the aggregate. Without this filter, a TRUNC conn whose elapsed
+        # collapses to <100 ms after recv-idle subtraction reports a wildly
+        # inflated avg (observed: 14 GB/s with 0 good conns), which is the
+        # same drain-artifact pathology as max_peak just expressed via the
+        # divisor instead of the inst-throughput print.
+        if [[ -z "$good_avgs" ]]; then
+            run_mean_avg="—"
+        else
+            run_mean_avg=$(printf '%s\n' $good_avgs | awk '{s+=$1;n++} END{printf "%.2f", s/n}')
+        fi
         run_raw_peak=$(printf '%s\n' $peaks | awk 'BEGIN{m=0} {if($1>m) m=$1} END{printf "%.2f", m}')
         if [[ -z "$good_peaks" ]]; then
             run_good_peak="—"

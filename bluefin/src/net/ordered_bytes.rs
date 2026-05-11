@@ -13,9 +13,8 @@ pub const MAX_BUFFER_SIZE: usize = 2000;
 /// Both call sites guarantee `base < MAX_BUFFER_SIZE` and `offset < MAX_BUFFER_SIZE`,
 /// so `base + offset < 2 * MAX_BUFFER_SIZE` and a single branch + subtract reproduces
 /// the modulo. `MAX_BUFFER_SIZE = 2000` is **not** a power of two, so a true `%`
-/// would compile to a 20–30 cycle `div`/`idiv` instead of ~1 cycle. See round G3
-/// in the perf SKILL: this used to be ~1.27 % server self-time on the hot
-/// `buffer_in_packet`/`consume`/`consume_bytes` loops.
+/// would compile to a 20–30 cycle `div`/`idiv` instead of ~1 cycle. This sits on
+/// the hot `buffer_in_packet` / `consume` / `consume_bytes` loops.
 #[inline(always)]
 fn wrap_index(base: usize, offset: usize) -> usize {
     let raw = base + offset;
@@ -159,8 +158,7 @@ impl OrderedBytes {
         // emit a 20–30 cycle integer division. Since `offset < MAX_BUFFER_SIZE`
         // (just checked) and `smallest_packet_number_index < MAX_BUFFER_SIZE`
         // (invariant), the unwrapped sum is `< 2 * MAX_BUFFER_SIZE`, so a single
-        // branch + subtract reproduces the modulo. ~1–2 cycles per call. See
-        // round G3 in the perf SKILL: `buffer_in_packet` was 1.27 % server self.
+        // branch + subtract reproduces the modulo. ~1–2 cycles per call.
         let index = wrap_index(self.smallest_packet_number_index, offset);
         // We do not overwrite packets in the buffer.
         if self.packets[index].is_some() {
@@ -330,7 +328,7 @@ impl OrderedBytes {
             && (out.len() - initial_len) < max_packets
             && self.packets[wrap_index(base, ix)].is_some()
         {
-            // Hoist the wrap once per iteration; see G3 in the perf SKILL.
+            // Hoist the wrap once per iteration.
             let slot = wrap_index(base, ix);
             // `take()` moves the BluefinPacket out of the slot. The
             // payload field is `Bytes`; moving it is just a pointer +

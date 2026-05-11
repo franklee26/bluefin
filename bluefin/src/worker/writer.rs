@@ -47,12 +47,8 @@ const DATA_CHANNEL_BOUND: usize = 4096;
 pub(crate) struct WriterHandler {
     socket: Arc<UdpSocket>,
     next_packet_num: u64,
-    /// **Round P (2026-05-10)**: swapped from `tokio::sync::mpsc::Sender<Bytes>`
-    /// to `flume::Sender<Bytes>` to eliminate the per-32-message list-block
-    /// alloc/free churn that was ~3.5–4 % of client CPU on the post-O
-    /// flamegraph (live bottleneck #17). flume uses an array-backed ring
-    /// buffer with no per-batch allocation; semantics preserved
-    /// (`try_send`/`send_async` map directly).
+    /// Array-backed channel (no per-batch list-block alloc/free that tokio's
+    /// linked-block mpsc has on the hot send path).
     data_sender: Option<flume::Sender<Bytes>>,
     ack_sender: Option<UnboundedSender<AckData>>,
     src_conn_id: u32,
@@ -212,10 +208,7 @@ impl WriterHandler {
         // count for `pending_bytes` accounting. The packetiser computes that
         // number for free as a side-effect of `consume_data_into`.
         //
-        // **Round P (2026-05-10)**: swapped from tokio's unbounded mpsc to
-        // `flume::unbounded` to avoid the same per-32-message list-block
-        // alloc/free that the public data channel had. ~250K crossings per
-        // 10 M sends = ~7.8K block alloc/free pairs without the swap.
+        // Array-backed (flume) for the same reason as `data_sender` above.
         let (send_tx, send_rx) = flume::unbounded::<(Vec<u8>, usize)>();
 
         // Return channel — sender ships emptied `Vec<u8>` allocations back
@@ -228,13 +221,12 @@ impl WriterHandler {
         //
         // Bounded to RECYCLE_CAPACITY: at steady state the producer/consumer
         // cycle is 1:1 so the channel sits at depth 0–1 and the bound never
-        // fires. The bound matters at process exit: an unbounded channel
-        // hoarded hundreds of empty 15 KiB Vecs at shutdown and tokio's
-        // task drop freed them serially through `madvise(DONT_NEED)`, which
-        // showed up as ~22 % of leaf samples in the 2026-05-10 client
-        // flamegraph (live bottleneck #15). With `try_send` below, a full
-        // channel drops the just-cleared Vec in place — there is no `await`
-        // on the sender so no deadlock risk.
+        // fires. The bound matters at process exit — an unbounded channel
+        // hoards every datagram allocated during the run, and tokio's task
+        // drop frees them serially through `madvise(DONT_NEED)`, which can
+        // dominate shutdown CPU. With `try_send` below, a full channel
+        // drops the just-cleared Vec in place. There is no `await` on the
+        // sender so no deadlock risk.
         const RECYCLE_CAPACITY: usize = 16;
         let (recycle_tx, mut recycle_rx) = mpsc::channel::<Vec<u8>>(RECYCLE_CAPACITY);
 
@@ -243,27 +235,11 @@ impl WriterHandler {
         // returns `Ok` for a given datagram. That gives `flush()` a true
         // "on the wire" guarantee, not a "in the channel" guarantee.
         //
-        // Two failed experiments are documented in the SKILL file:
-        //
-        // - Round I (2026-05-10): replaced this loop with a `sendmsg_x`
-        //   batch syscall on macOS. The syscall itself was genuinely faster
-        //   (peak 4.5 → 6.0 GB/s) but unpaced bursts overran the server's
-        //   8 MB recv buffer (`kern.ipc.maxsockbuf` cap). Server silently
-        //   dropped UDP datagrams; *delivered* throughput regressed.
-        //
-        // - Round K (2026-05-10): paired sendmsg_x writer (PACE_BATCH=4
-        //   with `tokio::task::yield_now()` pacing) with `recvmsg_x` reader
-        //   in conn_reader.rs. Improved healthy-run peak by +9 % but
-        //   bilateral reliability dropped 7/10 → 5/10 even after bumping
-        //   `kern.ipc.maxsockbuf` and SO_RCVBUF/SO_SNDBUF to 32 MB. The
-        //   bottleneck wasn't the recv-buffer cap; `yield_now` is a no-op
-        //   when no other task is queued on the worker, so the writer
-        //   still outpaced the reader's drain.
-        //
-        // The `macos_io::sendmsg_x_connected` and `macos_io::recvmsg_x_into`
-        // bindings remain in tree for a future round that adds proper
-        // application-level pacing (e.g. token bucket calibrated to the
-        // measured drain rate).
+        // Vectorised I/O (sendmsg_x batches) was tried and reverted: the
+        // syscall is cheaper but unpaced bursts overrun the receiver's UDP
+        // socket buffer (silent drop). The `macos_io::sendmsg_x_connected`
+        // and `macos_io::recvmsg_x_into` bindings remain in tree for a
+        // future round that adds application-level pacing.
         let socket_clone = Arc::clone(&socket);
         spawn(async move {
             while let Ok((mut datagram, payload_bytes)) = send_rx.recv_async().await {
@@ -347,9 +323,8 @@ impl WriterHandler {
                         .try_recv()
                         .unwrap_or_else(|_| Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM));
                     let datagram = std::mem::replace(&mut datagram_pool[i], replacement);
-                    // flume's `Sender::send` is sync (matches the previous
-                    // tokio unbounded `send`); succeeds unless the receiver
-                    // has been dropped, which can't happen here.
+                    // Sync send; succeeds unless the receiver has been
+                    // dropped, which can't happen here.
                     let _ = send_tx.send((datagram, payload_bytes));
                 } else {
                     break;

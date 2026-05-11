@@ -123,7 +123,7 @@ impl ConnReaderHandler {
         // MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM / minimum packet size.
         const PACKETS_VEC_CAPACITY: usize = 76;
         let mut packets: Vec<BluefinPacket> = Vec::with_capacity(PACKETS_VEC_CAPACITY);
-        // F3: 1-slot recv-buffer recycle. We hold one extra refcount on the
+        // 1-slot recv-buffer recycle. We hold one extra refcount on the
         // just-frozen `Bytes` across one iteration; if all per-packet slices
         // (and the consumer's downstream Bytes views) have been dropped by
         // the time we loop back, `try_into_mut` returns the same 15 KiB
@@ -201,19 +201,11 @@ impl ConnReaderHandler {
     /// + dedicated buffer task were pure overhead. Saves one waker hop per
     /// recv and reuses the parsed-packet carrier vec across iterations.
     ///
-    /// Two reverted experiments are documented in the SKILL file:
-    /// - Round J (recvmsg_x reader on its own): regressed delivered
-    ///   throughput by 9 % because the writer rarely produced multi-datagram
-    ///   bursts, so each `recvmsg_x` returned 1 datagram and paid the
-    ///   per-call setup overhead for nothing.
-    /// - Round K (paired sendmsg_x writer + recvmsg_x reader, with
-    ///   `tokio::task::yield_now()` pacing): healthy peak +9 % but
-    ///   bilateral reliability dropped to 5/10 even with `kern.ipc.maxsockbuf`
-    ///   bumped to 32 MB. `yield_now` is a no-op when no other task is
-    ///   queued, so the writer outpaced the reader.
-    ///
-    /// `macos_io::recvmsg_x_into` is preserved for a future round that
-    /// pairs with proper application-level pacing.
+    /// Vectorised I/O (recvmsg_x batches) was tried and reverted: under the
+    /// current writer, multi-datagram bursts are rare so each batch returns
+    /// 1 datagram and pays the per-call setup overhead for nothing. The
+    /// `macos_io::recvmsg_x_into` binding remains in tree for a future round
+    /// that pairs it with a paced batched writer.
     #[inline]
     async fn recv_and_buffer_inline(
         socket: Arc<UdpSocket>,
@@ -221,7 +213,7 @@ impl ConnReaderHandler {
     ) -> BluefinResult<()> {
         const PACKETS_VEC_CAPACITY: usize = 76;
         let mut packets: Vec<BluefinPacket> = Vec::with_capacity(PACKETS_VEC_CAPACITY);
-        // F3: 1-slot recv-buffer recycle (see `tx_impl` for full rationale).
+        // 1-slot recv-buffer recycle (see `tx_impl` for full rationale).
         let mut recycle: Option<Bytes> = None;
 
         loop {

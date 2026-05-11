@@ -312,9 +312,8 @@ impl BluefinConnection {
     /// Zero-copy variant of [`Self::recv`]. Pushes up to `max_packets`
     /// whole-payload [`Bytes`] slices into `out` instead of memcpying
     /// into a caller `&mut [u8]`. Each pushed `Bytes` is a refcount view
-    /// over the recv buffer, so this avoids the ~5 % `_platform_memmove`
-    /// in `OrderedBytes::consume` that the 2026-05-10 server flamegraph
-    /// surfaced (live bottleneck #13 in the perf SKILL).
+    /// over the recv buffer, so this avoids the `_platform_memmove`
+    /// in `OrderedBytes::consume`.
     ///
     /// Returns the total number of payload bytes pushed into `out` on
     /// this call. The vec is *not* cleared on entry — drain or clear it

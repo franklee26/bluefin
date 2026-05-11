@@ -16,13 +16,12 @@ use tokio::{spawn, task::JoinSet, time::sleep};
 /// the benchmark server can terminate cleanly.
 const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How often to push the idle deadline forward. Resetting on every recv
-/// (the original `tokio::time::timeout(RECV_IDLE_TIMEOUT, conn.recv(...))`
-/// pattern) re-armed a fresh `Sleep` on the timer wheel at recv-rate
-/// (~270K/s on the bench) and dominated the server CPU profile (live
-/// bottleneck #12 in the perf SKILL). Resetting once per `IDLE_RESET_EVERY`
-/// recvs caps that at <100/s while keeping idle detection sharp to
-/// `RECV_IDLE_TIMEOUT + ~15ms` at the bench's recv rate.
+/// How often to push the idle deadline forward. Resetting the `Sleep`'s
+/// deadline on every recv (the natural `tokio::time::timeout` pattern) re-arms
+/// the timer wheel at recv-rate (~270 K/s on the bench), which dominates
+/// CPU. Resetting once per `IDLE_RESET_EVERY` recvs caps that at <100 Hz while
+/// keeping idle detection sharp to `RECV_IDLE_TIMEOUT + ~15 ms` at the bench's
+/// recv rate.
 const IDLE_RESET_EVERY: i64 = 4096;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
@@ -107,21 +106,18 @@ async fn run() -> BluefinResult<()> {
             let mut last_print_instant = now;
 
             // Single long-lived idle deadline. Pinning one `Sleep` and
-            // resetting its deadline (instead of allocating a fresh
-            // `Sleep` per recv via `tokio::time::timeout`) is the
-            // documented tokio idiom for hot loops and removes the
-            // per-recv timer-wheel arm/disarm. See live bottleneck #12.
+            // resetting its deadline (instead of allocating a fresh `Sleep`
+            // per recv via `tokio::time::timeout`) is the documented tokio
+            // idiom for hot loops and removes the per-recv timer-wheel
+            // arm/disarm.
             let idle_sleep = sleep(RECV_IDLE_TIMEOUT);
             tokio::pin!(idle_sleep);
 
             loop {
-                // `recv_bytes` is the zero-copy variant of `recv`: it
-                // pushes `Bytes` slices over the recv buffer into our
-                // carrier vec instead of memcpying into a `[u8]`. The
-                // bench has no need for a contiguous buffer (we just
-                // sum lengths), so this lets us skip the ~5 % library
-                // CPU spent in `OrderedBytes::consume` -> memmove. See
-                // live bottleneck #13 in the perf SKILL.
+                // `recv_bytes` is the zero-copy variant of `recv`: it pushes
+                // `Bytes` slices over the recv buffer into our carrier vec
+                // instead of memcpying into a `[u8]`. The bench has no need
+                // for a contiguous buffer (we just sum lengths).
                 let size = tokio::select! {
                     biased;
                     recv = conn.recv_bytes(&mut chunks, 16) => {

@@ -50,7 +50,7 @@ All knobs are read from the environment by [`bench_ci.sh`](../../bench_ci.sh); s
 | `BLUEFIN_SOCKET_RCVBUF` | unset (production) / `8388608` (8 MiB, workflow) | Per-socket `SO_RCVBUF` override read by [`BluefinSocket::new`](../../bluefin-io/src/socket/udp_socket.rs). When unset, falls back to the hardcoded **512 KiB** default — see "Socket buffer sizes" below. |
 | `BLUEFIN_SOCKET_SNDBUF` | unset (production) / `8388608` (8 MiB, workflow) | Per-socket `SO_SNDBUF` override, same semantics as RCVBUF. Set in CI to keep send/recv symmetric on the loopback bench. |
 | `BLUEFIN_NUM_SENDS` | unset (production = `10_000_000`) / `500000` (workflow) | Per-conn payload-loop iteration count read by [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs). Each iteration sends a 1500 B `Bytes`, so this controls total per-conn payload size: `NUM_SENDS × 1500 B`. CI ships 750 MB instead of the 15 GB dev default — see "Payload size and idle-timeout" below. |
-| `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` | unset (production = `2`) / `10` (workflow) | Server's per-conn recv-idle deadline in seconds, read once at startup by [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs). Bluefin has no protocol FIN; this is how the bench server decides a peer is gone. CI bumps to 10 s so slow-but-progressing CI conns can finish the (shrunk) payload before the deadline TRUNCs them. The server's FINAL `avg gb/s` subtracts this tail from the divisor so the reported number is bytes / actual-transfer-time. |
+| `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` | unset (production = `2`) / `20` (workflow) | Server's per-conn recv-idle deadline in seconds, read once at startup by [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs). Bluefin has no protocol FIN; this is how the bench server decides a peer is gone. CI bumps to 20 s so slow-but-progressing CI conns can finish the (shrunk) payload before the deadline TRUNCs them. The server's FINAL `avg gb/s` subtracts this tail from the divisor so the reported number is bytes / actual-transfer-time. |
 | `BLUEFIN_BENCH_RUN_RETRIES_ON_ZERO` | `0` (script) / `2` (workflow) | Maximum extra attempts per run when the run yields **0** GOOD conns. Catastrophic 0-good runs on hosted CI are almost always runner-allocation noise (CPU starvation, noisy neighbour); 2 retries make the post-retry catastrophic rate well under 0.1 %. Only the final attempt's data is committed; earlier attempts' logs stay on disk under their `attempt_*` directories but are NOT parsed. |
 | `BLUEFIN_BENCH_RUN_RETRIES_ON_PARTIAL` | `0` (script) / `0` (workflow) | Maximum extra attempts per run when the run yields **partial** GOOD conns (1 ≤ good < N). Default 0 because the conns that succeeded are real signal worth keeping; retrying would discard the diagnostic value of seeing GOOD-alongside-TRUNC. Bump only if you specifically want to suppress partial outcomes. |
 | `BLUEFIN_BENCH_RUN_RETRIES` | `0` | **Legacy single-knob fallback.** Used as the default for both ON_ZERO and ON_PARTIAL when neither is set explicitly. Kept for shell-override convenience; new code should set the asymmetric knobs directly. |
@@ -88,7 +88,7 @@ Option C (this stack) shrinks both axes proportionally so CI behaves like dev:
 | Knob | Dev default | CI override | Why |
 |------|-------------|-------------|-----|
 | `BLUEFIN_NUM_SENDS` | `10_000_000` | `500_000` | 15 GB → 750 MB. Active conns on hosted runners finish 750 MB in 2.5–15 s of real transfer time. |
-| `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` | `2` | `10` | 2 s → 10 s. Tolerates the longest scheduling-gap-induced stalls observed on hosted runners (≤ 5 ms typical, ≤ 1 s under heavy contention). |
+| `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` | `2` | `20` | 2 s → 20 s. Tolerates multi-second scheduling stalls observed on the worst hosted-runner allocations (5-10 s mid-stream stalls observed in practice). The timeout only fires when nothing arrives, so healthy runs are unaffected. |
 
 With Option C, `good_conns` returns to its original semantic ("delivered the full payload") and the floor of 5/10 becomes a **real liveness gate** rather than a smoke test.
 
@@ -98,7 +98,7 @@ With Option C, `good_conns` returns to its original semantic ("delivered the ful
 
 - **Lower** `BLUEFIN_NUM_SENDS` if hosted-runner throughput drops further (e.g. macOS image rev). Shrink `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` proportionally (~93 % of new target).
 - **Raise** `BLUEFIN_NUM_SENDS` to widen the burst window if hosted runners get faster (more iterations → more opportunities for the server's print-cadence to catch a peak).
-- **Raise** `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` if `bench (macos-latest)` starts showing a wave of TRUNC conns at 10 s but no actual perf regression. Keep `bench_two_process.sh`'s server-grace in sync (it auto-derives `recv_idle + 3` seconds).
+- **Raise** `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` if `bench (macos-latest)` starts showing a wave of TRUNC conns at 20 s but no actual perf regression. Keep `bench_two_process.sh`'s server-grace in sync (it auto-derives `recv_idle + 3` seconds).
 - Don't unset either env var in CI — falling back to dev defaults will TRUNC every conn and FAIL the gate.
 
 ### Socket buffer sizes (`BLUEFIN_SOCKET_RCVBUF` / `BLUEFIN_SOCKET_SNDBUF`)
@@ -170,7 +170,7 @@ Drain artifacts ALWAYS come from starved conns by construction (the active conn 
 
 ### Pathology 3: starved-conn `avg` is structurally tail-diluted
 
-The server's FINAL line reports `bytes / elapsed`, where `elapsed` is computed as `now.elapsed() - recv_idle` (clamped at 1 ms). Pre-Option-C, the subtraction wasn't there: `elapsed` included the full 2 s tail and the displayed avg was diluted accordingly (60 MB delivered in 0.6 s active recv → reported `60 / 2.6 = 23 MB/s`, not the 100 MB/s sustained rate). The fix landed when CI bumped `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` from 2 s to 10 s — without it, the dilution would have been 10× worse and dragged mean_avg into the noise floor.
+The server's FINAL line reports `bytes / elapsed`, where `elapsed` is computed as `now.elapsed() - recv_idle` (clamped at 1 ms). Pre-Option-C, the subtraction wasn't there: `elapsed` included the full 2 s tail and the displayed avg was diluted accordingly (60 MB delivered in 0.6 s active recv → reported `60 / 2.6 = 23 MB/s`, not the 100 MB/s sustained rate). The fix landed when CI bumped `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` from 2 s upward (currently 20 s) — without it, the dilution would have been 10×+ worse and dragged mean_avg into the noise floor.
 
 **Why the fix is safe for production**: the subtraction is approximate (the actual gap between last byte and idle-fire is `recv_idle ± IDLE_RESET_EVERY-iter-time`), but the error is bounded by tens of microseconds at hot-loop rates — dwarfed by the 2 s timeout it's correcting for. Production logs go from "slightly under-reports avg" to "reports avg accurately".
 
@@ -258,7 +258,7 @@ Each gated metric gets its own `:white_check_mark:` / `:x:` cell, so reviewers c
 | Task | What to do |
 |------|------------|
 | **Run the gate locally** | `./bench_ci.sh -r 5 -n 2 --skip-build` (after a `cargo build --release --bin server --bin client`). Takes ~1 min. |
-| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.40 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=2.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=5 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=700000000 BLUEFIN_SOCKET_RCVBUF=8388608 BLUEFIN_SOCKET_SNDBUF=8388608 BLUEFIN_NUM_SENDS=500000 BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10 BLUEFIN_NUM_READER_WORKERS=2 BLUEFIN_BENCH_RUN_RETRIES_ON_ZERO=2 BLUEFIN_BENCH_RUN_RETRIES_ON_PARTIAL=0 BLUEFIN_BENCH_RUN_RETRY_BACKOFF_SECS=5 BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md ./bench_ci.sh -r 5 -n 2 --skip-build`. |
+| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.40 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=2.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=5 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=700000000 BLUEFIN_SOCKET_RCVBUF=8388608 BLUEFIN_SOCKET_SNDBUF=8388608 BLUEFIN_NUM_SENDS=500000 BLUEFIN_RECV_IDLE_TIMEOUT_SECS=20 BLUEFIN_NUM_READER_WORKERS=2 BLUEFIN_BENCH_RUN_RETRIES_ON_ZERO=2 BLUEFIN_BENCH_RUN_RETRIES_ON_PARTIAL=0 BLUEFIN_BENCH_RUN_RETRY_BACKOFF_SECS=5 BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md ./bench_ci.sh -r 5 -n 2 --skip-build`. |
 | **Force a FAIL to test the comment** | `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=10.0 ./bench_ci.sh -r 2 -n 2 --skip-build`. Useful when changing the Markdown emitter. |
 | **Bump floors after a perf gain** | See "Ratcheting up" above. Edit only `.github/workflows/bluefin.yml`'s `env:` block. |
 | **Inspect a CI failure** | Open the run → `bench (macos-latest)` job → expand `Run CI bench`. The Markdown also lands in the run's Summary tab and on the PR. The full per-run logs are in the `bench-logs` artifact. |

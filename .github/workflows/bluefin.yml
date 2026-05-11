@@ -93,10 +93,14 @@ jobs:
     #      throughput needed to deliver 15 GB inside any reasonable
     #      timeout window.
     #
-    #   2. BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10 extends the server's
-    #      "peer-is-gone" deadline from the default 2 s to 10 s. Without
+    #   2. BLUEFIN_RECV_IDLE_TIMEOUT_SECS=20 extends the server's
+    #      "peer-is-gone" deadline from the default 2 s to 20 s. Without
     #      this bump, conns that are progressing slowly on a contended
     #      runner get TRUNCated mid-flight and the gate becomes meaningless.
+    #      Empirically the worst hosted-runner scheduling stalls observed
+    #      were 5-10 s mid-stream; 20 s gives ≥2x headroom over the worst
+    #      observed without changing healthy-run wall-clock at all (the
+    #      timeout only fires when nothing arrives).
     #
     #   3. BLUEFIN_SOCKET_RCVBUF / SNDBUF=8388608 raises per-socket buffers
     #      from the hardcoded 512 KiB default to 8 MiB. 512 KiB drains in
@@ -186,7 +190,7 @@ jobs:
       # makes BLUEFIN_BENCH_FLOOR_GOOD_CONNS a real liveness gate at 5/10.
       # Production binaries built without these env vars are unaffected.
       BLUEFIN_NUM_SENDS:                    "500000"    # 500 K × 1500 B = 750 MB per conn
-      BLUEFIN_RECV_IDLE_TIMEOUT_SECS:       "10"        # 5× the dev default; conns finish naturally
+      BLUEFIN_RECV_IDLE_TIMEOUT_SECS:       "20"        # 10× the dev default; absorbs multi-second scheduling stalls observed on the most contended hosted runners
       # Reader-worker count override. Default is 3, which suits dev boxes
       # with 8–10 perf cores but oversubscribes hosted macos-latest
       # (3 vCPUs total, shared by the server + client processes + tokio

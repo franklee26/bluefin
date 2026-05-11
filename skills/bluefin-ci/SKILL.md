@@ -125,11 +125,11 @@ The workflow ships these floors:
 
 | Floor | Value | Origin |
 |-------|-------|--------|
-| `mean avg gb/s` (good-conns only) | **0.05** | Noise floor. A GOOD conn that delivered the 750 MB CI payload in ≤15 s reports avg ≥ 50 MB/s. Catches "all GOOD conns barely moved". |
-| `max peak gb/s` (good-conns only) | **1.00** | ~50 % of CI-observed median GOOD-conn peak (~2.40 GB/s). **Regression signal for burst rate on conns that actually transferred data.** |
-| `good conns` (≥ 700 MB each) | **6** of 10 | Liveness gate. With Option C (`BLUEFIN_NUM_SENDS=500000`, `BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10`), conns either deliver the full 750 MB or TRUNC. 6/10 = 60 % completion is the lower bound across recent CI runs; below that signals real degradation. |
+| `mean avg gb/s` (good-conns only) | **0.40** | ~50 % of the first observed CI median (0.92 GB/s @ 5 runs × 2 conns, 2026-05-11). Detects \~50 % throughput regressions on the GOOD-conn population. |
+| `max peak gb/s` (good-conns only) | **2.00** | ~50 % of the first observed CI median (4.15 GB/s @ 5 runs × 2 conns, 2026-05-11). **Regression signal for burst rate on conns that actually transferred data.** |
+| `good conns` (≥ 700 MB each) | **6** of 10 | Liveness gate. Held at 6/10 (not the run-suggested 9/10) for runner-allocation headroom — a single bad runner allocation on hosted CI can starve up to 4 conn-trials without there being any real regression. |
 
-Floors 1 and 2 are pegged at ~50 % of the LOWER BOUND observed across multiple CI runs. Floor 3 is the real-regression detector. **Real perf signal still lives in local sweeps**, but the CI gate is now meaningful enough to catch a sub-50 % throughput regression or a complete liveness failure.
+Floors 1 and 2 are pegged at ~50 % of the LOWER BOUND observed across multiple CI runs. Floor 3 is the real-regression detector held below its current empirical lower bound for noise tolerance. **Real perf signal still lives in local sweeps**, but the CI gate is now meaningful enough to catch a sub-50 % throughput regression or a complete liveness failure.
 
 ## Runner reality and "drain artifacts"
 

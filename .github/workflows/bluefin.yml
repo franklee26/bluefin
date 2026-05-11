@@ -149,9 +149,9 @@ jobs:
       # Pegged at the observed CI floor with the new env-var stack
       # (bigger SO_RCVBUF, longer recv-idle timeout, smaller payload).
       # See block comment above for the rationale.
-      BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS:    "0.05"      # noise floor (just non-zero)
-      BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS:    "1.00"      # ~50 % of CI-median GOOD-conn peak
-      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "6"         # ≥6 of 10 conn-trials completed the (shrunk) payload
+      BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS:    "0.40"      # ~50 % of first observed CI median (0.92 GB/s @ 5 runs)
+      BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS:    "2.00"      # ~50 % of first observed CI median (4.15 GB/s @ 5 runs)
+      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "6"         # ≥6 of 10 conn-trials completed the (shrunk) payload; held at 6 (not 9) for runner-allocation headroom
       BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES:    "700000000" # 700 MB ≈ 93 % of the 750 MB CI payload (BLUEFIN_NUM_SENDS=500000 × 1500)
       BLUEFIN_BENCH_SUMMARY_MD:             "bench_logs/ci_summary.md"
       # Bump per-socket SO_RCVBUF / SO_SNDBUF from the hardcoded 512 KB

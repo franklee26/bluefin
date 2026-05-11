@@ -1,18 +1,28 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 use bluefin::net::server::BluefinServer;
 use bluefin_proto::BluefinResult;
+use bytes::Bytes;
 use std::{
     cmp::{max, min},
     net::{Ipv4Addr, SocketAddrV4},
     time::{Duration, Instant},
 };
-use tokio::{spawn, task::JoinSet, time::timeout};
+use tokio::{spawn, task::JoinSet, time::sleep};
 
 /// If no bytes arrive on a connection for this long, the per-connection
 /// task assumes the peer is gone, prints a final summary, and exits.
 /// Bluefin currently has no protocol-level FIN, so this is the only way
 /// the benchmark server can terminate cleanly.
 const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often to push the idle deadline forward. Resetting on every recv
+/// (the original `tokio::time::timeout(RECV_IDLE_TIMEOUT, conn.recv(...))`
+/// pattern) re-armed a fresh `Sleep` on the timer wheel at recv-rate
+/// (~270K/s on the bench) and dominated the server CPU profile (live
+/// bottleneck #12 in the perf SKILL). Resetting once per `IDLE_RESET_EVERY`
+/// recvs caps that at <100/s while keeping idle detection sharp to
+/// `RECV_IDLE_TIMEOUT + ~15ms` at the bench's recv rate.
+const IDLE_RESET_EVERY: i64 = 4096;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[tokio::main]
@@ -55,7 +65,11 @@ async fn run() -> BluefinResult<()> {
         let _ = join_set.spawn(async move {
             let _num = conn_num;
             let mut total_bytes: usize = 0;
-            let mut recv_bytes = [0u8; 10000];
+            // Carrier vec for the zero-copy `recv_bytes` API. We keep
+            // capacity across iterations by `drain(..)`-ing instead of
+            // reassigning, so this allocates exactly once per connection.
+            // 16 matches the per-call max-packets argument below.
+            let mut chunks: Vec<Bytes> = Vec::with_capacity(16);
             let mut min_bytes = usize::MAX;
             let mut max_bytes = 0;
             let mut iteration: i64 = 1;
@@ -68,19 +82,35 @@ async fn run() -> BluefinResult<()> {
             // cumulative running average.
             let mut last_print_bytes: usize = 0;
             let mut last_print_instant = now;
+
+            // Single long-lived idle deadline. Pinning one `Sleep` and
+            // resetting its deadline (instead of allocating a fresh
+            // `Sleep` per recv via `tokio::time::timeout`) is the
+            // documented tokio idiom for hot loops and removes the
+            // per-recv timer-wheel arm/disarm. See live bottleneck #12.
+            let idle_sleep = sleep(RECV_IDLE_TIMEOUT);
+            tokio::pin!(idle_sleep);
+
             loop {
-                // Use a timeout so the server self-terminates when the client
-                // stops sending. UDP gives us no close signal and Bluefin has
-                // no protocol-level FIN yet.
-                let recv_result =
-                    timeout(RECV_IDLE_TIMEOUT, conn.recv(&mut recv_bytes, 10000)).await;
-                let size = match recv_result {
-                    Ok(Ok(size)) => size,
-                    Ok(Err(e)) => {
-                        eprintln!("(#{}) recv error: {:?} -- exiting", _num, e);
-                        break;
+                // `recv_bytes` is the zero-copy variant of `recv`: it
+                // pushes `Bytes` slices over the recv buffer into our
+                // carrier vec instead of memcpying into a `[u8]`. The
+                // bench has no need for a contiguous buffer (we just
+                // sum lengths), so this lets us skip the ~5 % library
+                // CPU spent in `OrderedBytes::consume` -> memmove. See
+                // live bottleneck #13 in the perf SKILL.
+                let size = tokio::select! {
+                    biased;
+                    recv = conn.recv_bytes(&mut chunks, 16) => {
+                        match recv {
+                            Ok(size) => size,
+                            Err(e) => {
+                                eprintln!("(#{}) recv error: {:?} -- exiting", _num, e);
+                                break;
+                            }
+                        }
                     }
-                    Err(_) => {
+                    _ = idle_sleep.as_mut() => {
                         eprintln!(
                             "(#{}) idle for {:?} -- assuming peer is gone",
                             _num, RECV_IDLE_TIMEOUT
@@ -88,9 +118,24 @@ async fn run() -> BluefinResult<()> {
                         break;
                     }
                 };
+                // Push the idle deadline forward on a coarse cadence so we
+                // re-arm the timer wheel at <100Hz instead of recv-rate.
+                if iteration % IDLE_RESET_EVERY == 0 {
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + RECV_IDLE_TIMEOUT);
+                }
                 total_bytes += size;
-                min_bytes = min(size, min_bytes);
-                max_bytes = max(size, max_bytes);
+                // Drain the carrier vec, tracking the smallest/largest
+                // payload we've seen so far. `drain(..)` keeps the vec's
+                // allocated capacity, so the next recv reuses it.
+                for b in chunks.drain(..) {
+                    let n = b.len();
+                    min_bytes = min(n, min_bytes);
+                    max_bytes = max(n, max_bytes);
+                    // Refcount drop on `b` happens here; it's the only
+                    // bookkeeping per-payload — no copy.
+                }
 
                 num_iterations_without_print += 1;
                 // Use >= so we always emit a line at or after the threshold,

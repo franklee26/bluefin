@@ -8,6 +8,24 @@ use std::fmt;
 /// via [OrderedBytes::consume()], we can only consume at most [MAX_BUFFER_SIZE] number of packets.
 pub const MAX_BUFFER_SIZE: usize = 2000;
 
+/// Wraps `base + offset` modulo [`MAX_BUFFER_SIZE`] without an integer division.
+///
+/// Both call sites guarantee `base < MAX_BUFFER_SIZE` and `offset < MAX_BUFFER_SIZE`,
+/// so `base + offset < 2 * MAX_BUFFER_SIZE` and a single branch + subtract reproduces
+/// the modulo. `MAX_BUFFER_SIZE = 2000` is **not** a power of two, so a true `%`
+/// would compile to a 20–30 cycle `div`/`idiv` instead of ~1 cycle. See round G3
+/// in the perf SKILL: this used to be ~1.27 % server self-time on the hot
+/// `buffer_in_packet`/`consume`/`consume_bytes` loops.
+#[inline(always)]
+fn wrap_index(base: usize, offset: usize) -> usize {
+    let raw = base + offset;
+    if raw >= MAX_BUFFER_SIZE {
+        raw - MAX_BUFFER_SIZE
+    } else {
+        raw
+    }
+}
+
 /// [OrderedBytes] represents the connection's buffered packets. OrderedBytes stores at most
 /// [MAX_BUFFER_SIZE] number of bluefin packets and maintains their intended consumption
 /// order based on the packet number. OrderedBytes only stores packet payload information and
@@ -137,7 +155,13 @@ impl OrderedBytes {
             ));
         }
 
-        let index = (self.smallest_packet_number_index + offset) % MAX_BUFFER_SIZE;
+        // `MAX_BUFFER_SIZE = 2000` is not a power of 2, so a true `%` would
+        // emit a 20–30 cycle integer division. Since `offset < MAX_BUFFER_SIZE`
+        // (just checked) and `smallest_packet_number_index < MAX_BUFFER_SIZE`
+        // (invariant), the unwrapped sum is `< 2 * MAX_BUFFER_SIZE`, so a single
+        // branch + subtract reproduces the modulo. ~1–2 cycles per call. See
+        // round G3 in the perf SKILL: `buffer_in_packet` was 1.27 % server self.
+        let index = wrap_index(self.smallest_packet_number_index, offset);
         // We do not overwrite packets in the buffer.
         if self.packets[index].is_some() {
             return Err(BluefinError::Unexpected(
@@ -215,10 +239,13 @@ impl OrderedBytes {
 
         let mut ix = 0;
         while ix < MAX_BUFFER_SIZE
-            && self.packets[(base + ix) % MAX_BUFFER_SIZE].is_some()
+            && self.packets[wrap_index(base, ix)].is_some()
             && num_bytes < len
         {
-            let packet = self.packets[(base + ix) % MAX_BUFFER_SIZE]
+            // Hoist the wrap into a single computation so the loop body's
+            // three slot accesses don't each pay for a divmod. See G3.
+            let slot = wrap_index(base, ix);
+            let packet = self.packets[slot]
                 .as_mut()
                 .unwrap();
             let packet_num = packet.header.packet_number;
@@ -242,11 +269,11 @@ impl OrderedBytes {
                 num_bytes += payload_len;
             }
 
-            self.packets[(base + ix) % MAX_BUFFER_SIZE] = None;
+            self.packets[slot] = None;
 
             self.smallest_packet_number = packet_num + 1;
             self.smallest_packet_number_index =
-                (self.smallest_packet_number_index + 1) % MAX_BUFFER_SIZE;
+                wrap_index(self.smallest_packet_number_index, 1);
 
             ix += 1;
         }
@@ -257,6 +284,74 @@ impl OrderedBytes {
         }
 
         Ok(ConsumeResult::new(ix, base_packet_number, num_bytes as u64))
+    }
+
+    /// Zero-copy variant of [`Self::consume`]. Pushes up to `max_packets`
+    /// whole-payload [`Bytes`] slices into `out` instead of memcpying into
+    /// a caller `&mut [u8]`. Each pushed `Bytes` is a refcount view over
+    /// the original recv buffer — no copy, no allocation.
+    ///
+    /// If a previous [`Self::consume`] call left carry-over bytes, they
+    /// are prepended as the first element so the caller observes the
+    /// same in-order byte stream regardless of which API was used last.
+    /// Carry-over is itself a `Bytes` (created by `Bytes::split_off`)
+    /// so this is also zero-copy.
+    ///
+    /// Returns [`BluefinError::BufferEmptyError`] if nothing was pushed.
+    /// `out` is *not* cleared on entry; the caller is responsible for
+    /// draining/clearing it between calls if they don't want appends to
+    /// accumulate. The carrier vec's capacity is preserved across calls
+    /// when the caller uses `out.drain(..)` (or `out.clear()`).
+    #[inline]
+    pub(crate) fn consume_bytes(
+        &mut self,
+        out: &mut Vec<Bytes>,
+        max_packets: usize,
+    ) -> BluefinResult<ConsumeResult> {
+        let initial_len = out.len();
+        let mut total_bytes: u64 = 0;
+
+        // Drain any leftover carry-over from a previous `consume()` call.
+        // It's already a `Bytes` slice over the same recv buffer, so this
+        // is a refcount move, not a copy.
+        if let Some(c) = self.carry_over_bytes.take() {
+            total_bytes += c.len() as u64;
+            out.push(c);
+        }
+
+        let base = self.smallest_packet_number_index;
+        let base_packet_number = match self.packets[base].as_ref() {
+            Some(p) => p.header.packet_number,
+            None => 0,
+        };
+
+        let mut ix = 0;
+        while ix < MAX_BUFFER_SIZE
+            && (out.len() - initial_len) < max_packets
+            && self.packets[wrap_index(base, ix)].is_some()
+        {
+            // Hoist the wrap once per iteration; see G3 in the perf SKILL.
+            let slot = wrap_index(base, ix);
+            // `take()` moves the BluefinPacket out of the slot. The
+            // payload field is `Bytes`; moving it is just a pointer +
+            // refcount-bump's worth of work. No memcpy.
+            let packet = self.packets[slot].take().unwrap();
+            let payload = packet.payload;
+            total_bytes += payload.len() as u64;
+            out.push(payload);
+
+            self.smallest_packet_number = packet.header.packet_number + 1;
+            self.smallest_packet_number_index =
+                wrap_index(self.smallest_packet_number_index, 1);
+
+            ix += 1;
+        }
+
+        if out.len() == initial_len {
+            return Err(BluefinError::BufferEmptyError);
+        }
+
+        Ok(ConsumeResult::new(ix, base_packet_number, total_bytes))
     }
 }
 

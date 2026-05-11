@@ -10,7 +10,7 @@ use crate::net::connection::ConnectionBuffer;
 use crate::net::{ConnectionManagedBuffers, Wakeable, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use std::sync::{Arc, MutexGuard};
 
 /// This is arbitrary number of worker tasks to use if we cannot decide how many worker tasks
@@ -123,15 +123,25 @@ impl ConnReaderHandler {
         // MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM / minimum packet size.
         const PACKETS_VEC_CAPACITY: usize = 76;
         let mut packets: Vec<BluefinPacket> = Vec::with_capacity(PACKETS_VEC_CAPACITY);
+        // F3: 1-slot recv-buffer recycle. We hold one extra refcount on the
+        // just-frozen `Bytes` across one iteration; if all per-packet slices
+        // (and the consumer's downstream Bytes views) have been dropped by
+        // the time we loop back, `try_into_mut` returns the same 15 KiB
+        // allocation and we save a malloc/free pair. If the consumer is slow,
+        // `try_into_mut` returns `Err(b)`, we drop our refcount, and alloc
+        // fresh — no harm, just a missed opportunity. Bounded memory growth
+        // (one extra buffer-lifetime of headroom per task).
+        let mut recycle: Option<Bytes> = None;
 
         loop {
-            // One heap allocation per recv. We trade up to ~10 small
-            // per-payload `Vec::with_capacity` allocations inside
-            // `from_bytes_into` for a single 15 KiB `BytesMut` here. Every
-            // packet payload sliced out of `frozen` below is a refcount
-            // bump on this same allocation, so the buffer lives exactly as
-            // long as the longest-held payload.
-            let mut buf = BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
+            // Acquire a recv buffer: prefer recycling, fall back to alloc.
+            let mut buf = match recycle.take() {
+                Some(b) => b
+                    .try_into_mut()
+                    .unwrap_or_else(|_| BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM)),
+                None => BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM),
+            };
+            debug_assert!(buf.capacity() >= MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
 
             // Hand recv a `&mut [u8]` over the spare capacity. We use
             // `set_len(MAX)` rather than `BytesMut::zeroed(MAX)` to skip
@@ -142,7 +152,8 @@ impl ConnReaderHandler {
             // SAFETY: `recv` writes `size` bytes into the buffer before
             // returning; `truncate(size)` immediately drops the
             // still-uninit tail so no consumer can ever observe it via the
-            // `Bytes` API.
+            // `Bytes` API. On the recycled path the bytes were previously
+            // initialised by the prior recv — still sound for `set_len`.
             unsafe { buf.set_len(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM); }
             let size = socket.recv(&mut buf[..]).await?;
             buf.truncate(size);
@@ -151,6 +162,10 @@ impl ConnReaderHandler {
             // can be cheaply sliced into refcount views — one per parsed
             // packet payload.
             let frozen = buf.freeze();
+            // Stash one refcount for next iteration's recycle attempt.
+            // Cheap (atomic increment); the buffer is recycled the moment
+            // every other holder has dropped.
+            recycle = Some(frozen.clone());
             BluefinPacket::from_bytes_into(frozen, &mut packets)?;
 
             // Hand the populated vec to the consumer without cloning the
@@ -206,17 +221,28 @@ impl ConnReaderHandler {
     ) -> BluefinResult<()> {
         const PACKETS_VEC_CAPACITY: usize = 76;
         let mut packets: Vec<BluefinPacket> = Vec::with_capacity(PACKETS_VEC_CAPACITY);
+        // F3: 1-slot recv-buffer recycle (see `tx_impl` for full rationale).
+        let mut recycle: Option<Bytes> = None;
 
         loop {
-            // One heap allocation per recv (see `tx_impl` for the rationale).
-            let mut buf = BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
+            // Recycle the prior buffer if all slices have dropped, else alloc.
+            let mut buf = match recycle.take() {
+                Some(b) => b
+                    .try_into_mut()
+                    .unwrap_or_else(|_| BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM)),
+                None => BytesMut::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM),
+            };
+            debug_assert!(buf.capacity() >= MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM);
             // SAFETY: `recv` writes `size` bytes into the buffer before
             // returning; `truncate(size)` immediately drops the still-uninit
-            // tail.
+            // tail. On the recycled path the bytes were init'd by the prior
+            // recv — still sound for `set_len`.
             unsafe { buf.set_len(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM); }
             let size = socket.recv(&mut buf[..]).await?;
             buf.truncate(size);
             let frozen = buf.freeze();
+            // Stash one refcount for next iteration's recycle attempt.
+            recycle = Some(frozen.clone());
 
             // Reuse the carrier vec; `from_bytes_into` only ever appends.
             packets.clear();

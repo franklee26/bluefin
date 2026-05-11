@@ -18,7 +18,7 @@ use bytes::{Bytes, BytesMut};
 use tokio::{
     net::UdpSocket,
     spawn,
-    sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender},
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     sync::Notify,
 };
 
@@ -47,7 +47,13 @@ const DATA_CHANNEL_BOUND: usize = 4096;
 pub(crate) struct WriterHandler {
     socket: Arc<UdpSocket>,
     next_packet_num: u64,
-    data_sender: Option<Sender<Bytes>>,
+    /// **Round P (2026-05-10)**: swapped from `tokio::sync::mpsc::Sender<Bytes>`
+    /// to `flume::Sender<Bytes>` to eliminate the per-32-message list-block
+    /// alloc/free churn that was ~3.5–4 % of client CPU on the post-O
+    /// flamegraph (live bottleneck #17). flume uses an array-backed ring
+    /// buffer with no per-batch allocation; semantics preserved
+    /// (`try_send`/`send_async` map directly).
+    data_sender: Option<flume::Sender<Bytes>>,
     ack_sender: Option<UnboundedSender<AckData>>,
     src_conn_id: u32,
     dst_conn_id: u32,
@@ -89,7 +95,7 @@ impl WriterHandler {
     }
 
     pub(crate) fn start(&mut self) -> BluefinResult<()> {
-        let (data_s, data_r) = mpsc::channel::<Bytes>(DATA_CHANNEL_BOUND);
+        let (data_s, data_r) = flume::bounded::<Bytes>(DATA_CHANNEL_BOUND);
         let (ack_s, ack_r) = mpsc::unbounded_channel();
         self.data_sender = Some(data_s);
         self.ack_sender = Some(ack_s);
@@ -183,7 +189,7 @@ impl WriterHandler {
 
     #[inline]
     async fn read_data(
-        mut rx: Receiver<Bytes>,
+        rx: flume::Receiver<Bytes>,
         next_packet_num: u64,
         src_conn_id: u32,
         dst_conn_id: u32,
@@ -205,7 +211,12 @@ impl WriterHandler {
         // need to re-walk the formatted datagram to recover the user-payload
         // count for `pending_bytes` accounting. The packetiser computes that
         // number for free as a side-effect of `consume_data_into`.
-        let (send_tx, mut send_rx) = mpsc::unbounded_channel::<(Vec<u8>, usize)>();
+        //
+        // **Round P (2026-05-10)**: swapped from tokio's unbounded mpsc to
+        // `flume::unbounded` to avoid the same per-32-message list-block
+        // alloc/free that the public data channel had. ~250K crossings per
+        // 10 M sends = ~7.8K block alloc/free pairs without the swap.
+        let (send_tx, send_rx) = flume::unbounded::<(Vec<u8>, usize)>();
 
         // Return channel — sender ships emptied `Vec<u8>` allocations back
         // to the packetiser instead of letting them drop. Without this the
@@ -215,11 +226,17 @@ impl WriterHandler {
         // per outgoing datagram. With this, allocations cap at ~12 (the
         // initial pool) at steady state.
         //
-        // Unbounded is fine: at steady state cycle is 1:1 so the channel
-        // sits near-empty, and the bound is naturally the in-flight set
-        // (≤ 12 + the writer's mpsc::channel(4096) cap). Bounded would
-        // just introduce a dead-lock risk if recycle ever blocked on full.
-        let (recycle_tx, mut recycle_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Bounded to RECYCLE_CAPACITY: at steady state the producer/consumer
+        // cycle is 1:1 so the channel sits at depth 0–1 and the bound never
+        // fires. The bound matters at process exit: an unbounded channel
+        // hoarded hundreds of empty 15 KiB Vecs at shutdown and tokio's
+        // task drop freed them serially through `madvise(DONT_NEED)`, which
+        // showed up as ~22 % of leaf samples in the 2026-05-10 client
+        // flamegraph (live bottleneck #15). With `try_send` below, a full
+        // channel drops the just-cleared Vec in place — there is no `await`
+        // on the sender so no deadlock risk.
+        const RECYCLE_CAPACITY: usize = 16;
+        let (recycle_tx, mut recycle_rx) = mpsc::channel::<Vec<u8>>(RECYCLE_CAPACITY);
 
         // Spawn dedicated sender task. This task is the *only* place that
         // decrements `pending_bytes`, and it does so AFTER `socket.try_send`
@@ -249,7 +266,7 @@ impl WriterHandler {
         // measured drain rate).
         let socket_clone = Arc::clone(&socket);
         spawn(async move {
-            while let Some((mut datagram, payload_bytes)) = send_rx.recv().await {
+            while let Ok((mut datagram, payload_bytes)) = send_rx.recv_async().await {
                 // Keep retrying until sent
                 loop {
                     match socket_clone.try_send(&datagram) {
@@ -277,21 +294,34 @@ impl WriterHandler {
                     }
                 }
                 // Recycle the buffer back to the packetiser. `clear()` keeps
-                // capacity (it's a `len = 0` write, no realloc). If the
-                // packetiser has gone away (shouldn't happen — it's the
-                // upstream of this very task), `send` errors and the Vec
-                // drops naturally.
+                // capacity (it's a `len = 0` write, no realloc). Use
+                // `try_send`: if the recycle channel is full (only happens
+                // at process exit, when the packetiser has stopped pulling)
+                // the Vec drops in place. At steady state cycle is 1:1 so
+                // the channel is near-empty and `try_send` always succeeds.
                 datagram.clear();
-                let _ = recycle_tx.send(datagram);
+                let _ = recycle_tx.try_send(datagram);
             }
         });
 
         loop {
             b.clear();
-            let size = rx.recv_many(&mut b, limit).await;
-            if size == 0 {
-                continue;
+            // flume has no `recv_many`; build it from one async wait + a
+            // try-loop. Same shape as tokio's `recv_many`: wait for at least
+            // one, then drain up to `limit` non-blockingly. Returns 0 only
+            // when the channel is empty AND closed; we treat the closed
+            // case as "sender hung up" and exit the task.
+            match rx.recv_async().await {
+                Ok(first) => b.push(first),
+                Err(_) => return,
             }
+            while b.len() < limit {
+                match rx.try_recv() {
+                    Ok(msg) => b.push(msg),
+                    Err(_) => break,
+                }
+            }
+            let size = b.len();
             // `Bytes` is cheap to move out of the Vec slot via `extract` (mem::replace
             // with `Bytes::default()`, which is an empty Bytes).
             for i in 0..size {
@@ -317,6 +347,9 @@ impl WriterHandler {
                         .try_recv()
                         .unwrap_or_else(|_| Vec::with_capacity(MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM));
                     let datagram = std::mem::replace(&mut datagram_pool[i], replacement);
+                    // flume's `Sender::send` is sync (matches the previous
+                    // tokio unbounded `send`); succeeds unless the receiver
+                    // has been dropped, which can't happen here.
                     let _ = send_tx.send((datagram, payload_bytes));
                 } else {
                     break;
@@ -367,7 +400,10 @@ impl WriterHandler {
                 // Same accounting as `send_bytes`: pre-increment so `flush()`
                 // never observes a stale zero, undo on enqueue failure.
                 self.pending_bytes.fetch_add(len, Ordering::Relaxed);
-                if sender.send(payload).await.is_err() {
+                // flume's `send_async` matches tokio mpsc's `send().await`
+                // semantics: returns Err only if the receiver has been
+                // dropped; awaits backpressure when the channel is full.
+                if sender.send_async(payload).await.is_err() {
                     self.pending_bytes.fetch_sub(len, Ordering::Relaxed);
                     return Err(BluefinError::WriteError(
                         "Failed to send data (channel closed)",

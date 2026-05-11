@@ -117,6 +117,42 @@ impl ReaderRxChannel {
 
         Ok((consume_res.get_bytes_consumed(), addr))
     }
+
+    /// Zero-copy variant of [`Self::read`]. Hands back whole-payload
+    /// [`Bytes`] slices via `out` instead of memcpying into a caller
+    /// `&mut [u8]`. Same await + lock + ack-bookkeeping shape as `read`.
+    /// See [`ConnectionBuffer::consume_bytes`] /
+    /// [`OrderedBytes::consume_bytes`].
+    #[inline]
+    pub(crate) async fn read_bytes(
+        &mut self,
+        out: &mut Vec<bytes::Bytes>,
+        max_packets: usize,
+    ) -> BluefinResult<(u64, SocketAddr)> {
+        let _ = self.future.clone().await;
+        let (consume_res, addr) = {
+            self.future
+                .buffer
+                .lock()
+                .unwrap()
+                .consume_bytes(out, max_packets)?
+        };
+        let num_packets_consumed = consume_res.get_num_packets_consumed();
+        let base_packet_num = consume_res.get_base_packet_number();
+        self.packets_consumed += num_packets_consumed;
+
+        if num_packets_consumed > 0
+            && base_packet_num != 0
+            && self.packets_consumed >= self.packets_consumed_before_ack
+        {
+            let _ = self
+                .writer_handler
+                .send_ack(base_packet_num, num_packets_consumed);
+            self.packets_consumed = 0;
+        }
+
+        Ok((consume_res.get_bytes_consumed(), addr))
+    }
 }
 
 impl ReaderTxChannel {

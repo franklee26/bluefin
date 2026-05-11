@@ -187,6 +187,15 @@ jobs:
       # Production binaries built without these env vars are unaffected.
       BLUEFIN_NUM_SENDS:                    "500000"    # 500 K × 1500 B = 750 MB per conn
       BLUEFIN_RECV_IDLE_TIMEOUT_SECS:       "10"        # 5× the dev default; conns finish naturally
+      # Reader-worker count override. Default is 3, which suits dev boxes
+      # with 8–10 perf cores but oversubscribes hosted macos-latest
+      # (3 vCPUs total, shared by the server + client processes + tokio
+      # worker threads + per-conn tasks). Reader workers are only on the
+      # hot path during handshake; steady-state data flows through the
+      # per-conn socket, so dropping from 3 to 2 trims a hot thread off
+      # the contended runner without losing meaningful demux parallelism
+      # for the 2 concurrent handshakes the bench performs.
+      BLUEFIN_NUM_READER_WORKERS:           "2"         # 3 -> 2 to fit hosted-runner thread budget
       # Per-run retry knobs. Hosted macos-latest runners occasionally land
       # on a deeply contended host where both bench peers get starved and
       # the run yields 0 GOOD conns despite no actual code regression.

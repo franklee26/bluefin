@@ -32,6 +32,28 @@ fn recv_idle_timeout() -> Duration {
         .unwrap_or(DEFAULT_RECV_IDLE_TIMEOUT)
 }
 
+/// How many `ReaderTxChannel` workers the bench server binds to its
+/// listening UDP socket. Reader workers demux datagrams to the right
+/// `ConnectionBuffer` and are on the hot path during handshake; once a
+/// `BluefinConnection`'s per-connection socket takes over, additional
+/// reader workers buy nothing for steady-state throughput.
+///
+/// Default 3 is great on dev boxes (8–10 perf cores) but oversubscribes
+/// hosted macos-latest runners (3 vCPUs total, shared between the server
+/// and client processes plus tokio's worker threads). CI overrides this
+/// via `BLUEFIN_NUM_READER_WORKERS` to keep a tiny bit of demux
+/// parallelism without piling more threads than the runner has cores.
+/// Production builds are unaffected unless the env var is explicitly set.
+const DEFAULT_NUM_READER_WORKERS: u16 = 3;
+
+fn num_reader_workers() -> u16 {
+    env::var("BLUEFIN_NUM_READER_WORKERS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_NUM_READER_WORKERS)
+}
+
 /// How often to push the idle deadline forward. Resetting the `Sleep`'s
 /// deadline on every recv (the natural `tokio::time::timeout` pattern) re-arms
 /// the timer wheel at recv-rate (~270 K/s on the bench), which dominates
@@ -56,7 +78,14 @@ async fn run() -> BluefinResult<()> {
         Ipv4Addr::new(127, 0, 0, 1),
         1318,
     )));
-    server.set_num_reader_workers(3)?;
+    let n_workers = num_reader_workers();
+    if n_workers != DEFAULT_NUM_READER_WORKERS {
+        eprintln!(
+            "(server) reader workers overridden via env: {} (default {})",
+            n_workers, DEFAULT_NUM_READER_WORKERS,
+        );
+    }
+    server.set_num_reader_workers(n_workers)?;
     server.bind().await?;
     let mut join_set = JoinSet::new();
 

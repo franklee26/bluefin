@@ -26,6 +26,19 @@ const IOVEC_SIZE: usize = 8;
 
 const MAX_CHUNK_SIZE: usize = 1500;
 
+/// Resolve a socket-buffer size in bytes from `env_var`, falling back to
+/// `default_bytes` when the variable is unset, empty, or unparseable.
+/// Values must be a positive integer that fits in `c_int` (the type
+/// `setsockopt(SO_{RCV,SND}BUF)` takes).
+fn socket_buf_size_from_env(env_var: &str, default_bytes: c_int) -> c_int {
+    std::env::var(env_var)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&n| n > 0 && n <= c_int::MAX as i64)
+        .map(|n| n as c_int)
+        .unwrap_or(default_bytes)
+}
+
 pub struct BufMetadata {
     pub src_addr: SocketAddr,
     pub len: usize,
@@ -91,10 +104,21 @@ impl BluefinSocket {
 
         let fd = udp_sock.as_raw_fd();
         set_sock_opt(fd, libc::IPPROTO_IP, libc::IP_RECVTOS, 1)?;
-        
-        // Increase socket buffer sizes for higher throughput (512KB each)
-        set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, 524288)?;
-        set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, 524288)?;
+
+        // Socket buffer sizes. Default 512 KB matches what bluefin has
+        // shipped historically; this drains in ~340 µs at 1.5 GB/s burst,
+        // which is below typical tokio scheduling-gap durations on
+        // contended runners. CI overrides via env to 8 MB so the bench
+        // gate can distinguish real perf regressions from runner-driven
+        // packet drops. Kernel silently clamps to platform caps:
+        //   - macOS: kern.ipc.maxsockbuf (default ~8 MB)
+        //   - Linux: /proc/sys/net/core/{rmem,wmem}_max (default ~212 KB
+        //     on most distros without sysctl tweaks)
+        // Production traffic is unaffected unless the env var is set.
+        let sndbuf = socket_buf_size_from_env("BLUEFIN_SOCKET_SNDBUF", 524288);
+        let rcvbuf = socket_buf_size_from_env("BLUEFIN_SOCKET_RCVBUF", 524288);
+        set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_SNDBUF, sndbuf)?;
+        set_sock_opt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, rcvbuf)?;
         
         #[cfg(macos)]
         {

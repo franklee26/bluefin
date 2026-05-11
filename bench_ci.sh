@@ -71,15 +71,34 @@ fi
 # --- per-run accumulators -------------------------------------------------
 TOTAL_CONNS=$(( N_RUNS * N_CONNS ))
 GOOD_CONNS=0
-ALL_AVGS=()      # gb/s, every conn that emitted a FINAL line
-ALL_PEAKS=()    # gb/s, ditto
+ALL_AVGS=()       # gb/s, every conn that emitted a FINAL line
+ALL_PEAKS=()      # gb/s, ditto (kept for mean_peak reporting)
+GOOD_AVGS=()      # gb/s, avgs from conns that cleared the bytes floor only.
+GOOD_PEAKS=()     # gb/s, peaks from conns that cleared the bytes floor only.
+                  # Both used by the gate. See "drain artifacts" note below.
 RUN_LOG_DIRS=()
 RUN_RC=()
 # Parallel arrays keyed by run index (0-based). Each slot is a space-joined
 # string for that run; empty if no FINAL lines were parsed.
-RUN_AVGS=()      # avg gb/s per conn, space-joined
-RUN_PEAKS=()    # peak gb/s per conn, space-joined
-RUN_GOOD=()     # good-conn count for this run
+RUN_AVGS=()       # avg gb/s per conn, space-joined (all conns)
+RUN_PEAKS=()      # peak gb/s per conn, space-joined (all conns, for reporting)
+RUN_GOOD_PEAKS=() # peak gb/s per GOOD conn only (per-run max_peak column)
+RUN_GOOD=()       # good-conn count for this run
+
+# Note on "drain artifacts" and starved-conn dilution:
+#   On contended hosted runners the server task gets preempted for tens of
+#   ms while the client keeps pumping at 1+ GB/s. The kernel UDP socket
+#   buffer fills, then the server resumes and drains it at memcpy speed.
+#   The recv loop's inst-throughput print sees `multi-MB / microseconds`
+#   = 100+ GB/s and records it as `peak`. That's a measurement artifact,
+#   not a real network rate. Separately, every conn's `avg` includes the
+#   2 s recv-idle tail (`bytes/elapsed` where `elapsed` keeps running
+#   during the idle wait); on starved conns that delivered <60 MB total,
+#   the avg collapses to <30 MB/s and dilutes any aggregate that includes
+#   it. Both pathologies are exclusive to STARVED conns. So we filter
+#   BOTH max_peak and mean_avg to GOOD conns only (= conns that delivered
+#   >= GOOD_CONN_MIN_BYTES) for the gate; the unfiltered numbers are kept
+#   in the comment for visibility into runner contention.
 
 echo
 echo "=========================================================================="
@@ -138,6 +157,7 @@ for ((run = 1; run <= N_RUNS; run++)); do
 
     run_avgs_local=()
     run_peaks_local=()
+    run_good_peaks_local=()
     run_good_local=0
 
     # Parse FINAL lines. Format (units are picked dynamically by the server,
@@ -163,8 +183,11 @@ for ((run = 1; run <= N_RUNS; run++)); do
         fi
 
         # Normalise to gb/s. Server emits lowercase units with `/s` suffix:
-        # "kb/s", "mb/s", "gb/s". Strip the "/s" then scale.
+        # "kb/s", "mb/s", "gb/s". The peak field is the last token on the
+        # line so it carries a trailing `)` (e.g. "mb/s)"). Strip the `)`
+        # FIRST, then the `/s`, before scaling.
         avg=$(awk -v v="$avg" -v u="$avg_unit" 'BEGIN{
+            sub("\\)$", "", u);
             sub("/s$", "", u);
             if (u == "kb")      printf "%.4f", v / 1000000;
             else if (u == "mb") printf "%.4f", v / 1000;
@@ -172,6 +195,7 @@ for ((run = 1; run <= N_RUNS; run++)); do
             else                printf "%.4f", v;   # unknown -> assume gb/s
         }')
         peak=$(awk -v v="$peak" -v u="$peak_unit" 'BEGIN{
+            sub("\\)$", "", u);
             sub("/s$", "", u);
             if (u == "kb")      printf "%.4f", v / 1000000;
             else if (u == "mb") printf "%.4f", v / 1000;
@@ -186,8 +210,13 @@ for ((run = 1; run <= N_RUNS; run++)); do
 
         # Truncated conns (idle timeout / bilateral failure) DO emit a FINAL
         # line; we exclude them from the "good" count via the bytes floor.
+        # GOOD conns also contribute their avg+peak to GOOD_AVGS/GOOD_PEAKS
+        # (filtered sets used by the gate; see drain-artifacts note above).
         if (( $(awk -v b="$bytes" -v f="$GOOD_CONN_MIN_BYTES" 'BEGIN{print (b+0 >= f+0) ? 1 : 0}') )); then
             GOOD_CONNS=$((GOOD_CONNS + 1))
+            GOOD_AVGS+=("$avg")
+            GOOD_PEAKS+=("$peak")
+            run_good_peaks_local+=("$peak")
             run_good_local=$((run_good_local + 1))
             verdict="GOOD"
         else
@@ -198,6 +227,7 @@ for ((run = 1; run <= N_RUNS; run++)); do
 
     RUN_AVGS+=("${run_avgs_local[*]:-}")
     RUN_PEAKS+=("${run_peaks_local[*]:-}")
+    RUN_GOOD_PEAKS+=("${run_good_peaks_local[*]:-}")
     RUN_GOOD+=("$run_good_local")
 done
 
@@ -212,17 +242,29 @@ if [[ ${#ALL_AVGS[@]} -eq 0 ]]; then
 fi
 
 # awk for mean/max so we don't depend on bc/python on the runner.
-mean_avg=$(printf '%s\n' "${ALL_AVGS[@]}" | awk '{s+=$1; n++} END{printf "%.3f", s/n}')
+# raw_* are reported in the comment for visibility into runner contention;
+# mean_avg / max_peak (filtered to GOOD conns) are what the gate compares
+# against. See "drain artifacts" / starved-conn-dilution note above.
+raw_mean_avg=$(printf '%s\n' "${ALL_AVGS[@]}" | awk '{s+=$1; n++} END{printf "%.3f", s/n}')
 mean_peak=$(printf '%s\n' "${ALL_PEAKS[@]}" | awk '{s+=$1; n++} END{printf "%.3f", s/n}')
-max_peak=$(printf '%s\n' "${ALL_PEAKS[@]}" | awk 'BEGIN{m=0} {if($1>m) m=$1} END{printf "%.3f", m}')
 min_avg=$(printf '%s\n' "${ALL_AVGS[@]}" | awk 'BEGIN{m=1e9} {if($1<m) m=$1} END{printf "%.3f", m}')
+raw_max_peak=$(printf '%s\n' "${ALL_PEAKS[@]}" | awk 'BEGIN{m=0} {if($1>m) m=$1} END{printf "%.3f", m}')
+if [[ ${#GOOD_AVGS[@]} -eq 0 ]]; then
+    mean_avg="0.000"
+    max_peak="0.000"
+else
+    mean_avg=$(printf '%s\n' "${GOOD_AVGS[@]}" | awk '{s+=$1; n++} END{printf "%.3f", s/n}')
+    max_peak=$(printf '%s\n' "${GOOD_PEAKS[@]}" | awk 'BEGIN{m=0} {if($1>m) m=$1} END{printf "%.3f", m}')
+fi
 
 printf "  conn-trials:        %d (good %d, missing/trunc %d)\n" \
     "$TOTAL_CONNS" "$GOOD_CONNS" "$((TOTAL_CONNS - GOOD_CONNS))"
-printf "  mean avg gb/s:      %s    (floor %s)\n" "$mean_avg" "$FLOOR_MEAN_AVG_GBPS"
+printf "  mean avg gb/s:      %s    (floor %s, good-conns only)\n" "$mean_avg" "$FLOOR_MEAN_AVG_GBPS"
+printf "  raw mean avg gb/s:  %s    (incl. starved conns; idle-tail diluted)\n" "$raw_mean_avg"
 printf "  min  avg gb/s:      %s\n" "$min_avg"
 printf "  mean peak gb/s:     %s\n" "$mean_peak"
-printf "  max  peak gb/s:     %s    (floor %s)\n" "$max_peak" "$FLOOR_MAX_PEAK_GBPS"
+printf "  max  peak gb/s:     %s    (floor %s, good-conns only)\n" "$max_peak" "$FLOOR_MAX_PEAK_GBPS"
+printf "  raw max peak gb/s:  %s    (incl. drain artifacts from starved conns)\n" "$raw_max_peak"
 
 # --- gate -----------------------------------------------------------------
 fails=()
@@ -259,16 +301,22 @@ mkdir -p "$(dirname "$SUMMARY_MD")"
     echo "| metric | observed | floor | result |"
     echo "| --- | ---: | ---: | :---: |"
     if (( $(awk -v v="$mean_avg" -v f="$FLOOR_MEAN_AVG_GBPS" 'BEGIN{print (v+0 < f+0) ? 1 : 0}') )); then
-        echo "| mean avg gb/s | $mean_avg | $FLOOR_MEAN_AVG_GBPS | :x: |"
+        echo "| mean avg gb/s (good only) | $mean_avg | $FLOOR_MEAN_AVG_GBPS | :x: |"
     else
-        echo "| mean avg gb/s | $mean_avg | $FLOOR_MEAN_AVG_GBPS | :white_check_mark: |"
+        echo "| mean avg gb/s (good only) | $mean_avg | $FLOOR_MEAN_AVG_GBPS | :white_check_mark: |"
+    fi
+    if (( $(awk -v g="$mean_avg" -v r="$raw_mean_avg" 'BEGIN{print (r+0 < g+0 - 0.001) ? 1 : 0}') )); then
+        echo "| raw mean avg gb/s | $raw_mean_avg | — | — |"
     fi
     echo "| min  avg gb/s | $min_avg | — | — |"
     echo "| mean peak gb/s | $mean_peak | — | — |"
     if (( $(awk -v v="$max_peak" -v f="$FLOOR_MAX_PEAK_GBPS" 'BEGIN{print (v+0 < f+0) ? 1 : 0}') )); then
-        echo "| max  peak gb/s | $max_peak | $FLOOR_MAX_PEAK_GBPS | :x: |"
+        echo "| max  peak gb/s (good only) | $max_peak | $FLOOR_MAX_PEAK_GBPS | :x: |"
     else
-        echo "| max  peak gb/s | $max_peak | $FLOOR_MAX_PEAK_GBPS | :white_check_mark: |"
+        echo "| max  peak gb/s (good only) | $max_peak | $FLOOR_MAX_PEAK_GBPS | :white_check_mark: |"
+    fi
+    if (( $(awk -v g="$max_peak" -v r="$raw_max_peak" 'BEGIN{print (r+0 > g+0 + 0.001) ? 1 : 0}') )); then
+        echo "| raw max peak gb/s | $raw_max_peak | — | — |"
     fi
     if (( GOOD_CONNS < FLOOR_GOOD_CONNS )); then
         echo "| good conns | $GOOD_CONNS / $TOTAL_CONNS | $FLOOR_GOOD_CONNS | :x: |"
@@ -278,19 +326,25 @@ mkdir -p "$(dirname "$SUMMARY_MD")"
     echo
     echo "### Per-run"
     echo
-    echo "| run | good/N | mean avg gb/s | max peak gb/s |"
-    echo "| ---: | :---: | ---: | ---: |"
+    echo "| run | good/N | mean avg gb/s | max peak gb/s (good) | raw max peak gb/s |"
+    echo "| ---: | :---: | ---: | ---: | ---: |"
     for ((i = 0; i < N_RUNS; i++)); do
         avgs="${RUN_AVGS[$i]}"
         peaks="${RUN_PEAKS[$i]}"
+        good_peaks="${RUN_GOOD_PEAKS[$i]}"
         good_n="${RUN_GOOD[$i]}"
         if [[ -z "$avgs" ]]; then
-            echo "| $((i + 1)) | 0/$N_CONNS | — | — |"
+            echo "| $((i + 1)) | 0/$N_CONNS | — | — | — |"
             continue
         fi
         run_mean_avg=$(printf '%s\n' $avgs | awk '{s+=$1;n++} END{printf "%.2f", s/n}')
-        run_max_peak=$(printf '%s\n' $peaks | awk 'BEGIN{m=0} {if($1>m) m=$1} END{printf "%.2f", m}')
-        echo "| $((i + 1)) | $good_n/$N_CONNS | $run_mean_avg | $run_max_peak |"
+        run_raw_peak=$(printf '%s\n' $peaks | awk 'BEGIN{m=0} {if($1>m) m=$1} END{printf "%.2f", m}')
+        if [[ -z "$good_peaks" ]]; then
+            run_good_peak="—"
+        else
+            run_good_peak=$(printf '%s\n' $good_peaks | awk 'BEGIN{m=0} {if($1>m) m=$1} END{printf "%.2f", m}')
+        fi
+        echo "| $((i + 1)) | $good_n/$N_CONNS | $run_mean_avg | $run_good_peak | $run_raw_peak |"
     done
     echo
     if [[ ${#fails[@]} -gt 0 ]]; then
@@ -301,9 +355,18 @@ mkdir -p "$(dirname "$SUMMARY_MD")"
         done
         echo
     fi
-    echo "<sub>A \"good conn\" delivered ≥ $((GOOD_CONN_MIN_BYTES / 1000000000)) GB before idle timeout. "
-    echo "Floors are env-var overridable: \`BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS\`, "
-    echo "\`BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS\`, \`BLUEFIN_BENCH_FLOOR_GOOD_CONNS\`. "
+    # Footnote: explain the bytes threshold in human-readable units (MB or GB).
+    if (( GOOD_CONN_MIN_BYTES >= 1000000000 )); then
+        good_threshold_human="$((GOOD_CONN_MIN_BYTES / 1000000000)) GB"
+    else
+        good_threshold_human="$((GOOD_CONN_MIN_BYTES / 1000000)) MB"
+    fi
+    echo "<sub>A \"good conn\" delivered ≥ ${good_threshold_human} before idle timeout. "
+    echo "\"max peak (good only)\" filters out kernel-buffer-drain artifacts "
+    echo "that appear as huge inst-throughput readings on starved conns under "
+    echo "runner CPU contention. Floors are env-var overridable: "
+    echo "\`BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS\`, \`BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS\`, "
+    echo "\`BLUEFIN_BENCH_FLOOR_GOOD_CONNS\`, \`BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES\`. "
     echo "Ratchet up after stable runs land. Script: \`bench_ci.sh\`.</sub>"
 } > "$SUMMARY_MD"
 

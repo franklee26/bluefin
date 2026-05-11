@@ -81,6 +81,9 @@ CLIENT_BIN="./target/release/client"
 
 LOG_DIR="bench_logs/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
+# Single-line marker so external drivers (e.g. bench_ci.sh) can pick up the
+# per-invocation log directory without racing against `ls -t bench_logs/`.
+echo "[log-dir] $LOG_DIR"
 
 # --- macOS prefers `gtimeout` (coreutils); fall back to `timeout` ----------
 if command -v gtimeout >/dev/null 2>&1; then

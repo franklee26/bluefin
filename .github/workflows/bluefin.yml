@@ -190,12 +190,19 @@ jobs:
       # Per-run retry knobs. Hosted macos-latest runners occasionally land
       # on a deeply contended host where both bench peers get starved and
       # the run yields 0 GOOD conns despite no actual code regression.
-      # Empirically this hits ~5-10 % of CI runs. With one retry on a 5 s
-      # backoff, the post-retry catastrophic-allocation rate is well under
-      # 1 %, while keeping wall-clock additive only on actually-bad runs
-      # (typical run = 0 retries; worst-case run = +5 s + ~12 s redo).
-      # Production behaviour is unaffected (RUN_RETRIES defaults to 0).
-      BLUEFIN_BENCH_RUN_RETRIES:            "1"         # one extra attempt per run on 0 good
+      # Empirically this hits ~5-10 % of CI runs and a single retry isn't
+      # always enough on the worst allocations. We use an ASYMMETRIC retry
+      # policy:
+      #   - 0 good (catastrophic, almost certainly runner-allocation):
+      #     retry up to 2x. The cumulative probability of 3 consecutive
+      #     bad allocations is well under 0.1 %.
+      #   - 1 of 2 good (partial, the conns that worked are real signal):
+      #     no retry. Committing the partial result preserves the
+      #     diagnostic value of seeing one TRUNC alongside one GOOD.
+      #   - 2 of 2 good: never retry.
+      # Production behaviour is unaffected (both knobs default to 0).
+      BLUEFIN_BENCH_RUN_RETRIES_ON_ZERO:    "2"         # extra attempts when 0 good
+      BLUEFIN_BENCH_RUN_RETRIES_ON_PARTIAL: "0"         # extra attempts when 1..N-1 good (= keep current behaviour)
       BLUEFIN_BENCH_RUN_RETRY_BACKOFF_SECS: "5"         # short cooldown to let the runner settle
     steps:
       - uses: actions/checkout@v4

@@ -17,11 +17,21 @@
 #   BLUEFIN_BENCH_FLOOR_GOOD_CONNS      default 6     (of N_RUNS * N_CONNS)
 #
 # Per-run retry knobs (env vars):
-#   BLUEFIN_BENCH_RUN_RETRIES            default 0     # attempts per run = 1 + this
+#   BLUEFIN_BENCH_RUN_RETRIES_ON_ZERO    default 0     # extra attempts when 0 GOOD conns
+#   BLUEFIN_BENCH_RUN_RETRIES_ON_PARTIAL default 0     # extra attempts when 1..N-1 GOOD conns
 #   BLUEFIN_BENCH_RUN_RETRY_BACKOFF_SECS default 5     # sleep between attempts
-# A run is retried only if it produced 0 GOOD conns (catastrophic
-# allocation on hosted CI runners, where contention starves both peers).
-# Only the final attempt's data feeds the aggregate stats.
+#   BLUEFIN_BENCH_RUN_RETRIES            (legacy)      # used as the default for both above when set
+# A run is retried while its remaining-retry budget is positive. The
+# budget is NOT reset per attempt: it starts at max(ON_ZERO, ON_PARTIAL)
+# and is clamped down to the smallest budget triggered by any attempt of
+# the run so far. So once you see a partial-good attempt (budget=0 in
+# CI), the run is locked to that level for any subsequent attempts -- it
+# can never "upgrade" to the larger 0-good budget. CI uses an asymmetric
+# policy: 2 retries on a catastrophic 0-good run (almost always a
+# runner-allocation issue, and a third attempt usually clears it),
+# 0 retries on a partial-good run (1+ good means bluefin worked; the
+# lone TRUNC is signal worth keeping). All-good runs never retry. Only
+# the final attempt's data feeds the aggregate stats.
 #
 # A "good conn" is one that emitted a FINAL line AND delivered at least
 # GOOD_CONN_MIN_BYTES (default 14e9 = ~93% of the 15 GB target). This
@@ -47,14 +57,18 @@ FLOOR_MAX_PEAK_GBPS="${BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS:-0.10}"
 FLOOR_GOOD_CONNS="${BLUEFIN_BENCH_FLOOR_GOOD_CONNS:-6}"
 GOOD_CONN_MIN_BYTES="${BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES:-14000000000}"
 
-# Retry a run that produced 0 GOOD conns up to this many extra times.
-# Default 0 = current behaviour (no retry). CI sets this to 1 so
-# catastrophic runner-allocation events (one in ~10 hosted-macos jobs by
-# observation) get a second chance instead of flaking the gate. Only the
-# final attempt's data is committed to the aggregate stats; earlier
-# attempts' logs are still on disk under the run's `attempt_*` dirs but
-# are NOT parsed.
-RUN_RETRIES="${BLUEFIN_BENCH_RUN_RETRIES:-0}"
+# Retry a run that produced few GOOD conns up to this many extra times.
+# CI uses an asymmetric policy (see header comment): catastrophic 0-good
+# runs get more retries because they're almost always runner-allocation
+# noise; partial-good runs get fewer because the conns that survived are
+# real signal worth committing.
+#
+# Legacy `BLUEFIN_BENCH_RUN_RETRIES` is supported as the default for both
+# new knobs (so a single-knob CI override still works) but the asymmetric
+# knobs win when set explicitly.
+RUN_RETRIES_LEGACY="${BLUEFIN_BENCH_RUN_RETRIES:-0}"
+RUN_RETRIES_ON_ZERO="${BLUEFIN_BENCH_RUN_RETRIES_ON_ZERO:-$RUN_RETRIES_LEGACY}"
+RUN_RETRIES_ON_PARTIAL="${BLUEFIN_BENCH_RUN_RETRIES_ON_PARTIAL:-$RUN_RETRIES_LEGACY}"
 RUN_RETRY_BACKOFF_SECS="${BLUEFIN_BENCH_RUN_RETRY_BACKOFF_SECS:-5}"
 
 # --- arg parsing -----------------------------------------------------------
@@ -128,7 +142,7 @@ echo "   mean avg gb/s : >= $FLOOR_MEAN_AVG_GBPS"
 echo "   max peak gb/s : >= $FLOOR_MAX_PEAK_GBPS"
 echo "   good conns    : >= $FLOOR_GOOD_CONNS / $TOTAL_CONNS"
 echo "   good-conn floor bytes: $GOOD_CONN_MIN_BYTES"
-echo "   per-run retries on 0 good: $RUN_RETRIES (backoff ${RUN_RETRY_BACKOFF_SECS}s)"
+echo "   per-run retries  : $RUN_RETRIES_ON_ZERO on 0 good / $RUN_RETRIES_ON_PARTIAL on partial (backoff ${RUN_RETRY_BACKOFF_SECS}s)"
 echo "=========================================================================="
 
 # --- run loop -------------------------------------------------------------
@@ -147,10 +161,23 @@ for ((run = 1; run <= N_RUNS; run++)); do
     run_good_peaks_local=()
     run_good_local=0
 
-    max_attempts=$(( RUN_RETRIES + 1 ))
+    # Retry budget. max_attempts is an upper bound on the loop counter;
+    # the actual stop condition is `budget_remaining` below, which starts
+    # at the largest possible budget and is clamped DOWN by every failing
+    # attempt to its result-level's budget. This is the no-reset policy:
+    # once a partial-good attempt has been observed, the run can never be
+    # granted more retries than RUN_RETRIES_ON_PARTIAL even if a later
+    # attempt collapses to 0 good (which would otherwise unlock the
+    # bigger ON_ZERO budget).
+    if (( RUN_RETRIES_ON_ZERO >= RUN_RETRIES_ON_PARTIAL )); then
+        max_attempts=$(( RUN_RETRIES_ON_ZERO + 1 ))
+    else
+        max_attempts=$(( RUN_RETRIES_ON_PARTIAL + 1 ))
+    fi
+    budget_remaining=$(( max_attempts - 1 ))   # = max(ON_ZERO, ON_PARTIAL)
     for ((attempt = 1; attempt <= max_attempts; attempt++)); do
         if (( attempt > 1 )); then
-            echo "  [retry] run $run produced 0 good conns; sleeping ${RUN_RETRY_BACKOFF_SECS}s before attempt $attempt/$max_attempts..."
+            echo "  [retry] run $run sleeping ${RUN_RETRY_BACKOFF_SECS}s before attempt $attempt/$max_attempts..."
             sleep "$RUN_RETRY_BACKOFF_SECS"
         fi
 
@@ -257,14 +284,35 @@ for ((run = 1; run <= N_RUNS; run++)); do
             echo "  $verdict  bytes=$bytes  avg=${avg} gb/s  peak=${peak} gb/s"
         done < <(grep -E '^\(#[0-9]+\) FINAL:' "$server_log" || true)
 
-        if (( run_good_local > 0 )); then
-            final_attempt=$attempt
-            break  # at least one good conn -- accept this attempt
+        # Decide whether to retry. Three cases for the current attempt:
+        #   - All N conns good     -> never retry (full success)
+        #   - 0 conns good         -> level_budget = RUN_RETRIES_ON_ZERO
+        #   - 1..N-1 conns good    -> level_budget = RUN_RETRIES_ON_PARTIAL
+        # `budget_remaining` is then clamped DOWN to level_budget. This
+        # gives the no-reset semantics: a 1/2-then-0/2 sequence locks to
+        # the partial budget (so we DON'T get the bigger 0-good budget
+        # just because the latest attempt happened to be 0-good). If the
+        # cumulative retries used (attempt - 1) has reached the running
+        # min, we accept the current attempt as final.
+        final_attempt=$attempt
+        if (( run_good_local >= N_CONNS )); then
+            break  # all good -- best possible outcome, accept
         fi
-        final_attempt=$attempt   # may be overwritten by next iteration; survives the loop
-        if (( attempt < max_attempts )); then
-            echo "  [retry] run $run attempt $attempt yielded 0 good conns; will retry"
+        if (( run_good_local == 0 )); then
+            level_budget=$RUN_RETRIES_ON_ZERO
+            level="0 good"
+        else
+            level_budget=$RUN_RETRIES_ON_PARTIAL
+            level="$run_good_local/$N_CONNS good (partial)"
         fi
+        if (( level_budget < budget_remaining )); then
+            budget_remaining=$level_budget
+        fi
+        retries_used=$(( attempt - 1 ))
+        if (( retries_used >= budget_remaining )); then
+            break  # cumulative retry budget exhausted; accept
+        fi
+        echo "  [retry] run $run attempt $attempt yielded $level; budget $budget_remaining, used $retries_used; will retry"
     done
 
     # Commit the (possibly retried) attempt's results to the global aggregates.
@@ -373,6 +421,21 @@ esac
     if (( retried_runs > 0 )); then
         echo
         echo "**Retries:** $retried_runs of $N_RUNS run(s) needed retry (+$total_extra_attempts extra attempt(s)). See per-run table."
+        echo
+        echo "<details><summary>why retries vary across runs</summary>"
+        echo
+        echo "Hosted CI runners occasionally land on a deeply contended host where both bench peers get starved and a run produces 0 GOOD conns despite no actual code regression. To absorb this without weakening the gate, this job uses an **asymmetric retry policy** (current values: \`ON_ZERO=$RUN_RETRIES_ON_ZERO\`, \`ON_PARTIAL=$RUN_RETRIES_ON_PARTIAL\`, backoff \`${RUN_RETRY_BACKOFF_SECS}s\`):"
+        echo
+        echo "| attempt outcome | extra retries granted |"
+        echo "| --- | :---: |"
+        echo "| all $N_CONNS conns good | 0 (accept) |"
+        echo "| 1..$((N_CONNS - 1)) conns good (partial) | up to \`ON_PARTIAL=$RUN_RETRIES_ON_PARTIAL\` |"
+        echo "| 0 conns good (catastrophic) | up to \`ON_ZERO=$RUN_RETRIES_ON_ZERO\` |"
+        echo
+        echo "The retry budget is **per-run** and **only shrinks** across attempts: once a partial-good attempt has been observed in a run, that run is locked to the partial budget for the rest of its attempts -- it can never be promoted to the larger 0-good budget by a later attempt happening to collapse to 0. Only the **final** attempt's data is committed to the aggregate stats; earlier attempts' logs are still on disk under the run's \`attempt_*\` directory but are not parsed."
+        echo
+        echo "So the same code can show 0, 1, or 2 retries on different CI runs purely from runner-allocation luck. The \`attempts\` column in the per-run table below shows how many attempts each run took (bold = needed at least one retry)."
+        echo "</details>"
     fi
     echo
     echo "### Aggregate"

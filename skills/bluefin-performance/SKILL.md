@@ -305,6 +305,51 @@ w = float(rect.get(INFERNO + 'w'))
 
 The teardown-vs-steady-vs-idle bucketing is also worth replicating when reading any future client flamegraph: walk each leaf box's parent chain; if any ancestor symbol contains `task::raw::shutdown`, `set_stage`, or `drop_in_place`, that leaf is teardown. If any ancestor contains `park_internal`, `wait_until`, or `cvwait`, it's idle. Otherwise it's real work. On a graceful-exit profile, expect 20-25 % teardown unless #15 is fixed.
 
+## Trends across all rounds (read this before proposing a new round)
+
+A meta-summary across the 22 rounds in the timeline below. **Future rounds will be evaluated against these trends; if a proposal contradicts one, justify it explicitly.**
+
+### Average-throughput trajectory (the headline number)
+
+The "avg" number's *meaning* changed across rounds; understand it before comparing values:
+
+| Era | What "avg" measured | Value range |
+|---|---|---|
+| **pre-`b8c0489` (Tier A)** | client-side send rate, no flush, single-conn | climbed 2.50 → 2.84 → **3.04 GB/s** |
+| **2026-05/#1 → #10** | mixed: client-side send rate (still inflated); some rounds report peak | "+5.6 % client-side", "+65–85 % client-side (was lying)" |
+| **post-D (round D, flush fix) onwards** | server-observed *delivered* per-conn avg, two-conn bench, honest | settled at **~1.76–1.87 GB/s per conn** |
+| **post-F1 onwards (after the bench-only `timeout()` removal)** | same, but server's measurement loop no longer self-throttles | tightened around **~1.82 GB/s per conn** |
+| **post-P canonical (20-run sweep)** | same; n=35 healthy conns | **median 1.82 GB/s, stdev 0.02 (1.1 %)** |
+
+Per-round delivered avg, post-D era only (the comparable window):
+
+```
+D     M     N     O    F1    F2    G3   F3*    P    20-run
+ ~     1.76  1.84  1.79 1.82  1.81  1.82 1.73   1.81 1.82  GB/s avg per conn
+                                          (thermal-drift batch)
+```
+
+**Key observations:**
+
+1. **Avg has been flat at 1.81 ± 0.02 GB/s since round F1.** Six rounds since (F2 G3 F3 P + the 20-run calibration) all landed inside the same ±1 % band — empirical proof the bench is *not* CPU-bound on either side.
+2. **The pre-D climb (2.50 → 3.04 GB/s) was real but on a different metric.** It measured what the client could enqueue, not what the server delivered. After `flush()` made delivered-bytes honest, the headline number *dropped* by ~40 % — *not because anything regressed*, but because the previous numbers were ~40 % air. **Lesson: whenever a calibration round reduces a metric, treat it as a coordinate change, not a regression.**
+3. **Round N (+10 %)** moved avg from 1.76 → 1.84 by fixing a structural bug (the 12-Vec datagram pool was actually allocating fresh every iteration). Every avg-mover since baseline has been a structural bug-fix or a shape change, **never an allocation/copy elimination in isolation**.
+4. **Variance collapsed by ~10× over the same window.** Round F was 2/5 bilateral (40 %) at peak ~4.30. Round 20-run-sweep is 17/20 (85 %) with 1.1 % stdev on avg. The polish rounds delivered no GB/s but they delivered the variance reduction — which is what makes the next round's deliverable measurable.
+
+### Other recurring trends
+
+5. **Six rounds delivered measurable throughput; all six were *shape* changes, not *cycles* changes.** `2e853c7` (buffer pool), `b8c0489` (pipeline parallelism), `#2` (Bytes in mpsc), `#10` (bounded backpressure surfaces honest delivered bytes), `F` (inlined conn_reader = removed task hop), `N` (real recycle channel for the lying pool). Allocation/copy-elimination rounds in isolation (`E`, `M`, `F2`, `F3`, `G3`) all delivered **zero throughput** — they freed CPU that went to idle, because both sides have ~25–30 % idle headroom on macOS loopback. **Rule of thumb**: if your proposal is "save N % CPU" without changing a channel/task/pool boundary, predict throughput-flat in advance.
+
+6. **Foundation rounds compound; measure them in pairs.** `E` (Bytes payload, flat) → unblocked `F` (+12 % peak). `M` (count returned from `consume_data_into`, flat) → unblocked `N` (+10 %). `#1` (`mem::take`, flat) → enabled later recv-side reshaping in `F`. **Don't kill a foundation round for being throughput-flat; check whether it unblocks a downstream shape change.**
+
+7. **Calibration rounds were disproportionately valuable.** `D` (flush), `#10` (bounded), the 20-run sweep — three rounds whose deliverable was *what the number means*, not a faster number. Each exposed a previous round's measurement as wrong (or as a single-sample artefact). **Lesson: numbers are cheap, calibrated numbers are not.**
+
+8. **All proven regressions share one root cause: batching without pacing.** Rounds I (sendmsg_x send-only), J (recvmsg_x recv-only), K (paired vectorised + `yield_now`) all regressed *delivered* throughput because batching trades reduced syscalls for increased per-batch latency without a producer-rate governor; on macOS loopback the recv side overruns. **Vectorised I/O is gated on real flow control / pacing — not the other way around.** This is why CC comes before scatter-gather in the workstream order.
+
+9. **Single-sample maxes drift; medians don't.** Round N hit a 4.48 GB/s peak (single sample in 20 runs); the post-P 20-run sweep tops out at 4.04 GB/s with median 3.85 — every post-N round shipped throughput-flat, so the gap is pure run-to-run / thermal variance. **Honest peak = median of a large sweep**, not a one-shot record.
+
+10. **We have empirically converged on "not CPU-bound on either side."** Server post-G3+F3+P: largest pure-library frame < 1.3 % CPU; ~73 % is kernel/scheduler. Client post-P: largest user-frame is the suspected `_platform_memmove` payload-copy (6.7 %), and it's the *only* remaining structural CPU cost addressable in user space — only by scatter-gather sendmsg_x. **There is no remaining polish round that can plausibly move avg.** The next throughput lever is structural (CC + vectorised I/O), not micro.
+
 ## Historical timeline (commits, what worked)
 
 | Phase | Commit | Throughput | Key change |

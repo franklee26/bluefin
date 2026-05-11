@@ -41,24 +41,34 @@ All knobs are read from the environment by [`bench_ci.sh`](../../bench_ci.sh); s
 
 | Var | Default | What it does |
 |-----|---------|--------------|
-| `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS` | `0.05` (script) / `0.91` (workflow) | Minimum mean of per-conn `avg gb/s` across all conn-trials. Below this → FAIL. |
-| `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS` | `0.10` (script) / `1.90` (workflow) | Minimum of the *maximum* observed `peak gb/s`. Below this → FAIL. |
-| `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`    | `6` (script) / `5` (workflow) | Minimum count of "good conns" out of `N_RUNS * N_CONNS` total trials. Below this → FAIL. |
-| `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` | `14000000000` (14 GB) | **Threshold for what counts as a "good conn".** A conn that emits a FINAL line is GOOD if it delivered ≥ this many bytes, else TRUNC. Used for the good-conns count above. |
+| `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS` | `0.05` (script) / `0.05` (workflow) | Minimum mean of per-conn `avg gb/s` across all conn-trials. Below this → FAIL. On hosted runners, this is a noise floor (just non-zero). |
+| `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS` | `0.10` (script) / `1.00` (workflow) | Minimum of the *maximum* observed `peak gb/s`. Below this → FAIL. **This is the primary regression signal on hosted runners** — see "Runner reality" below. |
+| `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`    | `6` (script) / `4` (workflow) | Minimum count of "good conns" out of `N_RUNS * N_CONNS` total trials. Below this → FAIL. The threshold for "good" is `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`. |
+| `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` | `14000000000` (14 GB) script / `100000000` (100 MB) workflow | **Threshold for what counts as a "good conn".** A conn that emits a FINAL line is GOOD if it delivered ≥ this many bytes, else TRUNC. Used for the good-conns count above. **Rebaselined for CI** — see below. |
 | `BLUEFIN_BENCH_SUMMARY_MD` | `bench_logs/ci_summary.md` | Path the script writes the Markdown summary to. The workflow pins it so the comment step can find it. |
 
 ### `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` in detail
 
-Each client sends exactly **15 000 000 119 bytes** (10 M × 1500 B + handshake bytes). A connection is "good" if it delivered the full payload before the server's 2 s recv-idle timeout fired; otherwise it's "truncated" — the bilateral-failure pattern that surfaces under sustained CPU contention.
+Each client sends exactly **15 000 000 119 bytes** (10 M × 1500 B + handshake bytes). On local Apple-silicon this completes in ~10 s; on hosted runners it does not.
 
-The gate distinguishes these two cases by checking each FINAL line's byte count against `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`. The default of **14 GB ≈ 93 % of the 15 GB target** filters out clear truncations while allowing tiny rounding under-shoots (a TRUNC conn typically delivers 5–8 GB, well below the threshold). Both GOOD and TRUNC conns contribute their `avg`/`peak` numbers to the aggregate stats — the threshold only gates the good-conn count.
+The gate distinguishes "made real progress" from "starved out" by checking each FINAL line's byte count against `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`. Both GOOD and TRUNC conns contribute their `avg`/`peak` numbers to the aggregate stats — the threshold only gates the good-conn count.
 
-**When to tune it**:
+**Two operating points**:
 
-- **Lower** (e.g. `12000000000`) if hosted runners reliably truncate at 12 GB due to scheduler hiccups but otherwise hit reasonable throughput. This is the first lever in the fallback ladder before lowering the gb/s floors.
-- **Raise** to be stricter — e.g. `14900000000` to require ≥ 99.3 % of payload delivered. Useful if you're investigating partial-delivery regressions.
+- **Local (script default 14 GB)**: ≈ 93 % of the 15 GB target. Filters out clear truncations while allowing tiny rounding under-shoots. A TRUNC conn locally typically delivers 5–8 GB.
+- **Hosted CI (workflow override 100 MB)**: cleanly separates the bilateral-failure populations on hosted runners. Empirically (2026-05-11): the "active" conn delivers 300–800 MB per run; the "starved" conn delivers 6–60 MB. 100 MB sits in the gap. This makes `good_conns` mean "at least N runs had at least one peer making real progress", which is the right CI question.
 
-Do **not** lower it below ~10 GB — at that point you're letting through truly broken runs and the gate stops being meaningful.
+**When to tune the local default (14 GB)**:
+
+- **Lower** (e.g. `12000000000`) only if dev-box truncations become the norm and you want to ratchet the local run-quality bar down.
+- **Raise** (e.g. `14900000000`) to require ≥ 99.3 % of payload delivered if you're investigating partial-delivery regressions.
+
+**When to tune the CI override (100 MB)**:
+
+- **Lower** if a runner-image change makes 100 MB unreachable for the active conn (check the per-run table; if conn 0 routinely delivers <100 MB, the floor is the wrong shape for the new runner).
+- **Raise** if hosted runners get faster and the active conn reliably clears 500 MB — that lets you tighten the meaningful-progress bar.
+
+Do **not** lower the local default below ~10 GB — at that point you're letting through truly broken runs.
 
 ## Current floors and where they came from
 
@@ -66,35 +76,51 @@ The workflow ships these floors:
 
 | Floor | Value | Origin |
 |-------|-------|--------|
-| `mean avg gb/s` | **0.91** | 50 % of local 20-run sweep median (1.82 GB/s) |
-| `max peak gb/s` | **1.90** | 50 % of local 20-run sweep max-peak (3.85 GB/s) |
-| `good conns`    | **5** of 10 | 50 % of `N_RUNS × N_CONNS = 5 × 2 = 10` trials |
+| `mean avg gb/s` | **0.05** | Noise floor on hosted runners (observed CI median ~0.10). Just guards against catastrophic regressions. |
+| `max peak gb/s` | **1.00** | ~50 % of CI-observed median peak (~2.40 GB/s on 2026-05-11 run). **Primary regression signal.** |
+| `good conns`    | **4** of 10 (≥ 100 MB each) | 1-trial headroom over the 5/10 observed on 2026-05-11. "Good" is rebaselined to 100 MB delivered (vs 14 GB locally) so the gate distinguishes "made real progress" from "starved out" on hosted runners. |
 
-Local sample (5-run sweep, post-O+F1+F2+G3+F3+P, 2026-05-11): mean avg 1.892 GB/s, max peak 3.940 GB/s, 10/10 good — every floor cleared with 2× headroom.
+## Runner reality
 
-The 50 % rule is the **ratchet contract**: floors are always pegged at ~50 % of the most recent stable measurement, never higher. This is deliberately loose so the gate only fires on serious regressions and tolerates hosted-runner noise without flaking. Tighten by **lowering the divisor** (50 % → 60 % → 75 %) only after a sustained green streak that justifies the risk.
+**Hosted `macos-latest` runners are dramatically slower and burstier than typical Apple-silicon dev hardware.** Empirical data from the first CI run (2026-05-11):
+
+| Signal | Local (M-series) | Hosted (macos-latest) | Ratio | Useful as gate? |
+|--------|------------------|-----------------------|-------|-----------------|
+| `max peak gb/s` | 3.85 | 3.65 | ~95 % | **YES** — burst rate is comparable, code regressions surface here |
+| `mean avg gb/s` | 1.82 | 0.094 | ~5 % | NO — swamped by VM scheduling jitter |
+| good conns @ 14 GB | 9 / 10 | 0 / 10 | — | NO — the runner can't sustain long enough to deliver 14 GB |
+| good conns @ 100 MB | 10 / 10 | 5 / 10 | — | **YES** — distinguishes "active" conn (300–800 MB) from "starved" conn (6–60 MB) |
+| peak / mean ratio | ~2× | ~25× | — | runner is extremely bursty |
+
+**Bilateral failure is the steady-state on hosted runners**: per the 2026-05-11 CI data, conn 0 delivers 300–800 MB per run while conn 1 stalls at 6–60 MB. This is the same contention pattern documented in `bluefin-performance` for local under-provisioned runs, just always-on for the hosted runner class. The 100 MB threshold sits in the empirical gap between the two populations, so `good_conns` answers a real question: "did at least one peer per run move serious bytes, or is the code so broken that nothing is moving?"
+
+The takeaway: **`max_peak` is the strongest signal, `good_conns` (rebaselined) is a meaningful liveness gate, `mean_avg` is just a noise floor**.
 
 ## Ratcheting up after a perf gain
 
 After a confirmed gain (typically: a successful round of optimisations recorded in `bluefin-performance`'s round table, with a fresh local sweep), tighten the floors:
 
-1. Run the 20-run local sweep that the perf SKILL describes (or the 5-run quick-look in this doc's "current floors" row).
-2. Read the **median** mean-avg and the **median** (not max) peak. Median is more stable than max under runner noise.
-3. Multiply each by the **current ratchet factor (0.50)** and round to 2 decimal places. Update the workflow env block.
-4. Set `BLUEFIN_BENCH_FLOOR_GOOD_CONNS` to `ceil(0.50 * N_RUNS * N_CONNS)`. With the current `5×2 = 10`, that's **5**.
-5. Open a PR. The bench-macos job will run against its own new floors — if the PR is purely a floor bump, it should PASS comfortably.
+1. Run the 5-run CI bench (push a no-op PR) and read the GREEN `bench-macos` summary.
+2. Read the **median** `max peak gb/s` across the 5 runs.
+3. Multiply by the **current ratchet factor (0.50)** and round to 2 decimal places. Update `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS`.
+4. **Do NOT** ratchet `mean_avg` based on local numbers — hosted runners can't reach them. Bump only if the CI median has demonstrably risen.
+5. For `good_conns`: count how many conn-trials cleared `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` across the recent runs. If consistently ≥ `N_RUNS + k` for `k ≥ 1`, raise the floor to `N_RUNS + (k - 1)` (always leave 1-trial headroom). If hosted runners get faster and the active conn reliably clears a higher byte count, also raise `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` (e.g. 100 MB → 500 MB).
+6. Open a PR with the floor bump. The bench-macos job will run against its own new floors — if the PR is purely a floor bump, it should PASS comfortably.
 
-Do **not** ratchet on max-peak — peak is high-variance. Use the median peak and let max-peak sit well above the floor as natural headroom.
+Do **not** ratchet `max_peak` using the *max*, only the *median* across runs. Peak is high-variance.
 
 ## When CI fails: the fallback ladder
 
 Hosted `macos-latest` runners are slower and noisier than typical Apple-silicon dev hardware. If the gate flakes after a floor bump, work down this ladder *before* disabling the gate:
 
-1. **Widen `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`** (default 14e9 → try 12e9). Counts more partial deliveries as good. Usually the right answer when the runner is delivering reasonable throughput but truncating one or two conns under load.
-2. **Drop the gb/s floors in 0.10 steps**. Stay at 50 % of the new observed median.
-3. **Lower `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`** from 5 → 4 (out of 10). Last resort — implies the runner is so noisy that bilateral reliability is genuinely <50 %.
+1. **Lower `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS` in 0.20 steps**. Stay at 50 % of the new observed CI median.
+2. **Investigate `mean_avg` failures.** If mean_avg trips at 0.05, that's not noise — it's a real regression. Look at the per-conn FINAL lines in the artifact to see whether bytes were delivered at all.
+3. **Investigate `good_conns` failures.** If `good_conns` trips at 4, look at the per-run table. Three patterns:
+   - **Both conns starved across multiple runs** (all bytes < 100 MB): real regression. Don't lower the floor.
+   - **Active conn delivers <100 MB**: the runner generation has changed. Lower `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` to bracket the new active-conn population (look at conn 0 bytes across runs, set the threshold half-way down).
+   - **Active conn fine, fewer runs hitting it**: lower `BLUEFIN_BENCH_FLOOR_GOOD_CONNS` from 4 → 3 with a comment.
 
-If you reach step 3 and still flake, the runner class is wrong for this gate. Move it to a self-hosted runner or accept that the CI bench is best-effort signal.
+If you reach step 3 with no obvious regression cause, the runner class may have changed (GitHub occasionally migrates runner image generations). Compare against the SHA of the previous green run; if the runner image changed, rebaseline both `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS` and `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` against the new median.
 
 ## Anatomy of `bench_ci.sh`
 
@@ -133,11 +159,11 @@ The Markdown body the script emits looks like:
 
 | metric         | observed | floor | result             |
 | ---            |    ---:  |  ---: | :---:              |
-| mean avg gb/s  |   1.892  |  0.91 | :white_check_mark: |
+| mean avg gb/s  |   1.892  |  0.05 | :white_check_mark: |
 | min  avg gb/s  |   1.820  |    —  | —                  |
 | mean peak gb/s |   3.728  |    —  | —                  |
-| max  peak gb/s |   3.940  |  1.90 | :white_check_mark: |
-| good conns     | 10 / 10  |    5  | :white_check_mark: |
+| max  peak gb/s |   3.940  |  1.00 | :white_check_mark: |
+| good conns     | 10 / 10  |    4  | :white_check_mark: |
 
 ### Per-run
 …
@@ -153,7 +179,7 @@ Each gated metric gets its own `:white_check_mark:` / `:x:` cell, so reviewers c
 | Task | What to do |
 |------|------------|
 | **Run the gate locally** | `./bench_ci.sh -r 5 -n 2 --skip-build` (after a `cargo build --release --bin server --bin client`). Takes ~1 min. |
-| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.91 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=1.90 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=5` and `BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md`. |
+| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.05 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=1.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=4 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=100000000` and `BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md`. |
 | **Force a FAIL to test the comment** | `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=10.0 ./bench_ci.sh -r 2 -n 2 --skip-build`. Useful when changing the Markdown emitter. |
 | **Bump floors after a perf gain** | See "Ratcheting up" above. Edit only `.github/workflows/bluefin.yml`'s `env:` block. |
 | **Inspect a CI failure** | Open the run → `bench-macos` job → expand `Run CI bench`. The Markdown also lands in the run's Summary tab and on the PR. The full per-run logs are in the `bench-logs` artifact. |

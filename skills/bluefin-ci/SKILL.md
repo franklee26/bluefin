@@ -1,6 +1,6 @@
 ---
 name: bluefin-ci
-description: How CI/CD works for the Bluefin codebase. Covers the GitHub Actions workflow ([`.github/workflows/bluefin.yml`](../../.github/workflows/bluefin.yml)), the throughput-regression `bench-macos` job (driver script [`bench_ci.sh`](../../bench_ci.sh), floors, sticky PR comments, log artifacts), the env-var knobs that govern the gate, and the ratchet protocol for tightening floors as performance improves. Load whenever a task touches the workflow file, the bench gate, the comment formatting, the floor thresholds, or asks "why did CI fail?" / "how do I bump CI to require more throughput?". Pair with `bluefin-performance` for the *measurement* side (what the numbers mean, the canonical baseline).
+description: How CI/CD works for the Bluefin codebase. Covers the GitHub Actions workflow ([`.github/workflows/bluefin.yml`](../../.github/workflows/bluefin.yml)), the throughput-regression `bench (macos-latest)` job (driver script [`bench_ci.sh`](../../bench_ci.sh), floors, sticky PR comments, log artifacts), the env-var knobs that govern the gate, and the ratchet protocol for tightening floors as performance improves. Load whenever a task touches the workflow file, the bench gate, the comment formatting, the floor thresholds, or asks "why did CI fail?" / "how do I bump CI to require more throughput?". Pair with `bluefin-performance` for the *measurement* side (what the numbers mean, the canonical baseline).
 ---
 
 # Bluefin CI
@@ -16,11 +16,11 @@ End-to-end documentation of the Bluefin GitHub Actions pipeline, with primary fo
 | `build` | ubuntu-latest, macos-latest | `cargo build` + `cargo test`, plus a second pass with `--features macos-fast` on macOS only |
 | `coverage` | ubuntu-latest | `cargo llvm-cov` → upload to Codecov |
 | `kani` | ubuntu-latest | Model-checking via `model-checking/kani-github-action@v1.1` |
-| `bench-macos` | macos-latest | **Throughput regression gate. The rest of this doc.** |
+| `bench (macos-latest)` | macos-latest | **Throughput regression gate. The rest of this doc.** |
 
-## The `bench-macos` job
+## The `bench (macos-latest)` job
 
-The bench-macos job runs [`bench_ci.sh`](../../bench_ci.sh), which drives [`bench_two_process.sh`](../../bench_two_process.sh) `N_RUNS` times at `N_CONNS` connections each, parses the per-conn `(#X) FINAL: …` lines from each successful attempt's `server.log`, aggregates the stats, compares them against env-var floors, and produces:
+The `bench (macos-latest)` job runs [`bench_ci.sh`](../../bench_ci.sh), which drives [`bench_two_process.sh`](../../bench_two_process.sh) `N_RUNS` times at `N_CONNS` connections each, parses the per-conn `(#X) FINAL: …` lines from each successful attempt's `server.log`, aggregates the stats, compares them against env-var floors, and produces:
 
 1. **stdout** with per-conn verdicts and an aggregate block — visible in the Actions log;
 2. **a Markdown summary** at `$BLUEFIN_BENCH_SUMMARY_MD` (default `bench_logs/ci_summary.md`) — used downstream;
@@ -43,34 +43,58 @@ All knobs are read from the environment by [`bench_ci.sh`](../../bench_ci.sh); s
 |-----|---------|--------------|
 | `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS` | `0.05` (script) / `0.05` (workflow) | Minimum mean of per-conn `avg gb/s` across **GOOD conns only** (filtered — see "Drain artifacts" below). Below this → FAIL. |
 | `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS` | `0.10` (script) / `1.00` (workflow) | Minimum of the *maximum* observed `peak gb/s` across **GOOD conns only** (filtered). Below this → FAIL. |
-| `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`    | `6` (script) / `1` (workflow) | Minimum count of "good conns" out of `N_RUNS * N_CONNS` total trials. Below this → FAIL. The threshold for "good" is `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`. |
-| `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` | `14000000000` (14 GB) script / `100000000` (100 MB) workflow | **Threshold for what counts as a "good conn".** A conn that emits a FINAL line is GOOD if it delivered ≥ this many bytes, else TRUNC. Used for the good-conns count above. **Rebaselined for CI** — see below. |
+| `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`    | `6` (script) / `6` (workflow) | Minimum count of "good conns" out of `N_RUNS * N_CONNS` total trials. Below this → FAIL. The threshold for "good" is `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`. |
+| `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` | `14000000000` (14 GB) script / `700000000` (700 MB) workflow | **Threshold for what counts as a "good conn".** A conn that emits a FINAL line is GOOD if it delivered ≥ this many bytes, else TRUNC. Used for the good-conns count above. **Rebaselined for CI** — see below. |
 | `BLUEFIN_BENCH_SUMMARY_MD` | `bench_logs/ci_summary.md` | Path the script writes the Markdown summary to. The workflow pins it so the comment step can find it. |
 | `BLUEFIN_SOCKET_RCVBUF` | unset (production) / `8388608` (8 MiB, workflow) | Per-socket `SO_RCVBUF` override read by [`BluefinSocket::new`](../../bluefin-io/src/socket/udp_socket.rs). When unset, falls back to the hardcoded **512 KiB** default — see "Socket buffer sizes" below. |
 | `BLUEFIN_SOCKET_SNDBUF` | unset (production) / `8388608` (8 MiB, workflow) | Per-socket `SO_SNDBUF` override, same semantics as RCVBUF. Set in CI to keep send/recv symmetric on the loopback bench. |
+| `BLUEFIN_NUM_SENDS` | unset (production = `10_000_000`) / `500000` (workflow) | Per-conn payload-loop iteration count read by [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs). Each iteration sends a 1500 B `Bytes`, so this controls total per-conn payload size: `NUM_SENDS × 1500 B`. CI ships 750 MB instead of the 15 GB dev default — see "Payload size and idle-timeout" below. |
+| `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` | unset (production = `2`) / `10` (workflow) | Server's per-conn recv-idle deadline in seconds, read once at startup by [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs). Bluefin has no protocol FIN; this is how the bench server decides a peer is gone. CI bumps to 10 s so slow-but-progressing CI conns can finish the (shrunk) payload before the deadline TRUNCs them. The server's FINAL `avg gb/s` subtracts this tail from the divisor so the reported number is bytes / actual-transfer-time. |
 
 ### `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` in detail
 
-Each client sends exactly **15 000 000 119 bytes** (10 M × 1500 B + handshake bytes). On local Apple-silicon this completes in ~10 s; on hosted runners it does not.
+Each client sends exactly **`NUM_SENDS × 1500 B + handshake bytes`**. With the production default `NUM_SENDS = 10 000 000`, that's ~15 GB per conn (~10 s on local Apple-silicon, never completes on hosted runners). With the CI workflow override `BLUEFIN_NUM_SENDS=500000`, that's ~750 MB per conn — sized so hosted runners can actually finish it inside the 10 s recv-idle window.
 
 The gate distinguishes "made real progress" from "starved out" by checking each FINAL line's byte count against `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`. Both GOOD and TRUNC conns contribute their `avg`/`peak` numbers to the aggregate stats — the threshold only gates the good-conn count.
 
 **Two operating points**:
 
-- **Local (script default 14 GB)**: ≈ 93 % of the 15 GB target. Filters out clear truncations while allowing tiny rounding under-shoots. A TRUNC conn locally typically delivers 5–8 GB.
-- **Hosted CI (workflow override 100 MB)**: cleanly separates the bilateral-failure populations on hosted runners. Empirically (2026-05-11): the "active" conn delivers 300–800 MB per run; the "starved" conn delivers 6–60 MB. 100 MB sits in the gap. This makes `good_conns` mean "at least N runs had at least one peer making real progress", which is the right CI question.
+- **Local (script default 14 GB)**: ≈ 93 % of the 15 GB local target. Filters out clear truncations while allowing tiny rounding under-shoots. A TRUNC conn locally typically delivers 5–8 GB.
+- **Hosted CI (workflow override 700 MB)**: ≈ 93 % of the 750 MB CI target. Same semantic as local — "good" means "delivered ≈ the full payload". Conns that stall mid-flight (typical hosted-runner contention) get TRUNCed and excluded from `good_conns`.
 
 **When to tune the local default (14 GB)**:
 
 - **Lower** (e.g. `12000000000`) only if dev-box truncations become the norm and you want to ratchet the local run-quality bar down.
 - **Raise** (e.g. `14900000000`) to require ≥ 99.3 % of payload delivered if you're investigating partial-delivery regressions.
 
-**When to tune the CI override (100 MB)**:
+**When to tune the CI override (700 MB)**:
 
-- **Lower** if a runner-image change makes 100 MB unreachable for the active conn (check the per-run table; if conn 0 routinely delivers <100 MB, the floor is the wrong shape for the new runner).
-- **Raise** if hosted runners get faster and the active conn reliably clears 500 MB — that lets you tighten the meaningful-progress bar.
+- **Lower** if a runner-image change makes 700 MB unreachable for the typical conn (check the per-run table; if conn 0 routinely delivers <700 MB, the floor is the wrong shape for the new runner). Always tune in lock-step with `BLUEFIN_NUM_SENDS` so the threshold stays at ~93 % of the payload.
+- **Raise** if hosted runners get faster and you bump `BLUEFIN_NUM_SENDS` to widen the dynamic range.
 
 Do **not** lower the local default below ~10 GB — at that point you're letting through truly broken runs.
+
+### Payload size and idle-timeout (`BLUEFIN_NUM_SENDS` / `BLUEFIN_RECV_IDLE_TIMEOUT_SECS`)
+
+The two CI-only knobs ship together because they fix a shared structural mismatch: **the production-default 15 GB payload + 2 s recv-idle is incompatible with hosted-macos-latest throughput**. Active conns on hosted runners deliver ~50–300 MB/s sustained — so 15 GB needs 50–300 s, but the server gives up after 2 s of stalled recv. Every CI conn TRUNCated, mean_avg got diluted by the idle tail, and `good_conns` degenerated into a smoke test for "did *any* conn pump bytes for >100 MB before the timeout".
+
+Option C (this stack) shrinks both axes proportionally so CI behaves like dev:
+
+| Knob | Dev default | CI override | Why |
+|------|-------------|-------------|-----|
+| `BLUEFIN_NUM_SENDS` | `10_000_000` | `500_000` | 15 GB → 750 MB. Active conns on hosted runners finish 750 MB in 2.5–15 s of real transfer time. |
+| `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` | `2` | `10` | 2 s → 10 s. Tolerates the longest scheduling-gap-induced stalls observed on hosted runners (≤ 5 ms typical, ≤ 1 s under heavy contention). |
+
+With Option C, `good_conns` returns to its original semantic ("delivered the full payload") and the floor of 6/10 becomes a **real liveness gate** rather than a smoke test.
+
+**Server FINAL avg correction**: `bluefin/src/bin/server.rs` subtracts `recv_idle` from `now.elapsed()` when computing the FINAL avg, so a conn that delivered 750 MB in 2.5 s of real transfer + 10 s idle reports `avg = 750 MB / 2.5 s = 300 MB/s`, not `750 MB / 12.5 s = 60 MB/s`. Without this correction, bumping the timeout would have dragged mean_avg into the noise floor (see commit history for the Option C rollout).
+
+**When to re-baseline**:
+
+- **Lower** `BLUEFIN_NUM_SENDS` if hosted-runner throughput drops further (e.g. macOS image rev). Shrink `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` proportionally (~93 % of new target).
+- **Raise** `BLUEFIN_NUM_SENDS` to widen the burst window if hosted runners get faster (more iterations → more opportunities for the server's print-cadence to catch a peak).
+- **Raise** `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` if `bench (macos-latest)` starts showing a wave of TRUNC conns at 10 s but no actual perf regression. Keep `bench_two_process.sh`'s server-grace in sync (it auto-derives `recv_idle + 3` seconds).
+- Don't unset either env var in CI — falling back to dev defaults will TRUNC every conn and FAIL the gate.
 
 ### Socket buffer sizes (`BLUEFIN_SOCKET_RCVBUF` / `BLUEFIN_SOCKET_SNDBUF`)
 
@@ -101,11 +125,11 @@ The workflow ships these floors:
 
 | Floor | Value | Origin |
 |-------|-------|--------|
-| `mean avg gb/s` (good-conns only) | **0.05** | Noise floor. A single GOOD conn delivers ≥ 50 MB/s on hosted CI; this catches "the one conn that worked is barely moving". |
+| `mean avg gb/s` (good-conns only) | **0.05** | Noise floor. A GOOD conn that delivered the 750 MB CI payload in ≤15 s reports avg ≥ 50 MB/s. Catches "all GOOD conns barely moved". |
 | `max peak gb/s` (good-conns only) | **1.00** | ~50 % of CI-observed median GOOD-conn peak (~2.40 GB/s). **Regression signal for burst rate on conns that actually transferred data.** |
-| `good conns` (≥ 100 MB each) | **1** of 10 | Smoke test: at least 1 conn-trial out of 10 made real progress (≥ 100 MB delivered). Runner variance dominates; a single CI run can swing 1–5 of 10 good purely from runner allocation. |
+| `good conns` (≥ 700 MB each) | **6** of 10 | Liveness gate. With Option C (`BLUEFIN_NUM_SENDS=500000`, `BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10`), conns either deliver the full 750 MB or TRUNC. 6/10 = 60 % completion is the lower bound across recent CI runs; below that signals real degradation. |
 
-All three floors are pegged at the LOWER BOUND observed across multiple CI runs. The gate is effectively a smoke test on hosted runners: it catches catastrophic regressions (panics, hangs, broken transport) but cannot reliably catch a sub-50 % throughput regression. **Real perf signal lives in local sweeps**, not CI.
+Floors 1 and 2 are pegged at ~50 % of the LOWER BOUND observed across multiple CI runs. Floor 3 is the real-regression detector. **Real perf signal still lives in local sweeps**, but the CI gate is now meaningful enough to catch a sub-50 % throughput regression or a complete liveness failure.
 
 ## Runner reality and "drain artifacts"
 
@@ -141,22 +165,22 @@ Drain artifacts ALWAYS come from starved conns by construction (the active conn 
 
 ### Pathology 3: starved-conn `avg` is structurally tail-diluted
 
-The server's FINAL line reports `bytes / elapsed`, where `elapsed` includes the full 2 s recv-idle timeout tail. For a starved conn that delivered 60 MB in ~0.6 s of active recv, `elapsed` is 2.6 s and the displayed `avg` is `60 / 2.6 = 23 MB/s`, not the 100 MB/s sustained rate during the active period.
+The server's FINAL line reports `bytes / elapsed`, where `elapsed` is computed as `now.elapsed() - recv_idle` (clamped at 1 ms). Pre-Option-C, the subtraction wasn't there: `elapsed` included the full 2 s tail and the displayed avg was diluted accordingly (60 MB delivered in 0.6 s active recv → reported `60 / 2.6 = 23 MB/s`, not the 100 MB/s sustained rate). The fix landed when CI bumped `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` from 2 s to 10 s — without it, the dilution would have been 10× worse and dragged mean_avg into the noise floor.
 
-For a conn that delivered the full 15 GB locally, `elapsed = 9 s + 2 s tail = 11 s`, so the tail dilutes by 18 % — negligible. For starved conns the dilution is 5–10×. This is why `mean_avg` over ALL conns (including starved) collapsed to 0.035 in CI runs even though the active conn was doing real work.
+**Why the fix is safe for production**: the subtraction is approximate (the actual gap between last byte and idle-fire is `recv_idle ± IDLE_RESET_EVERY-iter-time`), but the error is bounded by tens of microseconds at hot-loop rates — dwarfed by the 2 s timeout it's correcting for. Production logs go from "slightly under-reports avg" to "reports avg accurately".
 
-Filtering to GOOD conns only (≥ 100 MB delivered) excludes the worst-diluted population: any GOOD conn delivered enough bytes that its active period dominates the 2 s tail.
+Filtering to GOOD conns only (≥ `GOOD_CONN_MIN_BYTES` delivered) is still the right gate strategy because TRUNC conns deliver too few bytes for *any* avg to be meaningful, regardless of whether the divisor is corrected.
 
 ## Ratcheting up after a perf gain
 
 After a confirmed gain (typically: a successful round of optimisations recorded in `bluefin-performance`'s round table, with a fresh local sweep), tighten the floors:
 
-1. Run the 5-run CI bench (push a no-op PR) and read the GREEN `bench-macos` summary. Look at the `(good only)` columns, NOT the `raw` columns.
+1. Run the 5-run CI bench (push a no-op PR) and read the GREEN `bench (macos-latest)` summary. Look at the `(good only)` columns, NOT the `raw` columns.
 2. Compute the median of `max peak gb/s (good only)` across the 5 runs.
 3. Multiply by the **current ratchet factor (0.50)** and round to 2 decimal places. Update `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS`.
 4. **Do NOT** ratchet `mean_avg` based on local numbers — hosted runners can't reach them. Bump only if the CI median of `mean avg gb/s (good only)` has demonstrably risen across multiple PRs.
 5. For `good_conns`: take the LOWEST observation of `good conns` across the recent runs and drop one for headroom. Don't use the mean — runner allocation variance is too high; the lowest is the real lower bound.
-6. Open a PR with the floor bump. The bench-macos job will run against its own new floors — if the PR is purely a floor bump, it should PASS comfortably.
+6. Open a PR with the floor bump. The `bench (macos-latest)` job will run against its own new floors — if the PR is purely a floor bump, it should PASS comfortably.
 
 Do **not** ratchet `max_peak` using the *max*, only the *median* across runs. Peak is high-variance.
 
@@ -229,10 +253,10 @@ Each gated metric gets its own `:white_check_mark:` / `:x:` cell, so reviewers c
 | Task | What to do |
 |------|------------|
 | **Run the gate locally** | `./bench_ci.sh -r 5 -n 2 --skip-build` (after a `cargo build --release --bin server --bin client`). Takes ~1 min. |
-| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.05 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=1.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=1 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=100000000 BLUEFIN_SOCKET_RCVBUF=8388608 BLUEFIN_SOCKET_SNDBUF=8388608` and `BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md`. |
+| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.05 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=1.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=6 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=700000000 BLUEFIN_SOCKET_RCVBUF=8388608 BLUEFIN_SOCKET_SNDBUF=8388608 BLUEFIN_NUM_SENDS=500000 BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10 BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md`. |
 | **Force a FAIL to test the comment** | `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=10.0 ./bench_ci.sh -r 2 -n 2 --skip-build`. Useful when changing the Markdown emitter. |
 | **Bump floors after a perf gain** | See "Ratcheting up" above. Edit only `.github/workflows/bluefin.yml`'s `env:` block. |
-| **Inspect a CI failure** | Open the run → `bench-macos` job → expand `Run CI bench`. The Markdown also lands in the run's Summary tab and on the PR. The full per-run logs are in the `bench-logs` artifact. |
+| **Inspect a CI failure** | Open the run → `bench (macos-latest)` job → expand `Run CI bench`. The Markdown also lands in the run's Summary tab and on the PR. The full per-run logs are in the `bench-logs` artifact. |
 | **Loosen the gate temporarily** | Set the env var in the workflow to a lower value, with a comment pointing back to the issue tracking the regression. Don't disable the job. |
 
 ## What this gate does *not* catch

@@ -291,10 +291,19 @@ fi
 # Path is overridable so the workflow can pin it to a known location.
 SUMMARY_MD="${BLUEFIN_BENCH_SUMMARY_MD:-bench_logs/ci_summary.md}"
 mkdir -p "$(dirname "$SUMMARY_MD")"
+# Translate kernel name into the human OS label CI users expect to see.
+# `uname -s` returns "Darwin" on macOS hosted runners, which is technically
+# accurate but unhelpful in a PR comment titled for human readers.
+uname_s="$(uname -s)"
+case "$uname_s" in
+    Darwin) os_label="macOS" ;;
+    Linux)  os_label="Linux" ;;
+    *)      os_label="$uname_s" ;;
+esac
 {
-    echo "## Bluefin throughput bench $verdict_emoji $verdict_overall"
+    echo "## Bluefin throughput bench ($os_label) $verdict_emoji $verdict_overall"
     echo
-    echo "**Config:** $N_RUNS run(s) × $N_CONNS conn(s) on \`$(uname -s) $(uname -m)\`"
+    echo "**Config:** $N_RUNS run(s) × $N_CONNS conn(s) on \`$uname_s $(uname -m)\`"
     echo
     echo "### Aggregate"
     echo

@@ -226,8 +226,19 @@ run_attempt() {
         echo "       client #$ix exit=$code$note"
     done
 
-    echo "       waiting up to 5s for server to print FINAL lines and exit..."
-    for _ in $(seq 1 50); do
+    # Server exits naturally only after `RECV_IDLE_TIMEOUT_SECS` of no
+    # incoming bytes. Default is 2 s; CI bumps it to 10 s. Our grace must
+    # always be at least that long + a small safety margin, otherwise we
+    # SIGTERM the server before it prints its FINAL lines and the bench
+    # parser sees zero measurements.
+    local recv_idle_secs="${BLUEFIN_RECV_IDLE_TIMEOUT_SECS:-2}"
+    if ! [[ "$recv_idle_secs" =~ ^[0-9]+$ ]] || (( recv_idle_secs <= 0 )); then
+        recv_idle_secs=2
+    fi
+    local grace_secs=$(( recv_idle_secs + 3 ))
+    local grace_iters=$(( grace_secs * 10 ))
+    echo "       waiting up to ${grace_secs}s for server to print FINAL lines and exit..."
+    for _ in $(seq 1 "$grace_iters"); do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             break
         fi

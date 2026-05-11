@@ -14,7 +14,23 @@ use tokio::{spawn, task::JoinSet, time::sleep};
 /// task assumes the peer is gone, prints a final summary, and exits.
 /// Bluefin currently has no protocol-level FIN, so this is the only way
 /// the benchmark server can terminate cleanly.
-const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// CI overrides this via `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` because hosted
+/// macos-latest runners deliver bytes at ~1–10 % of dev-box throughput,
+/// so the 15 GB target needs minutes, not seconds, to complete. Without
+/// the override, every CI conn TRUNCs at the 2 s mark and the bench gate
+/// degenerates into a smoke test. Production traffic is unaffected
+/// unless the env var is explicitly set.
+const DEFAULT_RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn recv_idle_timeout() -> Duration {
+    env::var("BLUEFIN_RECV_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RECV_IDLE_TIMEOUT)
+}
 
 /// How often to push the idle deadline forward. Resetting the `Sleep`'s
 /// deadline on every recv (the natural `tokio::time::timeout` pattern) re-arms
@@ -67,6 +83,13 @@ async fn run() -> BluefinResult<()> {
         "(server) accepting {} connection(s) before starting recv loops",
         num_expected_connections,
     );
+    let recv_idle = recv_idle_timeout();
+    if recv_idle != DEFAULT_RECV_IDLE_TIMEOUT {
+        eprintln!(
+            "(server) recv-idle timeout overridden via env: {:?} (default {:?})",
+            recv_idle, DEFAULT_RECV_IDLE_TIMEOUT,
+        );
+    }
     let mut connections = Vec::with_capacity(num_expected_connections);
 
     // Accept all connections FIRST before spawning any processing tasks
@@ -86,6 +109,7 @@ async fn run() -> BluefinResult<()> {
     for (conn_num, mut conn) in connections {
         let _ = join_set.spawn(async move {
             let _num = conn_num;
+            let recv_idle = recv_idle;
             let mut total_bytes: usize = 0;
             // Carrier vec for the zero-copy `recv_bytes` API. We keep
             // capacity across iterations by `drain(..)`-ing instead of
@@ -110,7 +134,7 @@ async fn run() -> BluefinResult<()> {
             // per recv via `tokio::time::timeout`) is the documented tokio
             // idiom for hot loops and removes the per-recv timer-wheel
             // arm/disarm.
-            let idle_sleep = sleep(RECV_IDLE_TIMEOUT);
+            let idle_sleep = sleep(recv_idle);
             tokio::pin!(idle_sleep);
 
             loop {
@@ -132,7 +156,7 @@ async fn run() -> BluefinResult<()> {
                     _ = idle_sleep.as_mut() => {
                         eprintln!(
                             "(#{}) idle for {:?} -- assuming peer is gone",
-                            _num, RECV_IDLE_TIMEOUT
+                            _num, recv_idle
                         );
                         break;
                     }
@@ -142,7 +166,7 @@ async fn run() -> BluefinResult<()> {
                 if iteration % IDLE_RESET_EVERY == 0 {
                     idle_sleep
                         .as_mut()
-                        .reset(tokio::time::Instant::now() + RECV_IDLE_TIMEOUT);
+                        .reset(tokio::time::Instant::now() + recv_idle);
                 }
                 total_bytes += size;
                 // Drain the carrier vec, tracking the smallest/largest
@@ -182,8 +206,20 @@ async fn run() -> BluefinResult<()> {
 
             // Final summary on exit so we always see a meaningful number,
             // even for short-lived connections.
-            let elapsed = now.elapsed().as_secs_f64();
-            let avg_throughput_mb = if elapsed > 0.0 {
+            //
+            // The loop only exits when the recv-idle deadline fires, which
+            // is approximately `recv_idle` seconds after the last incoming
+            // byte. Including that tail in the divisor under-reports the
+            // real throughput by `recv_idle / transfer_time`, which is
+            // ~30 % on dev hardware (2 s tail / 5 s transfer) and *much*
+            // worse in CI under the bumped 10 s timeout. Subtract the tail
+            // so FINAL avg reports bytes / actual-transfer-time. Clamp to a
+            // minimum positive value so a transfer that was fully consumed
+            // by the idle wait (i.e. zero real progress) doesn't divide by
+            // zero or report a wildly inflated number.
+            let elapsed_raw = now.elapsed().as_secs_f64();
+            let elapsed = (elapsed_raw - recv_idle.as_secs_f64()).max(1e-3);
+            let avg_throughput_mb = if total_bytes > 0 {
                 (total_bytes as f64 / elapsed) / 1e6
             } else {
                 0.0

@@ -64,7 +64,7 @@ jobs:
       - name: Run Kani
         uses: model-checking/kani-github-action@v1.1
 
-  bench-macos:
+  bench:
     # Throughput regression gate. Runs the two-process loopback bench
     # (server + N client procs, each with its own tokio runtime) 5 times
     # at N=2 connections, parses per-conn FINAL lines, and asserts the
@@ -72,51 +72,73 @@ jobs:
     #
     # >>> RUNNER REALITY <<<
     # Hosted macos-latest runners are dramatically slower and burstier than
-    # typical Apple-silicon dev hardware. Two artefacts dominate the
-    # measurement:
+    # typical Apple-silicon dev hardware. The bench gate compensates with
+    # FOUR CI-only env-var overrides (production binaries are unaffected
+    # unless these env vars are explicitly set):
     #
-    #   1. Bilateral failure is the steady state. Per the 2026-05-11 CI
-    #      runs, ~50–100 % of conn-trials are starved (deliver <60 MB
-    #      before the server's 2 s recv-idle timeout fires). Active conns
-    #      deliver 300–800 MB. Run-to-run variance is high; a single CI
-    #      run can swing between 5/10 and 1/10 good conns purely from
-    #      runner allocation luck.
+    #   1. BLUEFIN_NUM_SENDS=500000 shrinks the per-conn payload from
+    #      15 GB (10 M sends) to 750 MB. Hosted runners can't sustain the
+    #      throughput needed to deliver 15 GB inside any reasonable
+    #      timeout window.
     #
-    #   2. "max_peak" is corrupted by kernel-buffer-drain artifacts on
-    #      starved conns. When the server task is preempted for tens of ms
-    #      under CPU contention, packets queue in the kernel UDP buffer.
-    #      When the task resumes, it drains the buffer at memcpy speed and
-    #      records inst-throughput readings of 100+ GB/s — which is
-    #      kernel-to-userspace memcpy rate, not network rate. bench_ci.sh
-    #      filters max_peak to GOOD conns only (those that delivered
-    #      >= GOOD_CONN_MIN_BYTES) to keep the gate meaningful.
+    #   2. BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10 extends the server's
+    #      "peer-is-gone" deadline from the default 2 s to 10 s. Without
+    #      this bump, conns that are progressing slowly on a contended
+    #      runner get TRUNCated mid-flight and the gate becomes meaningless.
     #
-    # That makes the gate effectively a SMOKE TEST on hosted CI: it catches
-    # "code panics", "everything is broken", "burst rate collapsed". It
-    # CANNOT reliably catch a 30 % throughput regression — that signal
-    # lives in local sweeps, not here. See skills/bluefin-ci/SKILL.md.
+    #   3. BLUEFIN_SOCKET_RCVBUF / SNDBUF=8388608 raises per-socket buffers
+    #      from the hardcoded 512 KiB default to 8 MiB. 512 KiB drains in
+    #      ~340 us at burst rate; tokio scheduling gaps on contended 3-vCPU
+    #      runners routinely exceed that, dropping packets. 8 MiB buys
+    #      ~5 ms of preemption tolerance and is the practical macOS ceiling
+    #      (kern.ipc.maxsockbuf clamps at ~8 MiB on hosted runners).
     #
-    # Current floors are pegged at the lower bound of observed CI runs,
-    # NOT local dev. If CI flakes:
+    #   4. "max_peak" is still vulnerable to kernel-buffer-drain artifacts
+    #      on starved conns (a recovering preempted task drains the kernel
+    #      UDP buffer at memcpy speed and reports 100+ GB/s inst readings).
+    #      bench_ci.sh filters BOTH mean_avg AND max_peak to GOOD conns
+    #      only (those that delivered >= GOOD_CONN_MIN_BYTES) to keep the
+    #      gate meaningful.
+    #
+    # With this stack, "good conn" means "delivered the full 750 MB CI
+    # payload" again. The good_conns floor (6/10) is now a real liveness
+    # gate, not a smoke test: a sub-50 % completion rate signals real
+    # degradation. mean_avg and max_peak floors still detect throughput
+    # regressions on the GOOD-conn population. See skills/bluefin-ci/SKILL.md.
+    #
+    # Current floors are pegged at ~50 % of observed CI medians (the
+    # noise + variance margin) rather than at the local-dev numbers.
+    # If CI flakes:
     #   - lower BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS in 0.20 steps;
-    #   - if mean_avg trips, you have a real regression — investigate
+    #   - if mean_avg trips, you likely have a real regression -- investigate
     #     before lowering it further;
-    #   - if good_conns trips at 1, look at the per-run table. Either
-    #     the runner had a uniquely bad allocation (re-run) or no conn
-    #     anywhere delivered 100 MB (real regression).
+    #   - if good_conns trips at 6, look at the per-run table. Either
+    #     the runner had a uniquely bad allocation (re-run) or fewer than
+    #     6/10 conns delivered the 700 MB payload (real regression or
+    #     a runner-image change worth investigating).
     #
     # >>> RATCHET INSTRUCTIONS <<<
-    # After 5–10 successful CI runs, raise floors based on the OBSERVED CI
+    # After 5-10 successful CI runs, raise floors based on the OBSERVED CI
     # numbers (not local dev):
-    #   1. Open the most recent green `bench-macos` run logs.
+    #   1. Open the most recent green `bench (macos-latest)` run logs.
     #   2. Compute the median of "max peak gb/s (good only)" across runs.
     #   3. Set BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS to ~0.50 * that median.
-    #   4. Leave mean_avg at 0.05 unless the CI median has demonstrably
-    #      risen.
-    #   5. For good_conns: count how many conn-trials cleared
-    #      BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES across the recent runs, take
-    #      the LOWEST observation across runs, then drop one for headroom.
-    runs-on: macos-latest
+    #   4. Compute the median of "mean avg gb/s (good only)" across runs.
+    #      Set BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS to ~0.50 * that median.
+    #   5. For good_conns: take the LOWEST observation across runs, then
+    #      drop one for headroom (e.g. observed lows of 7,8,8 -> floor 6).
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Matrix-of-one for two reasons:
+      #   1. The displayed job name becomes `bench (macos-latest)`, which
+      #      matches the `build (macos-latest)` / `build (ubuntu-latest)`
+      #      naming the build job already produces.
+      #   2. Future expansion to additional runner OSes (e.g. once Linux
+      #      hosted runners gain enough rmem_max headroom for the bench
+      #      to be meaningful, see skills/bluefin-ci/SKILL.md) is a
+      #      one-line change here.
+      matrix:
+        os: [ macos-latest ]
     # `pull-requests: write` is required so the sticky-comment step can
     # post / update the bench-results comment on the PR. `contents: read`
     # is the implicit default for `actions/checkout`.
@@ -124,12 +146,13 @@ jobs:
       contents: read
       pull-requests: write
     env:
-      # Pegged at ~50 % of the observed CI median, NOT local dev. See block
-      # comment above for the rationale.
+      # Pegged at the observed CI floor with the new env-var stack
+      # (bigger SO_RCVBUF, longer recv-idle timeout, smaller payload).
+      # See block comment above for the rationale.
       BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS:    "0.05"      # noise floor (just non-zero)
-      BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS:    "1.00"      # ~50 % of CI-median GOOD-conn peak (~2.40)
-      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "1"         # smoke test: ≥1 of 10 conn-trials made real progress; runner variance dominates
-      BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES:    "100000000" # 100 MB: separates "made real progress" from "starved" on hosted runners
+      BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS:    "1.00"      # ~50 % of CI-median GOOD-conn peak
+      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "6"         # ≥6 of 10 conn-trials completed the (shrunk) payload
+      BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES:    "700000000" # 700 MB ≈ 93 % of the 750 MB CI payload (BLUEFIN_NUM_SENDS=500000 × 1500)
       BLUEFIN_BENCH_SUMMARY_MD:             "bench_logs/ci_summary.md"
       # Bump per-socket SO_RCVBUF / SO_SNDBUF from the hardcoded 512 KB
       # default to 8 MB for CI only. 512 KB drains in ~340 µs at 1.5 GB/s,
@@ -143,6 +166,15 @@ jobs:
       # back to the historical 512 KB.
       BLUEFIN_SOCKET_RCVBUF:                "8388608"   # 8 MiB
       BLUEFIN_SOCKET_SNDBUF:                "8388608"   # 8 MiB
+      # Shrink the per-conn payload from 15 GB (10 M sends) to 750 MB
+      # (500 K sends) AND extend the server's recv-idle timeout from 2 s
+      # to 10 s. Together these let conns COMPLETE the payload on hosted
+      # runners instead of TRUNCing at the timeout. Reframes "good conn"
+      # back to its original semantic ("delivered the full payload") and
+      # makes BLUEFIN_BENCH_FLOOR_GOOD_CONNS a real liveness gate at 6/10.
+      # Production binaries built without these env vars are unaffected.
+      BLUEFIN_NUM_SENDS:                    "500000"    # 500 K × 1500 B = 750 MB per conn
+      BLUEFIN_RECV_IDLE_TIMEOUT_SECS:       "10"        # 5× the dev default; conns finish naturally
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust

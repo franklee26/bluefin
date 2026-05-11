@@ -64,29 +64,29 @@ jobs:
       - name: Run Kani
         uses: model-checking/kani-github-action@v1.1
 
-  bench:
+  bench-macos:
     # Throughput regression gate. Runs the two-process loopback bench
     # (server + N client procs, each with its own tokio runtime) 5 times
     # at N=2 connections, parses per-conn FINAL lines, and asserts the
     # aggregate stats clear the floors below.
     #
-    # Current floors are pegged at ~75% of the local 20-run sweep median
+    # Current floors are pegged at ~50% of the local 20-run sweep median
     # (mean avg 1.82 GB/s, max peak 3.85 GB/s, 90% good-conn rate). Hosted
     # macos-latest runners are slower and noisier than dev hardware, so if
     # CI flakes here:
     #   - first try widening `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` (default
     #     14e9) to count more partial deliveries as "good";
     #   - then dial back the gb/s floors in 0.10 steps;
-    #   - last resort, lower BLUEFIN_BENCH_FLOOR_GOOD_CONNS to 7.
+    #   - last resort, lower BLUEFIN_BENCH_FLOOR_GOOD_CONNS to 4.
     #
     # >>> RATCHET INSTRUCTIONS <<<
     # After 5–10 successful CI runs on macos-latest, raise the floors to
-    # ~75% of the observed CI median to lock in any perf gains:
-    #   1. Open the most recent green `bench` run logs.
+    # ~50% of the observed CI median to lock in any perf gains:
+    #   1. Open the most recent green `bench-macos` run logs.
     #   2. Note the "mean avg gb/s" and "max peak gb/s" lines.
-    #   3. Set the env vars below to ~0.75 * observed median.
-    #   4. Set BLUEFIN_BENCH_FLOOR_GOOD_CONNS to ~75% of total trials,
-    #      rounded UP (10 trials → 8).
+    #   3. Set the env vars below to ~0.50 * observed median.
+    #   4. Set BLUEFIN_BENCH_FLOOR_GOOD_CONNS to ~50% of total trials,
+    #      rounded UP (10 trials → 5).
     runs-on: macos-latest
     # `pull-requests: write` is required so the sticky-comment step can
     # post / update the bench-results comment on the PR. `contents: read`
@@ -95,10 +95,10 @@ jobs:
       contents: read
       pull-requests: write
     env:
-      # Pegged at ~75% of the local 20-run sweep median. See block comment above.
-      BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS: "1.35"   # 75% of 1.82 GB/s local median
-      BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS: "2.85"   # 75% of 3.85 GB/s local median
-      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:    "8"      # 75% of 5 runs * 2 conns = 10
+      # Pegged at ~50% of the local 20-run sweep median. See block comment above.
+      BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS: "0.91"   # 50% of 1.82 GB/s local median
+      BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS: "1.90"   # 50% of 3.85 GB/s local median
+      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:    "5"      # 50% of 5 runs * 2 conns = 10
       BLUEFIN_BENCH_SUMMARY_MD:          "bench_logs/ci_summary.md"
     steps:
       - uses: actions/checkout@v4

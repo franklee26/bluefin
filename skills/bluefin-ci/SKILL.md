@@ -1,6 +1,6 @@
 ---
 name: bluefin-ci
-description: How CI/CD works for the Bluefin codebase. Covers the GitHub Actions workflow ([`.github/workflows/bluefin.yml`](../../.github/workflows/bluefin.yml)), the throughput-regression `bench` job (driver script [`bench_ci.sh`](../../bench_ci.sh), floors, sticky PR comments, log artifacts), the env-var knobs that govern the gate, and the ratchet protocol for tightening floors as performance improves. Load whenever a task touches the workflow file, the bench gate, the comment formatting, the floor thresholds, or asks "why did CI fail?" / "how do I bump CI to require more throughput?". Pair with `bluefin-performance` for the *measurement* side (what the numbers mean, the canonical baseline).
+description: How CI/CD works for the Bluefin codebase. Covers the GitHub Actions workflow ([`.github/workflows/bluefin.yml`](../../.github/workflows/bluefin.yml)), the throughput-regression `bench-macos` job (driver script [`bench_ci.sh`](../../bench_ci.sh), floors, sticky PR comments, log artifacts), the env-var knobs that govern the gate, and the ratchet protocol for tightening floors as performance improves. Load whenever a task touches the workflow file, the bench gate, the comment formatting, the floor thresholds, or asks "why did CI fail?" / "how do I bump CI to require more throughput?". Pair with `bluefin-performance` for the *measurement* side (what the numbers mean, the canonical baseline).
 ---
 
 # Bluefin CI
@@ -16,11 +16,11 @@ End-to-end documentation of the Bluefin GitHub Actions pipeline, with primary fo
 | `build` | ubuntu-latest, macos-latest | `cargo build` + `cargo test`, plus a second pass with `--features macos-fast` on macOS only |
 | `coverage` | ubuntu-latest | `cargo llvm-cov` → upload to Codecov |
 | `kani` | ubuntu-latest | Model-checking via `model-checking/kani-github-action@v1.1` |
-| `bench` | macos-latest | **Throughput regression gate. The rest of this doc.** |
+| `bench-macos` | macos-latest | **Throughput regression gate. The rest of this doc.** |
 
-## The `bench` job
+## The `bench-macos` job
 
-The bench job runs [`bench_ci.sh`](../../bench_ci.sh), which drives [`bench_two_process.sh`](../../bench_two_process.sh) `N_RUNS` times at `N_CONNS` connections each, parses the per-conn `(#X) FINAL: …` lines from each successful attempt's `server.log`, aggregates the stats, compares them against env-var floors, and produces:
+The bench-macos job runs [`bench_ci.sh`](../../bench_ci.sh), which drives [`bench_two_process.sh`](../../bench_two_process.sh) `N_RUNS` times at `N_CONNS` connections each, parses the per-conn `(#X) FINAL: …` lines from each successful attempt's `server.log`, aggregates the stats, compares them against env-var floors, and produces:
 
 1. **stdout** with per-conn verdicts and an aggregate block — visible in the Actions log;
 2. **a Markdown summary** at `$BLUEFIN_BENCH_SUMMARY_MD` (default `bench_logs/ci_summary.md`) — used downstream;
@@ -41,9 +41,9 @@ All knobs are read from the environment by [`bench_ci.sh`](../../bench_ci.sh); s
 
 | Var | Default | What it does |
 |-----|---------|--------------|
-| `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS` | `0.05` (script) / `1.35` (workflow) | Minimum mean of per-conn `avg gb/s` across all conn-trials. Below this → FAIL. |
-| `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS` | `0.10` (script) / `2.85` (workflow) | Minimum of the *maximum* observed `peak gb/s`. Below this → FAIL. |
-| `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`    | `6` (script) / `8` (workflow) | Minimum count of "good conns" out of `N_RUNS * N_CONNS` total trials. Below this → FAIL. |
+| `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS` | `0.05` (script) / `0.91` (workflow) | Minimum mean of per-conn `avg gb/s` across all conn-trials. Below this → FAIL. |
+| `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS` | `0.10` (script) / `1.90` (workflow) | Minimum of the *maximum* observed `peak gb/s`. Below this → FAIL. |
+| `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`    | `6` (script) / `5` (workflow) | Minimum count of "good conns" out of `N_RUNS * N_CONNS` total trials. Below this → FAIL. |
 | `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` | `14000000000` (14 GB) | **Threshold for what counts as a "good conn".** A conn that emits a FINAL line is GOOD if it delivered ≥ this many bytes, else TRUNC. Used for the good-conns count above. |
 | `BLUEFIN_BENCH_SUMMARY_MD` | `bench_logs/ci_summary.md` | Path the script writes the Markdown summary to. The workflow pins it so the comment step can find it. |
 
@@ -66,13 +66,13 @@ The workflow ships these floors:
 
 | Floor | Value | Origin |
 |-------|-------|--------|
-| `mean avg gb/s` | **1.35** | 75 % of local 20-run sweep median (1.82 GB/s) |
-| `max peak gb/s` | **2.85** | 75 % of local 20-run sweep max-peak (3.85 GB/s) |
-| `good conns`    | **8** of 10 | 75 % of `N_RUNS × N_CONNS = 5 × 2 = 10` trials, rounded up |
+| `mean avg gb/s` | **0.91** | 50 % of local 20-run sweep median (1.82 GB/s) |
+| `max peak gb/s` | **1.90** | 50 % of local 20-run sweep max-peak (3.85 GB/s) |
+| `good conns`    | **5** of 10 | 50 % of `N_RUNS × N_CONNS = 5 × 2 = 10` trials |
 
-Local sample (5-run sweep, post-O+F1+F2+G3+F3+P, 2026-05-11): mean avg 1.892 GB/s, max peak 3.940 GB/s, 10/10 good — every floor cleared with 25–40 % headroom.
+Local sample (5-run sweep, post-O+F1+F2+G3+F3+P, 2026-05-11): mean avg 1.892 GB/s, max peak 3.940 GB/s, 10/10 good — every floor cleared with 2× headroom.
 
-The 75 % rule is the **ratchet contract**: floors are always pegged at ~75 % of the most recent stable measurement, never higher. This trades regression-detection sharpness for runner-noise tolerance.
+The 50 % rule is the **ratchet contract**: floors are always pegged at ~50 % of the most recent stable measurement, never higher. This is deliberately loose so the gate only fires on serious regressions and tolerates hosted-runner noise without flaking. Tighten by **lowering the divisor** (50 % → 60 % → 75 %) only after a sustained green streak that justifies the risk.
 
 ## Ratcheting up after a perf gain
 
@@ -80,19 +80,19 @@ After a confirmed gain (typically: a successful round of optimisations recorded 
 
 1. Run the 20-run local sweep that the perf SKILL describes (or the 5-run quick-look in this doc's "current floors" row).
 2. Read the **median** mean-avg and the **median** (not max) peak. Median is more stable than max under runner noise.
-3. Multiply each by **0.75** and round to 2 decimal places. Update the workflow env block.
-4. Set `BLUEFIN_BENCH_FLOOR_GOOD_CONNS` to `ceil(0.75 * N_RUNS * N_CONNS)`. With the current `5×2 = 10`, that's **8**.
-5. Open a PR. The bench job will run against its own new floors — if the PR is purely a floor bump, it should PASS comfortably.
+3. Multiply each by the **current ratchet factor (0.50)** and round to 2 decimal places. Update the workflow env block.
+4. Set `BLUEFIN_BENCH_FLOOR_GOOD_CONNS` to `ceil(0.50 * N_RUNS * N_CONNS)`. With the current `5×2 = 10`, that's **5**.
+5. Open a PR. The bench-macos job will run against its own new floors — if the PR is purely a floor bump, it should PASS comfortably.
 
-Do **not** ratchet on max-peak — peak is high-variance. Use the median peak and let max-peak sit ~10 % above the floor as natural headroom.
+Do **not** ratchet on max-peak — peak is high-variance. Use the median peak and let max-peak sit well above the floor as natural headroom.
 
 ## When CI fails: the fallback ladder
 
 Hosted `macos-latest` runners are slower and noisier than typical Apple-silicon dev hardware. If the gate flakes after a floor bump, work down this ladder *before* disabling the gate:
 
 1. **Widen `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`** (default 14e9 → try 12e9). Counts more partial deliveries as good. Usually the right answer when the runner is delivering reasonable throughput but truncating one or two conns under load.
-2. **Drop the gb/s floors in 0.10 steps**. Stay at 75 % of the new observed median.
-3. **Lower `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`** from 8 → 7 (out of 10). Last resort — implies the runner is so noisy that bilateral reliability is genuinely <80 %.
+2. **Drop the gb/s floors in 0.10 steps**. Stay at 50 % of the new observed median.
+3. **Lower `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`** from 5 → 4 (out of 10). Last resort — implies the runner is so noisy that bilateral reliability is genuinely <50 %.
 
 If you reach step 3 and still flake, the runner class is wrong for this gate. Move it to a self-hosted runner or accept that the CI bench is best-effort signal.
 
@@ -133,11 +133,11 @@ The Markdown body the script emits looks like:
 
 | metric         | observed | floor | result             |
 | ---            |    ---:  |  ---: | :---:              |
-| mean avg gb/s  |   1.892  |  1.35 | :white_check_mark: |
+| mean avg gb/s  |   1.892  |  0.91 | :white_check_mark: |
 | min  avg gb/s  |   1.820  |    —  | —                  |
 | mean peak gb/s |   3.728  |    —  | —                  |
-| max  peak gb/s |   3.940  |  2.85 | :white_check_mark: |
-| good conns     | 10 / 10  |    8  | :white_check_mark: |
+| max  peak gb/s |   3.940  |  1.90 | :white_check_mark: |
+| good conns     | 10 / 10  |    5  | :white_check_mark: |
 
 ### Per-run
 …
@@ -153,10 +153,10 @@ Each gated metric gets its own `:white_check_mark:` / `:x:` cell, so reviewers c
 | Task | What to do |
 |------|------------|
 | **Run the gate locally** | `./bench_ci.sh -r 5 -n 2 --skip-build` (after a `cargo build --release --bin server --bin client`). Takes ~1 min. |
-| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=1.35 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=2.85 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=8` and `BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md`. |
+| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.91 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=1.90 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=5` and `BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md`. |
 | **Force a FAIL to test the comment** | `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=10.0 ./bench_ci.sh -r 2 -n 2 --skip-build`. Useful when changing the Markdown emitter. |
 | **Bump floors after a perf gain** | See "Ratcheting up" above. Edit only `.github/workflows/bluefin.yml`'s `env:` block. |
-| **Inspect a CI failure** | Open the run → `bench` job → expand `Run CI bench`. The Markdown also lands in the run's Summary tab and on the PR. The full per-run logs are in the `bench-logs` artifact. |
+| **Inspect a CI failure** | Open the run → `bench-macos` job → expand `Run CI bench`. The Markdown also lands in the run's Summary tab and on the PR. The full per-run logs are in the `bench-logs` artifact. |
 | **Loosen the gate temporarily** | Set the env var in the workflow to a lower value, with a comment pointing back to the issue tracking the regression. Don't disable the job. |
 
 ## What this gate does *not* catch

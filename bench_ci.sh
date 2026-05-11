@@ -140,22 +140,44 @@ for ((run = 1; run <= N_RUNS; run++)); do
     run_peaks_local=()
     run_good_local=0
 
-    # Parse FINAL lines. Format:
+    # Parse FINAL lines. Format (units are picked dynamically by the server,
+    # so a truncated conn shows mb/s or even kb/s):
     #   (#0) FINAL: 15000000119 bytes in 8.183 s -- avg 1.83 gb/s (peak 3.85 gb/s)
+    #   (#1) FINAL: 18169619    bytes in 2.002 s -- avg 9.1  mb/s (peak 0.0  kb/s)
+    # We extract the value AND the unit for both avg and peak, then normalise
+    # to gb/s so the aggregate stats are comparable across healthy and
+    # truncated conns. Without normalisation, mixing 9.1 mb/s and 1.83 gb/s
+    # as if both were gb/s produces a meaningless mean.
     while IFS= read -r line; do
-        # awk extracts: bytes, avg, peak
-        read -r bytes avg peak <<<"$(awk '{
+        read -r bytes avg avg_unit peak peak_unit <<<"$(awk '{
             for (i = 1; i <= NF; i++) {
-                if ($i == "FINAL:") b = $(i+1)
-                if ($i == "avg")     a = $(i+1)
-                if ($i == "(peak")   p = $(i+1)
+                if ($i == "FINAL:") { b = $(i+1) }
+                if ($i == "avg")    { a = $(i+1); au = $(i+2) }
+                if ($i == "(peak")  { p = $(i+1); pu = $(i+2) }
             }
-            print b, a, p
+            print b, a, au, p, pu
         }' <<<"$line")"
 
         if [[ -z "$bytes" || -z "$avg" || -z "$peak" ]]; then
             continue
         fi
+
+        # Normalise to gb/s. Server emits lowercase units with `/s` suffix:
+        # "kb/s", "mb/s", "gb/s". Strip the "/s" then scale.
+        avg=$(awk -v v="$avg" -v u="$avg_unit" 'BEGIN{
+            sub("/s$", "", u);
+            if (u == "kb")      printf "%.4f", v / 1000000;
+            else if (u == "mb") printf "%.4f", v / 1000;
+            else if (u == "gb") printf "%.4f", v;
+            else                printf "%.4f", v;   # unknown -> assume gb/s
+        }')
+        peak=$(awk -v v="$peak" -v u="$peak_unit" 'BEGIN{
+            sub("/s$", "", u);
+            if (u == "kb")      printf "%.4f", v / 1000000;
+            else if (u == "mb") printf "%.4f", v / 1000;
+            else if (u == "gb") printf "%.4f", v;
+            else                printf "%.4f", v;
+        }')
 
         ALL_AVGS+=("$avg")
         ALL_PEAKS+=("$peak")

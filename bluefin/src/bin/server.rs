@@ -4,6 +4,7 @@ use bluefin_proto::BluefinResult;
 use bytes::Bytes;
 use std::{
     cmp::{max, min},
+    env,
     net::{Ipv4Addr, SocketAddrV4},
     time::{Duration, Instant},
 };
@@ -44,12 +45,34 @@ async fn run() -> BluefinResult<()> {
     server.bind().await?;
     let mut join_set = JoinSet::new();
 
-    const NUM_EXPECTED_CONNECTIONS: usize = 2;
-    let mut connections = Vec::with_capacity(NUM_EXPECTED_CONNECTIONS);
-    
+    // How many client connections to accept before we move on to processing.
+    //
+    // CLI:    `server [N]`              (positional, first arg)
+    // Env:    `BLUEFIN_BENCH_NUM_CONNS=N`
+    // Default: 2
+    //
+    // The bench wrapper passes `-n` through as the positional arg so a
+    // single sweep can drive 1..=N clients without recompiling. The env
+    // var is the fallback for ad-hoc invocations (`BLUEFIN_BENCH_NUM_CONNS=4
+    // ./target/release/server`). CLI > env > default.
+    let num_expected_connections: usize = env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .or_else(|| env::var("BLUEFIN_BENCH_NUM_CONNS").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(2);
+    assert!(
+        num_expected_connections >= 1,
+        "num_expected_connections must be >= 1 (got {num_expected_connections})"
+    );
+    eprintln!(
+        "(server) accepting {} connection(s) before starting recv loops",
+        num_expected_connections,
+    );
+    let mut connections = Vec::with_capacity(num_expected_connections);
+
     // Accept all connections FIRST before spawning any processing tasks
     // This avoids the race where processing one connection blocks accepting the next
-    for _conn_num in 0..NUM_EXPECTED_CONNECTIONS {
+    for _conn_num in 0..num_expected_connections {
         match server.accept().await {
             Ok(conn) => {
                 connections.push((_conn_num, conn));

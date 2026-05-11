@@ -159,7 +159,11 @@ run_attempt() {
     # --- 3. start server ---------------------------------------------------
     local server_log="$attempt_log_dir/server.log"
     echo "[attempt $attempt_ix | step 2/4] starting server -> $server_log"
-    "$SERVER_BIN" >"$server_log" 2>&1 &
+    # Pass NUM_CONNS through so the server accepts exactly that many handshakes
+    # before starting recv loops. Without this it hardcodes 2 and any
+    # `-n` other than 2 hangs (server waits forever on a 3rd accept, or
+    # exits early before the 3rd client finishes its handshake).
+    "$SERVER_BIN" "$NUM_CONNS" >"$server_log" 2>&1 &
     SERVER_PID=$!
     echo "       server pid: $SERVER_PID"
 

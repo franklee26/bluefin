@@ -13,11 +13,14 @@
 #   - Always prints server FINAL lines and per-client `sent ...` lines so
 #     the parent loop can grep them.
 #
-# Usage: ./bench_run_with_timeout.sh [wallclock_seconds]
+# Usage: ./bench_run_with_timeout.sh [wallclock_seconds] [num_conns]
+#   wallclock_seconds: hard kill grace (default 30)
+#   num_conns:         how many clients to spawn (default 2; max = len(DEFAULT_PORTS) in client.rs, currently 5)
 set -uo pipefail
 cd "$(dirname "$0")"
 
 WALLCLOCK="${1:-30}"
+NUM_CONNS="${2:-2}"
 LOG_DIR="bench_logs/$(date +%Y%m%d_%H%M%S_to)"
 mkdir -p "$LOG_DIR"
 
@@ -27,34 +30,41 @@ sleep 0.3
 
 export RUST_BACKTRACE=full
 
-./target/release/server >"$LOG_DIR/server.log" 2>&1 &
+# Server now reads num-expected-conns from argv[1]; pass NUM_CONNS through.
+./target/release/server "$NUM_CONNS" >"$LOG_DIR/server.log" 2>&1 &
 SVR=$!
 sleep 1.5
 
-./target/release/client --task 0 >"$LOG_DIR/c0.log" 2>&1 &
-C0=$!
-sleep 0.1
-./target/release/client --task 1 >"$LOG_DIR/c1.log" 2>&1 &
-C1=$!
+CLIENT_PIDS=()
+for ((ix = 0; ix < NUM_CONNS; ix++)); do
+    ./target/release/client --task "$ix" >"$LOG_DIR/c${ix}.log" 2>&1 &
+    CLIENT_PIDS+=($!)
+    # Stagger to dodge the handshake race (see live bottleneck #11). 100ms
+    # is what the in-process client uses between its two tasks; matches.
+    if (( ix + 1 < NUM_CONNS )); then
+        sleep 0.1
+    fi
+done
 
 # Wall-clock watchdog. SIGTERM first so client/server panic handlers get
 # a chance to flush stderr; SIGKILL after a short grace.
 (
     sleep "$WALLCLOCK"
-    for p in "$C0" "$C1" "$SVR"; do
+    for p in "${CLIENT_PIDS[@]}" "$SVR"; do
         kill -0 "$p" 2>/dev/null && kill -SIGTERM "$p" 2>/dev/null
     done
     sleep 1
-    for p in "$C0" "$C1" "$SVR"; do
+    for p in "${CLIENT_PIDS[@]}" "$SVR"; do
         kill -0 "$p" 2>/dev/null && kill -9 "$p" 2>/dev/null
     done
 ) &
 WATCHDOG=$!
 
-wait "$C0" 2>/dev/null
-C0_EXIT=$?
-wait "$C1" 2>/dev/null
-C1_EXIT=$?
+CLIENT_EXITS=()
+for pid in "${CLIENT_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null
+    CLIENT_EXITS+=($?)
+done
 # Server prints `FINAL` after 2 seconds of recv-idle on each connection.
 # Give it up to 6s to do that on its own; only SIGTERM if it's still
 # running after the watchdog grace.
@@ -70,16 +80,20 @@ wait "$WATCHDOG" 2>/dev/null || true
 
 # Tag for the parent loop's stats parser.
 HUNG=0
-if [[ "$C0_EXIT" -eq 143 || "$C0_EXIT" -eq 137 || "$C1_EXIT" -eq 143 || "$C1_EXIT" -eq 137 ]]; then
-    HUNG=1
-fi
+for ec in "${CLIENT_EXITS[@]}"; do
+    if [[ "$ec" -eq 143 || "$ec" -eq 137 ]]; then HUNG=1; fi
+done
 if (( HUNG )); then
-    echo "WALLCLOCK_TIMEOUT after ${WALLCLOCK}s (c0=$C0_EXIT c1=$C1_EXIT svr=$SVR_EXIT)"
+    echo "WALLCLOCK_TIMEOUT after ${WALLCLOCK}s (clients=${CLIENT_EXITS[*]} svr=$SVR_EXIT)"
 fi
 
 # Surface the lines the loop greps for. Server may have printed FINAL
 # even on SIGTERM if it had time; client may not have flushed stdout if
 # it was hung in flush().await — that's fine, the parent loop tolerates
 # missing rows.
+CLIENT_LOGS=()
+for ((ix = 0; ix < NUM_CONNS; ix++)); do
+    CLIENT_LOGS+=("$LOG_DIR/c${ix}.log")
+done
 grep -hE "FINAL|sent [0-9]+ bytes|sendmsg_x writer" \
-    "$LOG_DIR/server.log" "$LOG_DIR/c0.log" "$LOG_DIR/c1.log" 2>/dev/null || true
+    "$LOG_DIR/server.log" "${CLIENT_LOGS[@]}" 2>/dev/null || true

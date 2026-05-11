@@ -10,7 +10,7 @@ This skill is the consolidated record of every perf-related decision in the code
 ## Baseline & topology
 
 - **Current** (canonical 20-run sweep, 2026-05-10, post O+F1+F2+G3+F3+P; sweep dir `bench_logs/sweep_20260510_201419/`): per-conn server-observed **median 1.82 GB/s avg / 3.85 GB/s peak** on healthy conns (n=35; min 1.73, p25 1.80, p75 1.83, max 1.84, mean 1.81, **stdev 0.02 GB/s ≈ 1.1 %** — extremely tight). Peak distribution: median 3.85, p25 3.76, p75 3.90, max 4.04, mean 3.82, stdev 0.16. Bilateral healthy-run rate **17/20 = 85 %**, at-least-one-conn healthy 18/20 = 90 %, 0 wallclock timeouts. Up from the 2.50 GB/s `origin/main` baseline = **+47 % sustained / +60 % peak per conn**.
-- **Benchmarks**: [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs) + [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs). Loopback only, single 1500 B payload, 2 connections, 10M sends/conn = 15 GB/conn. Wrapper [`bench_run_with_timeout.sh`](../../bench_run_with_timeout.sh) enforces a 30s wall-clock cap per run.
+- **Benchmarks**: [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs) + [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs). Loopback only, single 1500 B payload, **2 connections by default but the bench is parameterised — both wrappers accept `N` via `-n` or positional arg, and the server reads the count from `argv[1]` (or `BLUEFIN_BENCH_NUM_CONNS`); max = `DEFAULT_PORTS.len()` in [`client.rs`](../../bluefin/src/bin/client.rs), currently 5**. 10M sends/conn = 15 GB/conn. Wrapper [`bench_run_with_timeout.sh`](../../bench_run_with_timeout.sh) enforces a 30 s wall-clock cap per run. **Canonical numbers in this SKILL are all N=2 unless explicitly noted** — the 20-run sweep, the round-by-round table, the live-bottleneck percentages. N=1 runs ~17 % faster (no contention); N=3+ degrades sharply due to live bottlenecks #6 (per-conn `connect()` defeats `SO_REUSEPORT`) + #11 (recv-side starvation under contention).
 - **Release profile** (root `Cargo.toml`): `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `debug = true`.
 
 ## The hot paths (memorize these)
@@ -468,10 +468,13 @@ Implementation details and rationale are in [`docs/archive/`](../../docs/archive
 - **macOS UDP recv buffer is hard-capped at `kern.ipc.maxsockbuf`** (default 8 MB; bump with `sudo sysctl -w kern.ipc.maxsockbuf=33554432 net.inet.udp.recvspace=8388608`). At 5 GB/s drain, 8 MB is **1.6 ms of buffering** — any pause longer than that drops UDP datagrams silently. The socket-creation path in [`bluefin/src/utils/mod.rs`](../../bluefin/src/utils/mod.rs) requests 32 MB; it only takes effect after the sysctl bump.
 - **`socket.try_send` swallows `ECONNREFUSED`; `sendmsg_x` does not.** Any future vectorised-send experiment must either propagate the error to a `BluefinError::ConnectionLost` *or* drain `pending_bytes` and continue — returning from the spawned sender task hangs `flush()` because new enqueues accumulate without a consumer. (Round K, 2026-05-10.)
 - **Vectorised I/O must be paired**. A reader-side batch (`recvmsg_x`) wins only when the writer also bursts; otherwise each call returns 1 datagram and pays the per-call setup overhead (round J: −9 % avg, −21 % peak). A writer-side batch (`sendmsg_x`) without a faster reader just exposes recv-buffer drops faster (round I: 75 % loss). Land them together — with pacing.
+- **Thermal drift inflates apparent regressions on small post-bench sweeps.** A 5-run sweep started immediately after a heavy bench session (e.g. a multi-N smoke test or a flamegraph capture) will read **~5–10 % low on peak** and may show 1–2 fewer bilateral-healthy runs than canonical. *Avg is much more stable* (typical drift <2 %). When investigating a suspected regression: (1) cool down for ~2 min; (2) insert ~8 s gaps between runs; (3) compare against the same metric on the same sweep size. Confirmed 2026-05-10 post N-parameterisation: warm 5-run peak median 3.56 → cool 5-run peak median 3.79 (canonical 20-run is 3.85), avg 1.82 across all three. **Avg-flat is the canonical "no regression" signal**; small-sweep peak deltas need cooldown verification before trusting. (Originally surfaced in rounds G3 → F3, recorded as a meta-rule here for next-time discipline.)
 
 ## Benchmarking protocol
 
 The benchmark binaries were updated 2026-05-09 to add an idle timeout, instantaneous-throughput reporting, a `--task <ix>` per-process mode, and explicit error reporting on `connect()` / task-join failures. See [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs) and [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs).
+
+> **Cooldown discipline.** *Always cool down (~2 min idle, or 8 s gaps between runs) before treating a small-sweep peak drop as a regression.* Thermal effects are the #1 source of false-positive "regression" signals on this machine — a 5-run sweep right after a heavy session reads ~5–10 % low on peak and 1–2 bilateral conns short. Avg-flat is the canonical no-regression signal; it's much more stable than peak. See tactical rules above and the post-N-change verification dataset (2026-05-10) for the worked example.
 
 **Pick by intent — there are two scripts:**
 
@@ -496,10 +499,23 @@ The benchmark binaries were updated 2026-05-09 to add an idle timeout, instantan
 **`bench_run_with_timeout.sh` (single shot, hard cap; assumes you've already `cargo build --release`):**
 
 ```bash
-./bench_run_with_timeout.sh             # 30 s wall-clock cap (default)
-./bench_run_with_timeout.sh 25          # 25 s cap; what we used for the round-J/K sweeps
-# Logs land in bench_logs/<timestamp>_to/{server,c0,c1}.log
+./bench_run_with_timeout.sh             # 30 s wall-clock cap, 2 conns (default)
+./bench_run_with_timeout.sh 25          # 25 s cap, 2 conns; what we used for the round-J/K sweeps
+./bench_run_with_timeout.sh 30 3        # 30 s cap, 3 conns (passes 3 to the server's argv[1])
+./bench_run_with_timeout.sh 30 5        # 30 s cap, 5 conns (max = DEFAULT_PORTS in client.rs)
+# Logs land in bench_logs/<timestamp>_to/{server,c0,c1,...}.log
 ```
+
+**N-connection observations (smoke-tested 2026-05-10, post-P):**
+
+| N | per-conn avg (GB/s) | per-conn peak (GB/s) | aggregate avg (GB/s) | starvation? |
+|--:|--------------------:|---------------------:|---------------------:|:-----------:|
+| 1 | 2.13                | 3.95                 | 2.13                 | none        |
+| 2 | 1.82 / 1.81         | 3.75 / 3.85          | ~3.6                 | none        |
+| 3 | 1.71–1.73           | 2.74–3.95            | ~5.2                 | conn #2 truncated to 12 GB |
+| 5 | 0.01–1.10 (server-observed)  | 0–3.53           | ~10 (clients sent 75 GB total) | severe — 4 of 5 conns stalled at <1 GB delivered before the 2 s idle fired |
+
+The sharp cliff at N≥3 is **not** new — it surfaces live bottlenecks #6 (per-connection `connect()`-ed socket defeats `SO_REUSEPORT` on Linux and isn't fanned across cores on macOS either) and #11 (server has 3 reader workers; once recv falls behind the kernel UDP queue, the per-conn 2 s idle deadline fires before the client's `flush().await` completes). **N=2 is the canonical bench because it stresses send-side parallelism without crossing the recv-starvation cliff.** Higher N is useful for stressing scaling specifically (e.g. validating a future change to the per-conn socket model).
 
 **The 10-run sweep pattern (round-J/K dataset, 2026-05-10):**
 

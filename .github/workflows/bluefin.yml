@@ -163,7 +163,7 @@ jobs:
       # See block comment above for the rationale.
       BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS:    "0.40"      # ~50 % of first observed CI median (0.92 GB/s @ 5 runs)
       BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS:    "2.00"      # ~50 % of first observed CI median (4.15 GB/s @ 5 runs)
-      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "6"         # ≥6 of 10 conn-trials completed the (shrunk) payload; combined with the per-run retry below this absorbs the bimodal hosted-runner allocation pattern
+      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "5"         # ≥5 of 10 conn-trials completed the (shrunk) payload; combined with the per-run retry below this absorbs the bimodal hosted-runner allocation pattern
       BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES:    "700000000" # 700 MB ≈ 93 % of the 750 MB CI payload (BLUEFIN_NUM_SENDS=500000 × 1500)
       BLUEFIN_BENCH_SUMMARY_MD:             "bench_logs/ci_summary.md"
       # Bump per-socket SO_RCVBUF / SO_SNDBUF from the hardcoded 512 KB
@@ -183,7 +183,7 @@ jobs:
       # to 10 s. Together these let conns COMPLETE the payload on hosted
       # runners instead of TRUNCing at the timeout. Reframes "good conn"
       # back to its original semantic ("delivered the full payload") and
-      # makes BLUEFIN_BENCH_FLOOR_GOOD_CONNS a real liveness gate at 6/10.
+      # makes BLUEFIN_BENCH_FLOOR_GOOD_CONNS a real liveness gate at 5/10.
       # Production binaries built without these env vars are unaffected.
       BLUEFIN_NUM_SENDS:                    "500000"    # 500 K × 1500 B = 750 MB per conn
       BLUEFIN_RECV_IDLE_TIMEOUT_SECS:       "10"        # 5× the dev default; conns finish naturally

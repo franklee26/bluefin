@@ -43,7 +43,7 @@ All knobs are read from the environment by [`bench_ci.sh`](../../bench_ci.sh); s
 |-----|---------|--------------|
 | `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS` | `0.05` (script) / `0.05` (workflow) | Minimum mean of per-conn `avg gb/s` across **GOOD conns only** (filtered — see "Drain artifacts" below). Below this → FAIL. |
 | `BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS` | `0.10` (script) / `1.00` (workflow) | Minimum of the *maximum* observed `peak gb/s` across **GOOD conns only** (filtered). Below this → FAIL. |
-| `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`    | `6` (script) / `6` (workflow) | Minimum count of "good conns" out of `N_RUNS * N_CONNS` total trials. Below this → FAIL. The threshold for "good" is `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`. |
+| `BLUEFIN_BENCH_FLOOR_GOOD_CONNS`    | `6` (script) / `5` (workflow) | Minimum count of "good conns" out of `N_RUNS * N_CONNS` total trials. Below this → FAIL. The threshold for "good" is `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES`. |
 | `BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES` | `14000000000` (14 GB) script / `700000000` (700 MB) workflow | **Threshold for what counts as a "good conn".** A conn that emits a FINAL line is GOOD if it delivered ≥ this many bytes, else TRUNC. Used for the good-conns count above. **Rebaselined for CI** — see below. |
 | `BLUEFIN_BENCH_SUMMARY_MD` | `bench_logs/ci_summary.md` | Path the script writes the Markdown summary to. The workflow pins it so the comment step can find it. |
 | `BLUEFIN_SOCKET_RCVBUF` | unset (production) / `8388608` (8 MiB, workflow) | Per-socket `SO_RCVBUF` override read by [`BluefinSocket::new`](../../bluefin-io/src/socket/udp_socket.rs). When unset, falls back to the hardcoded **512 KiB** default — see "Socket buffer sizes" below. |
@@ -89,7 +89,7 @@ Option C (this stack) shrinks both axes proportionally so CI behaves like dev:
 | `BLUEFIN_NUM_SENDS` | `10_000_000` | `500_000` | 15 GB → 750 MB. Active conns on hosted runners finish 750 MB in 2.5–15 s of real transfer time. |
 | `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` | `2` | `10` | 2 s → 10 s. Tolerates the longest scheduling-gap-induced stalls observed on hosted runners (≤ 5 ms typical, ≤ 1 s under heavy contention). |
 
-With Option C, `good_conns` returns to its original semantic ("delivered the full payload") and the floor of 6/10 becomes a **real liveness gate** rather than a smoke test.
+With Option C, `good_conns` returns to its original semantic ("delivered the full payload") and the floor of 5/10 becomes a **real liveness gate** rather than a smoke test.
 
 **Server FINAL avg correction**: `bluefin/src/bin/server.rs` subtracts `recv_idle` from `now.elapsed()` when computing the FINAL avg, so a conn that delivered 750 MB in 2.5 s of real transfer + 10 s idle reports `avg = 750 MB / 2.5 s = 300 MB/s`, not `750 MB / 12.5 s = 60 MB/s`. Without this correction, bumping the timeout would have dragged mean_avg into the noise floor (see commit history for the Option C rollout).
 
@@ -257,7 +257,7 @@ Each gated metric gets its own `:white_check_mark:` / `:x:` cell, so reviewers c
 | Task | What to do |
 |------|------------|
 | **Run the gate locally** | `./bench_ci.sh -r 5 -n 2 --skip-build` (after a `cargo build --release --bin server --bin client`). Takes ~1 min. |
-| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.40 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=2.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=6 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=700000000 BLUEFIN_SOCKET_RCVBUF=8388608 BLUEFIN_SOCKET_SNDBUF=8388608 BLUEFIN_NUM_SENDS=500000 BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10 BLUEFIN_BENCH_RUN_RETRIES_ON_ZERO=2 BLUEFIN_BENCH_RUN_RETRIES_ON_PARTIAL=0 BLUEFIN_BENCH_RUN_RETRY_BACKOFF_SECS=5 BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md ./bench_ci.sh -r 5 -n 2 --skip-build`. |
+| **Reproduce the workflow exactly** | Same as above plus `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=0.40 BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS=2.00 BLUEFIN_BENCH_FLOOR_GOOD_CONNS=5 BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES=700000000 BLUEFIN_SOCKET_RCVBUF=8388608 BLUEFIN_SOCKET_SNDBUF=8388608 BLUEFIN_NUM_SENDS=500000 BLUEFIN_RECV_IDLE_TIMEOUT_SECS=10 BLUEFIN_BENCH_RUN_RETRIES_ON_ZERO=2 BLUEFIN_BENCH_RUN_RETRIES_ON_PARTIAL=0 BLUEFIN_BENCH_RUN_RETRY_BACKOFF_SECS=5 BLUEFIN_BENCH_SUMMARY_MD=/tmp/x.md ./bench_ci.sh -r 5 -n 2 --skip-build`. |
 | **Force a FAIL to test the comment** | `BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS=10.0 ./bench_ci.sh -r 2 -n 2 --skip-build`. Useful when changing the Markdown emitter. |
 | **Bump floors after a perf gain** | See "Ratcheting up" above. Edit only `.github/workflows/bluefin.yml`'s `env:` block. |
 | **Inspect a CI failure** | Open the run → `bench (macos-latest)` job → expand `Run CI bench`. The Markdown also lands in the run's Summary tab and on the PR. The full per-run logs are in the `bench-logs` artifact. |

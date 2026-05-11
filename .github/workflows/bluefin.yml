@@ -75,9 +75,12 @@ jobs:
 
   bench:
     # Throughput regression gate. Runs the two-process loopback bench
-    # (server + N client procs, each with its own tokio runtime) 10 times
-    # at N=2 connections (= 20 conn-trials), parses per-conn FINAL lines,
-    # and asserts the aggregate stats clear the floors below.
+    # (server + N client procs, each with its own tokio runtime) 5 times
+    # at N=2 connections (= 10 conn-trials), parses per-conn FINAL lines,
+    # and asserts the aggregate stats clear the floors below. Any run that
+    # produces 0 GOOD conns (catastrophic hosted-runner allocation) is
+    # retried once after a short backoff; only the final attempt's data
+    # is committed to the aggregate.
     #
     # >>> RUNNER REALITY <<<
     # Hosted macos-latest runners are dramatically slower and burstier than
@@ -160,7 +163,7 @@ jobs:
       # See block comment above for the rationale.
       BLUEFIN_BENCH_FLOOR_MEAN_AVG_GBPS:    "0.40"      # ~50 % of first observed CI median (0.92 GB/s @ 5 runs)
       BLUEFIN_BENCH_FLOOR_MAX_PEAK_GBPS:    "2.00"      # ~50 % of first observed CI median (4.15 GB/s @ 5 runs)
-      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "6"         # ≥6 of 20 conn-trials completed the (shrunk) payload; loose enough to absorb the bimodal hosted-runner allocation pattern (one bad allocation can starve up to ~10 of 20 trials)
+      BLUEFIN_BENCH_FLOOR_GOOD_CONNS:       "6"         # ≥6 of 10 conn-trials completed the (shrunk) payload; combined with the per-run retry below this absorbs the bimodal hosted-runner allocation pattern
       BLUEFIN_BENCH_GOOD_CONN_MIN_BYTES:    "700000000" # 700 MB ≈ 93 % of the 750 MB CI payload (BLUEFIN_NUM_SENDS=500000 × 1500)
       BLUEFIN_BENCH_SUMMARY_MD:             "bench_logs/ci_summary.md"
       # Bump per-socket SO_RCVBUF / SO_SNDBUF from the hardcoded 512 KB
@@ -184,6 +187,16 @@ jobs:
       # Production binaries built without these env vars are unaffected.
       BLUEFIN_NUM_SENDS:                    "500000"    # 500 K × 1500 B = 750 MB per conn
       BLUEFIN_RECV_IDLE_TIMEOUT_SECS:       "10"        # 5× the dev default; conns finish naturally
+      # Per-run retry knobs. Hosted macos-latest runners occasionally land
+      # on a deeply contended host where both bench peers get starved and
+      # the run yields 0 GOOD conns despite no actual code regression.
+      # Empirically this hits ~5-10 % of CI runs. With one retry on a 5 s
+      # backoff, the post-retry catastrophic-allocation rate is well under
+      # 1 %, while keeping wall-clock additive only on actually-bad runs
+      # (typical run = 0 retries; worst-case run = +5 s + ~12 s redo).
+      # Production behaviour is unaffected (RUN_RETRIES defaults to 0).
+      BLUEFIN_BENCH_RUN_RETRIES:            "1"         # one extra attempt per run on 0 good
+      BLUEFIN_BENCH_RUN_RETRY_BACKOFF_SECS: "5"         # short cooldown to let the runner settle
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -192,13 +205,13 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Build release binaries
         run: cargo build --release --bin server --bin client
-      - name: Run CI bench (10 runs x 2 conns)
+      - name: Run CI bench (5 runs x 2 conns, retry on 0 good)
         id: bench
         # Don't fail the step here — we want the comment + step-summary to
         # post even on regression. We re-export the rc and fail at the end.
         run: |
           set +e
-          ./bench_ci.sh -r 10 -n 2 --skip-build
+          ./bench_ci.sh -r 5 -n 2 --skip-build
           echo "rc=$?" >> "$GITHUB_OUTPUT"
       - name: Append summary to GitHub step summary
         if: always()

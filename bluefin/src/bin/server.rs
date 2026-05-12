@@ -1,18 +1,66 @@
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 use bluefin::net::server::BluefinServer;
 use bluefin_proto::BluefinResult;
+use bytes::Bytes;
 use std::{
     cmp::{max, min},
+    env,
     net::{Ipv4Addr, SocketAddrV4},
     time::{Duration, Instant},
 };
-use tokio::{spawn, task::JoinSet, time::timeout};
+use tokio::{spawn, task::JoinSet, time::sleep};
 
 /// If no bytes arrive on a connection for this long, the per-connection
 /// task assumes the peer is gone, prints a final summary, and exits.
 /// Bluefin currently has no protocol-level FIN, so this is the only way
 /// the benchmark server can terminate cleanly.
-const RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// CI overrides this via `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` because hosted
+/// macos-latest runners deliver bytes at ~1–10 % of dev-box throughput,
+/// so the 15 GB target needs minutes, not seconds, to complete. Without
+/// the override, every CI conn TRUNCs at the 2 s mark and the bench gate
+/// degenerates into a smoke test. Production traffic is unaffected
+/// unless the env var is explicitly set.
+const DEFAULT_RECV_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn recv_idle_timeout() -> Duration {
+    env::var("BLUEFIN_RECV_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_RECV_IDLE_TIMEOUT)
+}
+
+/// How many `ReaderTxChannel` workers the bench server binds to its
+/// listening UDP socket. Reader workers demux datagrams to the right
+/// `ConnectionBuffer` and are on the hot path during handshake; once a
+/// `BluefinConnection`'s per-connection socket takes over, additional
+/// reader workers buy nothing for steady-state throughput.
+///
+/// Default 3 is great on dev boxes (8–10 perf cores) but oversubscribes
+/// hosted macos-latest runners (3 vCPUs total, shared between the server
+/// and client processes plus tokio's worker threads). CI overrides this
+/// via `BLUEFIN_NUM_READER_WORKERS` to keep a tiny bit of demux
+/// parallelism without piling more threads than the runner has cores.
+/// Production builds are unaffected unless the env var is explicitly set.
+const DEFAULT_NUM_READER_WORKERS: u16 = 3;
+
+fn num_reader_workers() -> u16 {
+    env::var("BLUEFIN_NUM_READER_WORKERS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_NUM_READER_WORKERS)
+}
+
+/// How often to push the idle deadline forward. Resetting the `Sleep`'s
+/// deadline on every recv (the natural `tokio::time::timeout` pattern) re-arms
+/// the timer wheel at recv-rate (~270 K/s on the bench), which dominates
+/// CPU. Resetting once per `IDLE_RESET_EVERY` recvs caps that at <100 Hz while
+/// keeping idle detection sharp to `RECV_IDLE_TIMEOUT + ~15 ms` at the bench's
+/// recv rate.
+const IDLE_RESET_EVERY: i64 = 4096;
 
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[tokio::main]
@@ -30,16 +78,52 @@ async fn run() -> BluefinResult<()> {
         Ipv4Addr::new(127, 0, 0, 1),
         1318,
     )));
-    server.set_num_reader_workers(3)?;
+    let n_workers = num_reader_workers();
+    if n_workers != DEFAULT_NUM_READER_WORKERS {
+        eprintln!(
+            "(server) reader workers overridden via env: {} (default {})",
+            n_workers, DEFAULT_NUM_READER_WORKERS,
+        );
+    }
+    server.set_num_reader_workers(n_workers)?;
     server.bind().await?;
     let mut join_set = JoinSet::new();
 
-    const NUM_EXPECTED_CONNECTIONS: usize = 2;
-    let mut connections = Vec::with_capacity(NUM_EXPECTED_CONNECTIONS);
-    
+    // How many client connections to accept before we move on to processing.
+    //
+    // CLI:    `server [N]`              (positional, first arg)
+    // Env:    `BLUEFIN_BENCH_NUM_CONNS=N`
+    // Default: 2
+    //
+    // The bench wrapper passes `-n` through as the positional arg so a
+    // single sweep can drive 1..=N clients without recompiling. The env
+    // var is the fallback for ad-hoc invocations (`BLUEFIN_BENCH_NUM_CONNS=4
+    // ./target/release/server`). CLI > env > default.
+    let num_expected_connections: usize = env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .or_else(|| env::var("BLUEFIN_BENCH_NUM_CONNS").ok().and_then(|s| s.parse().ok()))
+        .unwrap_or(2);
+    assert!(
+        num_expected_connections >= 1,
+        "num_expected_connections must be >= 1 (got {num_expected_connections})"
+    );
+    eprintln!(
+        "(server) accepting {} connection(s) before starting recv loops",
+        num_expected_connections,
+    );
+    let recv_idle = recv_idle_timeout();
+    if recv_idle != DEFAULT_RECV_IDLE_TIMEOUT {
+        eprintln!(
+            "(server) recv-idle timeout overridden via env: {:?} (default {:?})",
+            recv_idle, DEFAULT_RECV_IDLE_TIMEOUT,
+        );
+    }
+    let mut connections = Vec::with_capacity(num_expected_connections);
+
     // Accept all connections FIRST before spawning any processing tasks
     // This avoids the race where processing one connection blocks accepting the next
-    for _conn_num in 0..NUM_EXPECTED_CONNECTIONS {
+    for _conn_num in 0..num_expected_connections {
         match server.accept().await {
             Ok(conn) => {
                 connections.push((_conn_num, conn));
@@ -54,8 +138,13 @@ async fn run() -> BluefinResult<()> {
     for (conn_num, mut conn) in connections {
         let _ = join_set.spawn(async move {
             let _num = conn_num;
+            let recv_idle = recv_idle;
             let mut total_bytes: usize = 0;
-            let mut recv_bytes = [0u8; 10000];
+            // Carrier vec for the zero-copy `recv_bytes` API. We keep
+            // capacity across iterations by `drain(..)`-ing instead of
+            // reassigning, so this allocates exactly once per connection.
+            // 16 matches the per-call max-packets argument below.
+            let mut chunks: Vec<Bytes> = Vec::with_capacity(16);
             let mut min_bytes = usize::MAX;
             let mut max_bytes = 0;
             let mut iteration: i64 = 1;
@@ -68,29 +157,57 @@ async fn run() -> BluefinResult<()> {
             // cumulative running average.
             let mut last_print_bytes: usize = 0;
             let mut last_print_instant = now;
+
+            // Single long-lived idle deadline. Pinning one `Sleep` and
+            // resetting its deadline (instead of allocating a fresh `Sleep`
+            // per recv via `tokio::time::timeout`) is the documented tokio
+            // idiom for hot loops and removes the per-recv timer-wheel
+            // arm/disarm.
+            let idle_sleep = sleep(recv_idle);
+            tokio::pin!(idle_sleep);
+
             loop {
-                // Use a timeout so the server self-terminates when the client
-                // stops sending. UDP gives us no close signal and Bluefin has
-                // no protocol-level FIN yet.
-                let recv_result =
-                    timeout(RECV_IDLE_TIMEOUT, conn.recv(&mut recv_bytes, 10000)).await;
-                let size = match recv_result {
-                    Ok(Ok(size)) => size,
-                    Ok(Err(e)) => {
-                        eprintln!("(#{}) recv error: {:?} -- exiting", _num, e);
-                        break;
+                // `recv_bytes` is the zero-copy variant of `recv`: it pushes
+                // `Bytes` slices over the recv buffer into our carrier vec
+                // instead of memcpying into a `[u8]`. The bench has no need
+                // for a contiguous buffer (we just sum lengths).
+                let size = tokio::select! {
+                    biased;
+                    recv = conn.recv_bytes(&mut chunks, 16) => {
+                        match recv {
+                            Ok(size) => size,
+                            Err(e) => {
+                                eprintln!("(#{}) recv error: {:?} -- exiting", _num, e);
+                                break;
+                            }
+                        }
                     }
-                    Err(_) => {
+                    _ = idle_sleep.as_mut() => {
                         eprintln!(
                             "(#{}) idle for {:?} -- assuming peer is gone",
-                            _num, RECV_IDLE_TIMEOUT
+                            _num, recv_idle
                         );
                         break;
                     }
                 };
+                // Push the idle deadline forward on a coarse cadence so we
+                // re-arm the timer wheel at <100Hz instead of recv-rate.
+                if iteration % IDLE_RESET_EVERY == 0 {
+                    idle_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + recv_idle);
+                }
                 total_bytes += size;
-                min_bytes = min(size, min_bytes);
-                max_bytes = max(size, max_bytes);
+                // Drain the carrier vec, tracking the smallest/largest
+                // payload we've seen so far. `drain(..)` keeps the vec's
+                // allocated capacity, so the next recv reuses it.
+                for b in chunks.drain(..) {
+                    let n = b.len();
+                    min_bytes = min(n, min_bytes);
+                    max_bytes = max(n, max_bytes);
+                    // Refcount drop on `b` happens here; it's the only
+                    // bookkeeping per-payload — no copy.
+                }
 
                 num_iterations_without_print += 1;
                 // Use >= so we always emit a line at or after the threshold,
@@ -118,8 +235,20 @@ async fn run() -> BluefinResult<()> {
 
             // Final summary on exit so we always see a meaningful number,
             // even for short-lived connections.
-            let elapsed = now.elapsed().as_secs_f64();
-            let avg_throughput_mb = if elapsed > 0.0 {
+            //
+            // The loop only exits when the recv-idle deadline fires, which
+            // is approximately `recv_idle` seconds after the last incoming
+            // byte. Including that tail in the divisor under-reports the
+            // real throughput by `recv_idle / transfer_time`, which is
+            // ~30 % on dev hardware (2 s tail / 5 s transfer) and *much*
+            // worse in CI under the bumped 10 s timeout. Subtract the tail
+            // so FINAL avg reports bytes / actual-transfer-time. Clamp to a
+            // minimum positive value so a transfer that was fully consumed
+            // by the idle wait (i.e. zero real progress) doesn't divide by
+            // zero or report a wildly inflated number.
+            let elapsed_raw = now.elapsed().as_secs_f64();
+            let elapsed = (elapsed_raw - recv_idle.as_secs_f64()).max(1e-3);
+            let avg_throughput_mb = if total_bytes > 0 {
                 (total_bytes as f64 / elapsed) / 1e6
             } else {
                 0.0

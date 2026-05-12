@@ -153,12 +153,12 @@ A snapshot of what Bluefin actually guarantees right now (most of these will nee
 
 | Concern | Today's behaviour | Notes |
 |---------|-------------------|-------|
-| Send-side backpressure | Bounded `mpsc::channel(4096)` between user `send_bytes_async` and the writer pump (~6 MiB cap). Sync `send_bytes` returns `WriteError` on full. | Added 2026-05/#10. Implementation choice; protocol doesn't mandate. |
+| Send-side backpressure | Bounded `flume::bounded(4096)` between user `send_bytes_async` and the writer pump (~6 MiB cap). Sync `send_bytes` returns `WriteError` on full. | Added 2026-05/#10 as `tokio::sync::mpsc`; swapped to `flume` in 2026-05/P to eliminate per-32-message list-block alloc/free churn. Implementation choice; protocol doesn't mandate. |
 | Recv-side backpressure | `OrderedBytes` has `MAX_BUFFER_SIZE` slots; `buffer_in_bytes` returns `BufferFullError` when full. The producer drops the packet on error. | This is **lossy under sustained pressure** — there's no on-wire signal back to the sender. |
 | Retransmission | None. The receiver tracks ack acceptance in a `SlidingWindow`; the sender writes acks but never consumes them for retransmit decisions. | The dead `AckConsumer` is the planned hook. |
 | Congestion control | None. The send loop runs as fast as `socket.try_send` will let it. | Will need its own RFC section. |
 | Connection close | Implicit only — the server's read loop exits on a 2 s idle timeout; `Drop` on `BluefinConnection` closes the socket. | No explicit close packet; no graceful teardown. |
-| Flush | No public `flush()` API on `BluefinConnection`. Producers that need "make sure everything is on the wire" must rely on a fixed-time sleep at exit. | Documented in the bench client; called out in [bluefin-performance](../bluefin-performance/SKILL.md). |
+| Flush | Public `BluefinConnection::flush().await` waits until every previously-enqueued payload has been written by the writer task. Added 2026-05/D after the bench client's exit-sleep workaround proved fragile. | Implementation only — protocol carries no flush packet. |
 
 ## 9. Known architectural debt
 

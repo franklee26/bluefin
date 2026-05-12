@@ -81,6 +81,9 @@ CLIENT_BIN="./target/release/client"
 
 LOG_DIR="bench_logs/$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
+# Single-line marker so external drivers (e.g. bench_ci.sh) can pick up the
+# per-invocation log directory without racing against `ls -t bench_logs/`.
+echo "[log-dir] $LOG_DIR"
 
 # --- macOS prefers `gtimeout` (coreutils); fall back to `timeout` ----------
 if command -v gtimeout >/dev/null 2>&1; then
@@ -159,7 +162,11 @@ run_attempt() {
     # --- 3. start server ---------------------------------------------------
     local server_log="$attempt_log_dir/server.log"
     echo "[attempt $attempt_ix | step 2/4] starting server -> $server_log"
-    "$SERVER_BIN" >"$server_log" 2>&1 &
+    # Pass NUM_CONNS through so the server accepts exactly that many handshakes
+    # before starting recv loops. Without this it hardcodes 2 and any
+    # `-n` other than 2 hangs (server waits forever on a 3rd accept, or
+    # exits early before the 3rd client finishes its handshake).
+    "$SERVER_BIN" "$NUM_CONNS" >"$server_log" 2>&1 &
     SERVER_PID=$!
     echo "       server pid: $SERVER_PID"
 
@@ -219,8 +226,19 @@ run_attempt() {
         echo "       client #$ix exit=$code$note"
     done
 
-    echo "       waiting up to 5s for server to print FINAL lines and exit..."
-    for _ in $(seq 1 50); do
+    # Server exits naturally only after `RECV_IDLE_TIMEOUT_SECS` of no
+    # incoming bytes. Default is 2 s; CI bumps it to 10 s. Our grace must
+    # always be at least that long + a small safety margin, otherwise we
+    # SIGTERM the server before it prints its FINAL lines and the bench
+    # parser sees zero measurements.
+    local recv_idle_secs="${BLUEFIN_RECV_IDLE_TIMEOUT_SECS:-2}"
+    if ! [[ "$recv_idle_secs" =~ ^[0-9]+$ ]] || (( recv_idle_secs <= 0 )); then
+        recv_idle_secs=2
+    fi
+    local grace_secs=$(( recv_idle_secs + 3 ))
+    local grace_iters=$(( grace_secs * 10 ))
+    echo "       waiting up to ${grace_secs}s for server to print FINAL lines and exit..."
+    for _ in $(seq 1 "$grace_iters"); do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             break
         fi

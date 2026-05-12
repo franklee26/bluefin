@@ -175,6 +175,25 @@ impl ConnectionBuffer {
         Ok((consume_res, self.addr.unwrap()))
     }
 
+    /// Zero-copy variant of [`Self::consume`]. Hands back whole-payload
+    /// [`Bytes`] slices over the recv buffer instead of memcpying into
+    /// a caller `&mut [u8]`. See [`OrderedBytes::consume_bytes`].
+    #[inline]
+    pub(crate) fn consume_bytes(
+        &mut self,
+        out: &mut Vec<Bytes>,
+        max_packets: usize,
+    ) -> BluefinResult<(ConsumeResult, SocketAddr)> {
+        if self.addr.is_none() {
+            return Err(BluefinError::Unexpected(
+                "Cannot consume buffer because addr is field is none".to_string(),
+            ));
+        }
+
+        let consume_res = self.ordered_bytes.consume_bytes(out, max_packets)?;
+        Ok((consume_res, self.addr.unwrap()))
+    }
+
     pub(crate) fn peek(&self) -> BluefinResult<()> {
         if self.addr.is_none() {
             return Err(BluefinError::Unexpected(
@@ -287,6 +306,31 @@ impl BluefinConnection {
     #[inline]
     pub async fn recv(&mut self, buf: &mut [u8], len: usize) -> BluefinResult<usize> {
         let (size, _) = self.reader_rx.read(len, buf).await?;
+        Ok(size as usize)
+    }
+
+    /// Zero-copy variant of [`Self::recv`]. Pushes up to `max_packets`
+    /// whole-payload [`Bytes`] slices into `out` instead of memcpying
+    /// into a caller `&mut [u8]`. Each pushed `Bytes` is a refcount view
+    /// over the recv buffer, so this avoids the `_platform_memmove`
+    /// in `OrderedBytes::consume`.
+    ///
+    /// Returns the total number of payload bytes pushed into `out` on
+    /// this call. The vec is *not* cleared on entry — drain or clear it
+    /// yourself between calls. Reusing the same vec preserves capacity
+    /// and avoids per-call allocation.
+    ///
+    /// Use [`Self::recv`] if you need an owned contiguous buffer (e.g.
+    /// to feed a parser that doesn't accept `Bytes` chunks). Use this if
+    /// the consumer can work directly with a stream of `Bytes` slices —
+    /// it's strictly cheaper.
+    #[inline]
+    pub async fn recv_bytes(
+        &mut self,
+        out: &mut Vec<Bytes>,
+        max_packets: usize,
+    ) -> BluefinResult<usize> {
+        let (size, _) = self.reader_rx.read_bytes(out, max_packets).await?;
         Ok(size as usize)
     }
 

@@ -1,6 +1,6 @@
 ---
 name: bluefin-performance
-description: Performance and throughput rules for the Bluefin codebase. Captures the hot paths, the current baseline (~3.03 GB/s loopback), what's been tried, what's been proven to regress, where the live bottlenecks are, and how to benchmark/profile correctly. Load this in addition to `bluefin-101` whenever a task touches the worker, net, ordered_bytes, ack_handler, packet, or socket layers, or whenever the user says "throughput", "latency", "allocations", "hot path", "slow", or "optimize". Skip for pure correctness/feature work that is clearly not perf-sensitive.
+description: Performance and throughput rules for the Bluefin codebase. Captures the hot paths, the current baseline (~1.82 GB/s sustained per-conn / ~3.85 GB/s peak loopback after rounds O+F1+F2+G3+F3+P), what's been tried, what's been proven to regress, where the live bottlenecks are, and how to benchmark/profile correctly. Load this in addition to `bluefin-101` whenever a task touches the worker, net, ordered_bytes, ack_handler, packet, or socket layers, or whenever the user says "throughput", "latency", "allocations", "hot path", "slow", or "optimize". Skip for pure correctness/feature work that is clearly not perf-sensitive.
 ---
 
 # Bluefin Performance
@@ -9,8 +9,8 @@ This skill is the consolidated record of every perf-related decision in the code
 
 ## Baseline & topology
 
-- **Current**: ~3.03 GB/s per connection on loopback (macOS, single 1500 B payload). Up from 2.5 GB/s baseline (+21.6%).
-- **Benchmarks**: [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs) + [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs). Loopback only, single 1500 B payload, 2 connections.
+- **Current** (canonical 20-run sweep, 2026-05-10, post O+F1+F2+G3+F3+P; sweep dir `bench_logs/sweep_20260510_201419/`): per-conn server-observed **median 1.82 GB/s avg / 3.85 GB/s peak** on healthy conns (n=35; min 1.73, p25 1.80, p75 1.83, max 1.84, mean 1.81, **stdev 0.02 GB/s ≈ 1.1 %** — extremely tight). Peak distribution: median 3.85, p25 3.76, p75 3.90, max 4.04, mean 3.82, stdev 0.16. Bilateral healthy-run rate **17/20 = 85 %**, at-least-one-conn healthy 18/20 = 90 %, 0 wallclock timeouts. Up from the 2.50 GB/s `origin/main` baseline = **+47 % sustained / +60 % peak per conn**.
+- **Benchmarks**: [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs) + [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs). Loopback only, single 1500 B payload, **2 connections by default but the bench is parameterised — both wrappers accept `N` via `-n` or positional arg, and the server reads the count from `argv[1]` (or `BLUEFIN_BENCH_NUM_CONNS`); max = `DEFAULT_PORTS.len()` in [`client.rs`](../../bluefin/src/bin/client.rs), currently 5**. 10M sends/conn = 15 GB/conn. Wrapper [`bench_run_with_timeout.sh`](../../bench_run_with_timeout.sh) enforces a 30 s wall-clock cap per run. **Canonical numbers in this SKILL are all N=2 unless explicitly noted** — the 20-run sweep, the round-by-round table, the live-bottleneck percentages. N=1 runs ~17 % faster (no contention); N=3+ degrades sharply due to live bottlenecks #6 (per-conn `connect()` defeats `SO_REUSEPORT`) + #11 (recv-side starvation under contention).
 - **Release profile** (root `Cargo.toml`): `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`, `debug = true`.
 
 ## The hot paths (memorize these)
@@ -58,19 +58,101 @@ Full prioritized list lives in [`THROUGHPUT_ANALYSIS_2026.md`](../../THROUGHPUT_
 9. **`AckConsumer` is reserved for flow control** — currently writes `largest_recv_acked_packet_num` to an `AtomicU64` that nothing reads, but **do NOT delete it**. It is the wiring point for the application-level pacing / ack-window flow control that vectorised I/O (live bottleneck #5, rounds I/J/K) needs. Removing it now would force re-implementing the same plumbing later. The waker hop + per-ack atomic store is cheap (~one extra task wake per 200-packet ack). Wire it to the writer's pacing logic when implementing flow control.
 10. ~~**Unbounded send channel**~~ — **DONE 2026-05 (#10).** Writer's data channel is `mpsc::channel(4096)` (~6 MiB cap). Sync `BluefinConnection::send_bytes` returns `WriteError` on full; new async `send_bytes_async` awaits backpressure. Server peak unchanged within noise; delivered-bytes per run +~50% because the unbounded version was dropping ~half the bench's payloads at process exit. Ack channel left unbounded — low-volume, don't want a new failure mode. *Drain note (DONE 2026-05/D):* the bench client used to need a 2 s sleep after the loop because there was no public flush API. There is now: [`BluefinConnection::flush()`](../../bluefin/src/net/connection.rs) blocks until every byte handed to `send_bytes*` has been written to the kernel. The bench client uses it.
 11. **Server handshake race (correctness, not throughput, but visible in benches)** — when two clients hello within ~100 ms of each other on macOS loopback, the second client's `connect()` times out at 3 s with `TimedOut("Failed to read from handshake connection buffer")`. Reproduces ~1 in 3 with 100 ms inter-client stagger; ~0 with 500 ms. Root cause is in [`bluefin/src/net/server.rs`](../../bluefin/src/net/server.rs) / [`bluefin/src/net/connection.rs`](../../bluefin/src/net/connection.rs): a hello arriving before the next `accept()` slot is wired up gets dropped. The accept-before-spawn fix in [`docs/archive/BINARY_RACE_CONDITIONS.md`](../../docs/archive/BINARY_RACE_CONDITIONS.md) closed the *processing* race but not the *buffering* race. Bench script papers over it with `--stagger 0.5` + `--retry`.
-12. **Bench-only: per-recv `tokio::time::timeout(2s, conn.recv(...))` is the single largest server hotspot at ~5 % CPU.** Surfaced by the 2026-05-10 server flamegraph (`server::run::_{{closure}}` self-time 6.19 %, dominated by `Timespec::now` → `clock_gettime` → `mach_absolute_time` chains totalling ~485 samples). Every recv arms and disarms a fresh `tokio::time::Sleep` on the timer wheel; at ~270K recvs/s on the bench that's >540K `clock_gettime` calls/s. Fix is bench-only in [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs): track `Instant::now()` on a coarse cadence (e.g. every 1024 iterations) and exit the loop if `last_recv.elapsed() > RECV_IDLE_TIMEOUT`. **Library is unaffected.** Important because freeing this CPU exposes the true library ceiling under measurement — current ~4.48 GB/s peak almost certainly under-reports. (No round number assigned; bench-side change.)
-13. **`OrderedBytes::consume` memcpy on the recv path is ~5 % library CPU** (`_platform_memmove` 4.98 % in the flamegraph, parented by `server::run` → `conn.recv`). The recv pipeline parses payloads as zero-copy `Bytes` slices over the shared 15 KiB recv buffer, but `consume()` pays one `copy_from_slice(payload)` into the user-supplied `&mut [u8]`. Fix: add a parallel `BluefinConnection::recv_bytes()` API returning the underlying `Bytes` slice (true kernel-→-user zero-copy). Keep existing `recv(&mut [u8])` semantics for callers with stack buffers — don't break the API. Bench client/server switch to `recv_bytes`. Touches [`bluefin/src/net/connection.rs`](../../bluefin/src/net/connection.rs), [`bluefin/src/net/ordered_bytes.rs`](../../bluefin/src/net/ordered_bytes.rs), [`bluefin/src/worker/reader.rs`](../../bluefin/src/worker/reader.rs). Most likely-binding remaining library bottleneck on the recv side. (No round number yet.)
-14. **Per-recv `BytesMut::with_capacity(15200)` in `recv_and_buffer_inline` is ~1.2 % in malloc** (`szone_malloc_should_clear` 0.48 % + `small_malloc_should_clear` 0.40 % + `small_malloc_from_free_list` 0.27 %, all parented by `ConnReaderHandler::start::_{{closure}}`). Same shape as the round-N (writer-side) fix but trickier on the recv side because the derived `Bytes` is held by `OrderedBytes` until the consumer drains it — the recv loop can't recycle a buffer until every refcount on the slices it shipped has dropped. A small SPMC-of-`BytesMut` pool with `Bytes::try_into_mut()` recycle on `consume()` works but is non-trivial. ~1-2 % upside, low risk if done after #13 (which makes the consumer side honest). (No round number yet.)
-15. **Round-N recycle channel is unbounded** — at process exit it holds ~hundreds of empty 15 KiB `Vec<u8>`s waiting to be dropped, and tokio's task shutdown frees them serially through `madvise(DONT_NEED)` per Vec. Surfaced by the 2026-05-10 client flamegraph as **21.9 % of all leaf samples** rooted at `drop_in_place<UnboundedReceiver<Vec<u8>>>` → `drop_in_place<WriterHandler::read_data::{{closure}}>` → `task::raw::shutdown`. Doesn't slow steady-state throughput (it's strictly post-flush) but bloats profile noise and makes graceful shutdown surprisingly slow. Trivial fix: `mpsc::channel::<Vec<u8>>(16)` instead of `unbounded_channel`; sender's `recycle_tx.send(datagram).ok()` becomes `recycle_tx.try_send(datagram).ok()` so when the channel is full the empty Vec drops in place. At steady state cycle is 1:1 so the bound never fires; at exit there's ≤16 Vecs to drop. **Pure hygiene**; no throughput impact expected. Touches [`bluefin/src/worker/writer.rs`](../../bluefin/src/worker/writer.rs).
-16. **Bench-only client-side `clock_gettime` storm in `client::run_connection`** — same family as #12 but on the client side. The 2026-05-10 client flamegraph shows `client::run_connection::_{{closure}}` self-time at **5.53 %** with the usual `Timespec::now`/`clock_gettime`/`mach_absolute_time` chain underneath. Bench loop in [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs) calls `Instant::now()` per-iteration for throughput accounting. Coarsen to every-N like the server-side fix. **Library is unaffected.**
+12. ~~**Bench-only: per-recv `tokio::time::timeout(2s, conn.recv(...))` is the single largest server hotspot at ~5 % CPU.**~~ **FIXED in round F1 (2026-05-10).** Replaced the per-recv `timeout()` with a single pinned `tokio::time::sleep(IDLE)` driven by `tokio::select!`; deadline is reset on a coarse cadence (every 4 096 recvs ≈ ≤15 ms at bench rate) instead of every recv. Removes the per-call timer-wheel `Sleep` allocation + `clock_gettime` chain. **Calibration effect observed**: median avg rose 1.79 → 1.82 GB/s (+1.7 %), max avg 1.82 → 1.85 GB/s, peak max held at 4.48 GB/s — i.e. saved bench CPU went to actual recv drain as predicted, not to apparent peak. Library is unchanged.
+13. ~~**`OrderedBytes::consume` memcpy on the recv path is ~5 % library CPU**~~ **FIXED in round F2 (2026-05-10).** Added `OrderedBytes::consume_bytes(&mut Vec<Bytes>, max_packets) -> ConsumeResult` (zero-copy: each pushed `Bytes` is a refcount view over the recv buffer; carry-over from any prior `consume()` call is prepended cleanly). Wrappers added: `ConnectionBuffer::consume_bytes`, `ReaderRxChannel::read_bytes`, and the public `BluefinConnection::recv_bytes(&mut Vec<Bytes>, max_packets) -> usize`. Existing `recv(&mut [u8])` kept untouched for stack-buffer callers — no API break. Bench server switched to `recv_bytes` with a re-used 16-cap carrier vec. **Throughput unchanged within noise** (15 runs: avg median 1.81 vs F1 1.82; peak max 4.48 vs F1 4.48; bilateral 11/15 vs F1 4/5). Same shape as rounds E and M: removing a copy doesn't move the bench needle when the bench isn't recv-CPU-bound, but the saved ~5 % goes to idle and the profile gets dramatically cleaner. Re-flamegraph the server next — expect `_platform_memmove` to be gone and `bytes::shared_drop` to drop too.
+14. ~~**Per-recv `BytesMut::with_capacity(15200)` in `recv_and_buffer_inline`**~~ **FIXED in round F3 (2026-05-10).** 1-slot recycle stash across iterations: `Option<Bytes>` clone of the just-frozen buffer; next iter calls `try_into_mut()` — succeeds when refcount has dropped to 1 (i.e., the consumer has drained the prior slices), returns the same 15 KiB `BytesMut` allocation; falls back to `with_capacity` if refcount > 1 (slow consumer this round). Same pattern in both `tx_impl` (Linux SO_REUSEPORT path) and `recv_and_buffer_inline` (macOS hot path). Throughput-flat as predicted (server wasn't recv-CPU-bound). Re-flamegraph to confirm `szone_malloc_should_clear` chain is gone.
+15. ~~**Round-N recycle channel is unbounded**~~ **FIXED in round O (2026-05-10).** Bounded the recycle channel to 16 entries and switched the sender to `try_send` so a full channel drops the just-cleared Vec in place. Steady-state cycle is 1:1 so the bound never fires; at process exit there's ≤16 Vecs to drop instead of the previous ~hundreds. Throughput within noise as predicted (5-run sweep: max peak 4.40 vs round-N 4.48; median avg 1.79 vs round-N 1.84; bilateral 4/5 vs round-N 31/40 = 78%). Re-flamegraph the client to confirm the 22% teardown bucket has collapsed.
+16. ~~**`client::run_connection` 5.53 % self-time — cause unconfirmed**~~ **INVALID / FALSE ALARM (2026-05-10).** The post-F1+F2+O client capture confirms the previous "`clock_gettime` storm same family as #12" hypothesis was wrong. The 4.36 % self-time on `client::run_connection::_{{closure}}` (723/862 samples) in the new profile is the bench loop's async state machine + `total_bytes +=` accumulator + `payload.clone()` refcount + `i % SENDS_PER_YIELD == 0` modulo + `yield_now()` bookkeeping. **There are no per-iteration time calls** — only `Instant::now()` once at start and `start.elapsed()` once at end. The only `Timespec::now`/`clock_gettime` chains in the entire client profile (~0.4 % combined) are dtrace-orphaned and almost certainly tokio runtime timer-driver / reactor poll budget, not user code. **Lesson: don't infer call sites from leaf-symbol patterns; verify by reading the code.** This entry is preserved for round-attribution context; do not propose a fix.
+17. ~~**Tokio mpsc list-block alloc/free churn on the client — ~3.5–4 % of total CPU.**~~ **FIXED in round P (2026-05-10).** Both writer mpsc channels swapped to `flume` (data: `mpsc::channel(4096)` → `flume::bounded(4096)`; internal send: `mpsc::unbounded_channel` → `flume::unbounded`). flume uses an array-backed ring buffer with no per-batch list-block alloc. Recycle channel (cap 16, `try_recv` only) left as tokio mpsc — capacity ≤ one tokio block so no churn possible. Throughput-flat as predicted (we were idle-bound, not CPU-bound on the channel) — saved cycles went to idle. Re-flamegraph the client to confirm `Tx::find_block`/`Rx::pop`/`madvise` chains are gone.
 
 ## Last profiling pass
 
-### 2026-05-10 — server flamegraph
+### 2026-05-10 — server flamegraph, **post G3 + F3 + P** (current `flamegraph.svg`)
 
-`flamegraph.svg` at repo root (later overwritten by the client capture below — re-run if you need the raw SVG). ~9 180 samples / ~9 s of one healthy bench connection.
+2 620 leaf samples / shorter healthy bench segment. **Headline: server is now ~65 % kernel I/O + scheduler wait.** Pure-library CPU is <8 % of total, every prior round confirmed by absence, no remaining hotspot above 1.3 %. The server is *empirically not CPU-bound* — further library polish on this side is genuinely without ROI.
 
-Top hotspots, attributed to call sites:
+| Self %  | Symbol                                                       | Caller                                | Verdict                                                |
+|--------:|--------------------------------------------------------------|---------------------------------------|--------------------------------------------------------|
+| **35.80 %** | `kevent`                                                  | tokio I/O driver                      | intrinsic — kernel poll                                 |
+| **18.02 %** | `__psynch_cvwait`                                         | worker park (idle)                    | **idle headroom** — server has lots of spare           |
+| **13.21 %** | `__sendto`                                                | writer (acks)                         | intrinsic — already batched in `read_ack`              |
+| 7.40 %  | `ConnReaderHandler::start::_{{closure}}` self                | recv loop body                        | normal recv work; smaller pie share than before        |
+| 5.73 %  | `__psynch_cvsignal`                                          | cross-thread wakes                    | wake density (lower than post-F1's 5.8+3.4 %)          |
+| 6.71 %  | `mach_absolute_time` (combined three boxes)                  | tokio runtime timer-driver            | runtime-internal; not user-fixable                     |
+| 3.63 %  | `server::run::_{{closure}}::_{{closure}}` self                | bench loop body                       | bench-only; F1 already amortised the per-recv `Sleep`  |
+| **4.12 %** | `OrderedBytes::buffer_in_packet` self (81 + 27 samples)   | `ConnReaderHandler::start` recv path  | ~~G3 target~~ **same absolute count as post-F2 (~104) — see G3 verdict below** |
+| 0.99 % + 0.76 % + 0.76 % = 2.51 %  | `free_small` + `small_free_list_remove_ptr_no_clear` + `_nanov2_free` | various | small-object free                       |
+| 0.80 %  | `bytes::shared_drop`                                          | bench `chunks.drain(..)`              | refcount drop — expected with F2; lower than 1.10 % post-F2 |
+| 0.76 %  | `bytes::promotable_even_clone`                                | recv path                             | refcount bookkeeping                                   |
+| 0.50 %  | `parking_lot::Condvar::wait_until_internal` self              | worker park                           | normal park                                            |
+| **0.04 %** | `szone_malloc_*` + `small_malloc_*` (1 sample total)      | F3 deliverable                        | **F3 confirmed: was ~0.65 % post-F1+F2+O, was ~1.15 % pre-F2 → ~0 %** |
+
+**Confirmed by absence:**
+- `_platform_memmove` was **4.98 %** pre-F2 → **gone**. F2 still working.
+- `BytesMut::with_capacity` malloc chain was **0.65 %** post-F1+F2+O → **0.04 %** (1 sample). **F3 worked.**
+- `Timespec::now` storm under user code was **4.85 %** pre-F1 → still gone. F1 still working.
+- `server::run` self was **6.19 %** pre-F1 → 3.63 % now. F1 still saved ~2.6 %.
+- Process-exit teardown frames: still gone. Round O still working.
+
+**G3 verdict (honest).** `OrderedBytes::buffer_in_packet` self-time went from 81+23=104 samples (1.27 %) post-F2 → 81+27=108 samples (4.12 %) post-G3. *Absolute* sample count is essentially unchanged; the percentage rose because the rest of the pie shrank (more idle, no malloc chain). At ~30K calls/s × ~20 cycles saved per call, the expected absolute saving is ~0.1 % of CPU — **below the noise floor of a 30s bench**. G3 still landed correctly (ASM is provably better) but the bench can't see a sub-0.1 % delta. Lesson: when an optimisation's expected effect is below the bench's resolution, "throughput-flat + same absolute leaf count" *is* the success criterion — the win is the cleaner ASM, not a measurable graph.
+
+**Bottleneck verdict: server is empirically not CPU-bound.**
+- Kernel I/O (`kevent`+`__sendto`) = **49.0 %**
+- Scheduler / wakes (`__psynch_cvwait`+`__psynch_cvsignal`+`Condvar`) = **24.3 %**
+- Pure-library CPU (recv loop + buffer + parsing + drop) = **<8 %**
+- Bench-side overhead = **~3.6 %**
+
+**Implications for the next round:**
+1. **Server-side polish is done.** No remaining frame above 1.3 % is a library bottleneck. Further server CPU wins are mathematically capped at single-digit percent and won't move throughput.
+2. The 35.80 % `kevent` and 13.21 % `__sendto` are genuinely intrinsic (kernel UDP path). The only structural lever is batching syscalls — i.e. **vectorised I/O**. `recvmsg_x` would amortise `kevent` polls across multiple datagrams; `sendmsg_x` ack-batching could compress the 13.21 % `__sendto` chain. Both of these were rounds I/J/K (reverted) and require pacing first.
+3. Re-flamegraph the **client** to verify P's deliverable (Tx::find_block / Rx::pop / madvise chains gone). Server doesn't have the writer's data channel on the hot path so P's effect is invisible here.
+
+### 2026-05-10 — server flamegraph, **post F1 + F2 + O** (historical, retained for round-attribution)
+
+| Self %  | Symbol                                                           | Caller                                  | Verdict                                                         |
+|--------:|------------------------------------------------------------------|-----------------------------------------|-----------------------------------------------------------------|
+| **7.36 %** | `__psynch_cvwait` → `Condvar::wait_until_internal`             | tokio worker park (idle)                | **idle headroom** — server has spare capacity                    |
+| 4.11 %  | `__sendto`                                                       | writer (acks)                           | intrinsic; already batched in `read_ack`                        |
+| 1.91 % + 1.47 % = 3.38 %  | `__psynch_cvsignal` → `Condvar::notify_one_slow` (×2 paths) | cross-thread task wakes      | wake density (was ~5.8 % pre-F1) — fewer timer-wheel arms = fewer wakes |
+| ~2.6 %  | `mach_absolute_time` → `clock_gettime` → `Timespec::now` (truncated, no recoverable parent) | tokio runtime timer-driver / reactor poll budget | **runtime-internal** — not user-fixable                  |
+| **1.27 %** | `OrderedBytes::buffer_in_packet` self (81 + 23 samples)       | `ConnReaderHandler::start` recv path    | candidate G3 (later shipped — see *post-G3+F3+P* capture for honest verdict) |
+| 1.10 %  | `bytes::shared_drop` (91 samples) + `_nanov2_free` (22)          | `server::run` recv (`chunks.drain(..)`) | bench-side `Bytes` refcount drop — expected with F2             |
+| ~0.65 % | `szone_malloc` + `small_malloc_*` chain (54 + 13 + 5 = 72 samples) | `ConnReaderHandler::start` recv loop | **library** — see live bottleneck #14 (down from ~1.15 % pre-F2) |
+| 0.62 %  | `tokio::runtime::io::registration::Registration::readiness::poll` | recv path                              | runtime-internal                                                |
+| 0.36 %  | `tokio::runtime::task::waker::wake_by_val`                       | recv path                              | runtime-internal                                                |
+| 0.16 %  | `bytes::promotable_even_clone`                                   | recv path                              | refcount bump bookkeeping                                       |
+
+**Confirmed by absence (every prior round visible in the profile):**
+- `_platform_memmove` was **4.98 %** pre-F2 → **gone**. Round F2 worked.
+- `server::run` self was **6.19 %** pre-F1 → 1.62 %. Round F1 saved ~4.6 %.
+- `Timespec::now` user-attributable was **4.85 %** pre-F1 → ~0 % under user code (only ~2.6 % remains under tokio runtime, dtrace truncated). Round F1 worked.
+- `Condvar::notify_one_slow` chain was **~5.8 %** pre-F1 → 3.4 %. Free side-effect of F1 — fewer timer-wheel arms → fewer worker wakes.
+- Process-exit teardown frames are **gone** from leaf-rank top-25. Round O worked.
+
+**Decomposition of `ConnReaderHandler::start::_{{closure}}` self-time (467 total, 200 self):**
+- 81 `OrderedBytes::buffer_in_packet`
+- 54 `szone_malloc_should_clear` (per-recv `BytesMut`)
+- 51 `tokio::Registration::readiness::poll`
+- 30 `tokio::task::waker::wake_by_val`
+- 12 `drop_in_place<Drain<BluefinPacket>>`
+- 11 `bytes::shallow_clone_vec`
+- 5 `__recvfrom`
+- the rest <5 each
+
+**Decomposition of `server::run::_{{closure}}::_{{closure}}` self-time (298 total, 134 self):**
+- 91 `bytes::shared_drop` (carrier vec drain)
+- 22 `_nanov2_free`
+- 12 `pthread_mutex_unlock` (mpsc lock release)
+- 12 `Stderr::write_fmt` (per-print log line)
+- 6 `pthread_mutex_lock`
+- 4 `tokio::time::sleep::Sleep::poll` (the new pinned `Sleep`)
+
+**What this tells us about next moves:**
+1. **Server is well-tuned.** Pure-library footprint outside intrinsics is ~3 %. Diminishing returns from continuing here.
+2. **Re-flamegraph the client next.** That's where the producer cap lives. The previous client capture is stale (was for round N + unbounded recycle channel; rounds O / F1 / F2 all change shape).
+3. The two pure-library opportunities left on the server are **G3** (tighten `OrderedBytes::buffer_in_packet`, ~1 % upside) and **F3 / #14** (recv-side `BytesMut` pool, ~0.5–1 % upside, now mechanically possible thanks to F2).
+
+### 2026-05-10 — server flamegraph, **pre-F1+F2+O** (historical, retained for round-attribution)
 
 | Self %  | Symbol                                              | Caller / category                                            | Verdict                                                    |
 |--------:|-----------------------------------------------------|--------------------------------------------------------------|------------------------------------------------------------|
@@ -86,9 +168,107 @@ Top hotspots, attributed to call sites:
 | ~1.15 % | `szone_malloc` + `small_malloc_*`                   | `ConnReaderHandler` recv loop (`BytesMut::with_capacity`)    | **library** — see live bottleneck #14                      |
 | 0.79 %  | `OrderedBytes::buffer_in_packet`                    | `ConnReaderHandler` recv path                                | normal buffer work                                         |
 
-**Calibration after #12.** Once the bench-side `clock_gettime` storm is gone, expect roughly +5–6 % apparent server throughput at the same library cost, because the saved CPU goes to actually draining the recv path. Re-profile after the fix; #13 should then climb the chart proportionally.
+**Calibration after #12.** Once the bench-side `clock_gettime` storm is gone, expect roughly +5–6 % apparent server throughput at the same library cost, because the saved CPU goes to actually draining the recv path. Re-profile after the fix; #13 should then climb the chart proportionally. **→ confirmed in round F1: median avg +1.7 %, peak max held flat — saved CPU went to drain, not to peak. Re-profile shows #13 (`OrderedBytes::consume` memcpy) and #14 (recv `BytesMut`) should now be a larger fraction of the remaining server pie.** **→ second confirmation in the post-F1+F2+O capture above: #13's memmove is gone entirely; #14's malloc chain dropped from ~1.15 % → ~0.65 % (proportionally smaller because total drained CPU also fell). The server is no longer the bottleneck.**
 
-### 2026-05-10 — client flamegraph
+### 2026-05-10 — client flamegraph, **post G3 + F3 + P** (current `flamegraph.svg`)
+
+11 178 total samples / one healthy bench segment. **P delivered exactly what we predicted: tokio mpsc list-block churn is gone.** Two important caveats: (1) this capture has a *much* higher dtrace-orphan rate than the prior client capture (only 2 214 of 11 178 leaves have a recoverable parent — 80 % orphaned), so most apples-to-apples comparisons against pre-P are unsafe; (2) the overall flame is dominated by a single 6.70 % `_platform_memmove` leaf whose parent is unrecoverable — see "honest unknown" below.
+
+**Apples-to-apples deltas (the parts that ARE comparable because they're leaf-attributable in both captures):**
+
+| Bucket                                 | Pre-P (post-F1+F2+O) | Post-P | Δ                                    |
+|----------------------------------------|---------------------:|-------:|--------------------------------------|
+| `tokio::sync::mpsc::list::Tx::find_block` self | 0.20 %       | 0.13 %  + 0.05 % = **0.18 %** | flat — these residual frames are the **ack channel** + **recycle channel** (still tokio mpsc; cap 16 ≤ one block, can't churn) |
+| `tokio::sync::mpsc::list::Rx::pop` self        | 0.16 %       | **0.14 %** | flat — same residuals             |
+| `madvise` + `mvm_deallocate` chains rooted at `Rx::pop` | ~3.5 % | **gone** (residual leaves are orphans, not under any list-block frame) | **−3.5 % ✓** |
+| `flume::Shared<T>::recv` (new)                  | n/a          | 0.91 % total (0.30 % self) | new                                |
+| `drop_in_place<flume::async::SendFut<Bytes>>`   | n/a          | 0.36 % + 0.21 % = **0.57 %** | new — flume's per-send future drop |
+| `flume::Chan::pull_pending`                    | n/a          | 0.13 % + 0.10 % = **0.23 %** | new                                |
+| `drop_in_place<flume::async::RecvFut<…>>`       | n/a          | **0.11 %** | new                                |
+| **Total flume cost (new dependency)**          | n/a          | **~1.06 %** | structural cost                    |
+| **Net channel-CPU saving**                     |              |        | **~3.82 % → ~1.35 % ≈ −2.5 %**    |
+
+**Bucket totals (leaf-only, % of TOTAL=11 178):**
+
+| Bucket                                  | Samples | % of TOTAL |
+|-----------------------------------------|--------:|-----------:|
+| `_platform_memmove`                     |     749 | **6.70 %** |
+| `kevent` (combined)                     |     424 | 3.79 %     |
+| `__recvfrom`                            |     144 | 1.29 %     |
+| `__psynch_cvwait` (idle)                |      85 | 0.76 %     |
+| `__psynch_cvsignal`                     |      40 | 0.36 %     |
+| `mach_absolute_time`                    |      77 | 0.69 %     |
+| malloc leaves                           |     279 | 2.50 %     |
+| free / dealloc leaves                   |     200 | 1.79 %     |
+| pthread_mutex (lock + unlock)           |     175 | 1.57 %     |
+| flume                                   |     118 | 1.06 %     |
+| tokio mpsc list                         |      32 | **0.29 %** ← was 3.82 % pre-P |
+| Idle (parent-chain, park/wait/cvwait)   |     461 | 4.12 %     |
+
+**Honest unknown — the 6.70 % `_platform_memmove` leaf.** Dtrace cannot recover any parent frame for it (`parent: None`); the `WriterHandler::read_data` subtree (644 samples / 5.76 % attributed) does *not* have a memmove child either. Three plausible callers, none provable from this capture alone:
+1. **`serialize_packet_direct`'s `unsafe { copy_nonoverlapping(payload, ...) }`** — at 1500 B × ~250K datagrams/s = ~375 MB/s of payload-into-datagram bytes. *Most likely.* Inlined past dtrace's unwinder.
+2. **`send_data`'s `Bytes::copy_from_slice`** — but the bench client uses `send_bytes_async(payload.clone())` which is refcount-only, so this should be ~0.
+3. **bench loop's payload preparation** — but `payload` is a `Bytes` constructed once outside the loop and `.clone()`d, so no per-iter copy.
+
+**Why we should not chase this in a polish round.** If (1) is right, the only structural fix is **scatter-gather sendmsg_x with iovecs over the payload `Bytes` slices** — i.e., the K′ vectorised-I/O workstream that's already gated on congestion control. A "build the datagram more cheaply" optimisation has no upside because the bytes still need to leave userspace somehow. If (2) or (3) were right we'd see the matching parent symbol; we don't.
+
+**Confirmed by absence:**
+- Teardown rooted at `drop_in_place<UnboundedReceiver<Vec<u8>>>` (the round-N artifact): **gone**. Round O still working.
+- `client::run_connection` self-time was 4.36 % pre-P; now 2.73 % (305/11 178). Lower share, consistent with "less producer-side mpsc work in the bench's tight loop". **Still NOT a `clock_gettime` storm — #16 verdict still stands.**
+- No `Tx::find_block` parented under flume frames — flume genuinely doesn't have per-batch alloc.
+
+**Bottleneck verdict (post-G3+F3+P):**
+- **Both sides empirically not CPU-bound.** The remaining big leaves are kernel I/O (`kevent` 3.79 % client + 35.80 % server, `__sendto`/`__recvfrom`) and an unattributable memmove (6.70 % client) that's most likely the payload-into-datagram copy.
+- All three pure-CPU polish rounds (G3 server, F3 server, P client) shipped throughput-flat as predicted — the bench really is bound elsewhere.
+- The only remaining structural lever is **scatter-gather vectorised I/O** (rounds K′), which would simultaneously: (a) eliminate the 6.70 % datagram-build memmove, (b) compress the 35.80 % server `kevent` poll cost, (c) compress the 13.21 % server `__sendto` ack-write cost. Per user direction it comes after congestion control.
+
+**Capture quirks worth recording for next time.** This run's dtrace orphan rate was much higher than the post-O capture (~80 % vs ~0 %). Possible causes: the `lto = "fat"` + `codegen-units = 1` profile inlines aggressively, and dtrace's user-frame unwinder is unreliable on fully-inlined code. Mitigations to consider for the next capture: temporarily set `[profile.release-flame] inherits = "release"; lto = "thin"; codegen-units = 16; debug = "full"` and use `cargo flamegraph --profile release-flame` to retain symbol boundaries. The flame will be slightly slower but parent-attribution will improve dramatically.
+
+### 2026-05-10 — client flamegraph, **post F1 + F2 + O** (historical, retained for round-attribution)
+
+16 590 leaf samples / ~9 s of one healthy bench connection. **Round O delivered exactly what we predicted: teardown collapsed from 21.9 % → 1.3 %.** The 22 % we previously labelled "steady-state real work" was contaminated by the recycle-channel hoarding — the *true* steady-state share is ~72 %, not 48 %.
+
+| Bucket | Pre-O | Post-O | Δ |
+|---|---:|---:|---|
+| Steady-state work     | 48.3 %         | **71.5 %**     | +23.2 % |
+| Worker idle/park      | 29.8 %         | 27.2 %         | flat |
+| Process-exit teardown | **21.9 %**     | **1.3 %**      | **−20.6 %** ✓ |
+
+**Top steady-state hotspots:**
+
+| Self %  | Symbol / chain                                                       | Caller (when visible)                       | Verdict                                                              |
+|--------:|----------------------------------------------------------------------|---------------------------------------------|----------------------------------------------------------------------|
+| **4.36 %** | `client::run_connection::_{{closure}}` self (723 / 862 samples)   | bench send loop body                        | async state machine + `total_bytes +=` + `payload.clone()` + `yield_now` bookkeeping. **Not a `clock_gettime` storm** (see #16 — false alarm).            |
+| ~3.82 % | `madvise` + `mvm_deallocate_plat` chains (1.59 % + 0.92 % + 0.71 % + 0.52 % + 0.08 %) | mostly dtrace-orphaned; attributable subset → `tokio::sync::mpsc::list::Rx<T>::pop` | **mpsc block alloc/free churn** — see live bottleneck #17 |
+| 1.26 %  | `__recvfrom`                                                         | client recv (acks)                          | intrinsic syscall                                                    |
+| 0.65 %  | `__psynch_cvsignal` → `Condvar::notify_one_slow`                     | cross-task wakes                            | runtime-internal                                                     |
+| 0.59 %  | `_nanov2_free`                                                       | various                                     | small-object free                                                    |
+| 0.46 %  | `_szone_free`                                                        | various                                     | scalable-zone free                                                   |
+| 0.44 %  | `kevent`                                                             | tokio reactor                               | intrinsic                                                            |
+| 0.39 %  | `mach_absolute_time` → `clock_gettime` → `Timespec::now`             | dtrace-orphaned (no recoverable parent)     | runtime-internal — *not* user code (per #16 verification)             |
+| 0.20 %  | `tokio::sync::mpsc::list::Tx::find_block` self                       | client send                                 | mpsc block-alloc (Tx side) — part of #17                             |
+| 0.16 %  | `tokio::sync::mpsc::list::Rx<T>::pop` self                           | writer's `recv_many`                        | mpsc internals                                                       |
+
+**Decomposition of `tokio::sync::mpsc::list::Rx::pop` (3 boxes, 415 samples):** 86 → `mvm_deallocate_plat` (whole-block free), 21 → `free_small`, 14 → `free_small` (madvise). **`Tx::find_block` (4 boxes, ~159 samples):** 17 → `szone_malloc_should_clear` (block alloc).
+
+**Confirmed by absence:**
+- Teardown rooted at `drop_in_place<UnboundedReceiver<Vec<u8>>>` was 21.9 % → 1.3 %. **Round O ✓**
+- `Timespec::now` chains under user code: gone. **#16 was a false alarm** (no `clock_gettime` storm in the bench loop — verified by code reading).
+- Library send hot path (`consume_data_into`, `serialize_packet_direct`, `__sendto` from the spawned sender) still doesn't break 0.5 % anywhere. The send-side library is genuinely tuned out.
+
+**Bottleneck verdict: neither side is CPU-bound.**
+- **Server**: 7.4 % idle + ~3 % library + ~5 % intrinsic = lots of spare.
+- **Client**: 27 % idle + ~4 % bench loop + ~4 % mpsc churn = also lots of spare.
+- **Combined**: 4.48 GB/s peak with both sides ~25–30 % idle on macOS loopback means the cap is **kernel UDP / scheduler / cross-thread wake latency**, not CPU. Wake-from-epoll cost per datagram at ~300K dgrams/s × ~1 µs per wake = ~30 % of capacity gone in syscalls and context switches. That's exactly what vectorised I/O (rounds I/J/K) was supposed to amortise, but it requires application-level pacing to not overrun the recv buffer.
+
+**Candidates for the next round** (in decreasing ROI):
+1. ~~**G3 / OrderedBytes::buffer_in_packet (server, 1.27 %)**~~ **DONE 2026-05-10 (G3)** — `% MAX_BUFFER_SIZE` (non-power-of-2 idiv) replaced with `wrap_index()` branch-and-subtract; throughput-flat as predicted.
+2. ~~**F3 / #14 — recv-side `BytesMut` pool**~~ **DONE 2026-05-10 (F3)** — 1-slot `try_into_mut()` recycle stash on both recv loops; throughput-flat as predicted.
+3. ~~**#17 / switch writer's data mpsc to `flume`**~~ **DONE 2026-05-10 (P)** — both writer mpsc channels swapped (data + internal send); throughput-flat as predicted.
+4. **Pacing + vectorised I/O retry (rounds K')** — *the only structural lever that could push past 4.48 GB/s.* Token bucket calibrated to recv drain rate; pair with `sendmsg_x`/`recvmsg_x` bindings already in [`bluefin/src/utils/macos_io.rs`](../../bluefin/src/utils/macos_io.rs). High effort, real upside. **Per user direction (2026-05-10): comes after congestion control.**
+5. **Stop optimising on this bench.** 4.48 GB/s peak / 1.82 GB/s sustained on macOS loopback is genuinely good. Further wins likely need a different workload or a Linux benchmark where SO_REUSEPORT actually helps. **All three pure-CPU polish rounds (G3 server, F3 server, P client) have shipped throughput-flat — strong evidence the bench is genuinely not CPU-bound on either side.**
+
+### 2026-05-10 — client flamegraph, **pre-O** (historical, retained for round-attribution)
 
 ~15 000 samples / ~9 s of one healthy bench connection. **The headline is striking: roughly half the profile is real work, half is idle/teardown.**
 
@@ -98,7 +278,7 @@ Top hotspots, attributed to call sites:
 | Worker idle/park | 652 | 29.8 % |
 | Process-exit teardown | 478 | **21.9 %** |
 
-**The teardown 22 % is entirely the round-N recycle channel** — every leaf in that bucket roots at `drop_in_place<UnboundedReceiver<Vec<u8>>>` → `drop_in_place<WriterHandler::read_data::{{closure}}>` → `task::core::set_stage` → `task::raw::shutdown`, with `__recvfrom`/`madvise`/`free_small`/`mvm_deallocate_plat` as leaves. The unbounded recycle channel hoards empty 15 KiB Vecs at exit and tokio's task drop frees them serially. See live bottleneck #15.
+**The teardown 22 % is entirely the round-N recycle channel** — every leaf in that bucket roots at `drop_in_place<UnboundedReceiver<Vec<u8>>>` → `drop_in_place<WriterHandler::read_data::{{closure}}>` → `task::core::set_stage` → `task::raw::shutdown`, with `__recvfrom`/`madvise`/`free_small`/`mvm_deallocate_plat` as leaves. The unbounded recycle channel hoarded empty 15 KiB Vecs at exit and tokio's task drop freed them serially. **FIXED in round O (2026-05-10)** — channel bounded to 16 + `try_send`, so post-shutdown teardown should now be ~negligible. Re-capture a client flamegraph to verify.
 
 **Real steady-state hotspots** (filtering out shutdown + idle):
 
@@ -125,6 +305,51 @@ w = float(rect.get(INFERNO + 'w'))
 
 The teardown-vs-steady-vs-idle bucketing is also worth replicating when reading any future client flamegraph: walk each leaf box's parent chain; if any ancestor symbol contains `task::raw::shutdown`, `set_stage`, or `drop_in_place`, that leaf is teardown. If any ancestor contains `park_internal`, `wait_until`, or `cvwait`, it's idle. Otherwise it's real work. On a graceful-exit profile, expect 20-25 % teardown unless #15 is fixed.
 
+## Trends across all rounds (read this before proposing a new round)
+
+A meta-summary across the 22 rounds in the timeline below. **Future rounds will be evaluated against these trends; if a proposal contradicts one, justify it explicitly.**
+
+### Average-throughput trajectory (the headline number)
+
+The "avg" number's *meaning* changed across rounds; understand it before comparing values:
+
+| Era | What "avg" measured | Value range |
+|---|---|---|
+| **pre-`b8c0489` (Tier A)** | client-side send rate, no flush, single-conn | climbed 2.50 → 2.84 → **3.04 GB/s** |
+| **2026-05/#1 → #10** | mixed: client-side send rate (still inflated); some rounds report peak | "+5.6 % client-side", "+65–85 % client-side (was lying)" |
+| **post-D (round D, flush fix) onwards** | server-observed *delivered* per-conn avg, two-conn bench, honest | settled at **~1.76–1.87 GB/s per conn** |
+| **post-F1 onwards (after the bench-only `timeout()` removal)** | same, but server's measurement loop no longer self-throttles | tightened around **~1.82 GB/s per conn** |
+| **post-P canonical (20-run sweep)** | same; n=35 healthy conns | **median 1.82 GB/s, stdev 0.02 (1.1 %)** |
+
+Per-round delivered avg, post-D era only (the comparable window):
+
+```
+D     M     N     O    F1    F2    G3   F3*    P    20-run
+ ~     1.76  1.84  1.79 1.82  1.81  1.82 1.73   1.81 1.82  GB/s avg per conn
+                                          (thermal-drift batch)
+```
+
+**Key observations:**
+
+1. **Avg has been flat at 1.81 ± 0.02 GB/s since round F1.** Six rounds since (F2 G3 F3 P + the 20-run calibration) all landed inside the same ±1 % band — empirical proof the bench is *not* CPU-bound on either side.
+2. **The pre-D climb (2.50 → 3.04 GB/s) was real but on a different metric.** It measured what the client could enqueue, not what the server delivered. After `flush()` made delivered-bytes honest, the headline number *dropped* by ~40 % — *not because anything regressed*, but because the previous numbers were ~40 % air. **Lesson: whenever a calibration round reduces a metric, treat it as a coordinate change, not a regression.**
+3. **Round N (+10 %)** moved avg from 1.76 → 1.84 by fixing a structural bug (the 12-Vec datagram pool was actually allocating fresh every iteration). Every avg-mover since baseline has been a structural bug-fix or a shape change, **never an allocation/copy elimination in isolation**.
+4. **Variance collapsed by ~10× over the same window.** Round F was 2/5 bilateral (40 %) at peak ~4.30. Round 20-run-sweep is 17/20 (85 %) with 1.1 % stdev on avg. The polish rounds delivered no GB/s but they delivered the variance reduction — which is what makes the next round's deliverable measurable.
+
+### Other recurring trends
+
+5. **Six rounds delivered measurable throughput; all six were *shape* changes, not *cycles* changes.** `2e853c7` (buffer pool), `b8c0489` (pipeline parallelism), `#2` (Bytes in mpsc), `#10` (bounded backpressure surfaces honest delivered bytes), `F` (inlined conn_reader = removed task hop), `N` (real recycle channel for the lying pool). Allocation/copy-elimination rounds in isolation (`E`, `M`, `F2`, `F3`, `G3`) all delivered **zero throughput** — they freed CPU that went to idle, because both sides have ~25–30 % idle headroom on macOS loopback. **Rule of thumb**: if your proposal is "save N % CPU" without changing a channel/task/pool boundary, predict throughput-flat in advance.
+
+6. **Foundation rounds compound; measure them in pairs.** `E` (Bytes payload, flat) → unblocked `F` (+12 % peak). `M` (count returned from `consume_data_into`, flat) → unblocked `N` (+10 %). `#1` (`mem::take`, flat) → enabled later recv-side reshaping in `F`. **Don't kill a foundation round for being throughput-flat; check whether it unblocks a downstream shape change.**
+
+7. **Calibration rounds were disproportionately valuable.** `D` (flush), `#10` (bounded), the 20-run sweep — three rounds whose deliverable was *what the number means*, not a faster number. Each exposed a previous round's measurement as wrong (or as a single-sample artefact). **Lesson: numbers are cheap, calibrated numbers are not.**
+
+8. **All proven regressions share one root cause: batching without pacing.** Rounds I (sendmsg_x send-only), J (recvmsg_x recv-only), K (paired vectorised + `yield_now`) all regressed *delivered* throughput because batching trades reduced syscalls for increased per-batch latency without a producer-rate governor; on macOS loopback the recv side overruns. **Vectorised I/O is gated on real flow control / pacing — not the other way around.** This is why CC comes before scatter-gather in the workstream order.
+
+9. **Single-sample maxes drift; medians don't.** Round N hit a 4.48 GB/s peak (single sample in 20 runs); the post-P 20-run sweep tops out at 4.04 GB/s with median 3.85 — every post-N round shipped throughput-flat, so the gap is pure run-to-run / thermal variance. **Honest peak = median of a large sweep**, not a one-shot record.
+
+10. **We have empirically converged on "not CPU-bound on either side."** Server post-G3+F3+P: largest pure-library frame < 1.3 % CPU; ~73 % is kernel/scheduler. Client post-P: largest user-frame is the suspected `_platform_memmove` payload-copy (6.7 %), and it's the *only* remaining structural CPU cost addressable in user space — only by scatter-gather sendmsg_x. **There is no remaining polish round that can plausibly move avg.** The next throughput lever is structural (CC + vectorised I/O), not micro.
+
 ## Historical timeline (commits, what worked)
 
 | Phase | Commit | Throughput | Key change |
@@ -149,8 +374,15 @@ The teardown-vs-steady-vs-idle bucketing is also worth replicating when reading 
 | **2026-05-10** (L) | local | bilateral 7/10 → 8/10 (+1 healthy run); throughput flat (1.87 → 1.82 GB/s avg, 4.00 → 4.04 GB/s peak — within noise) | Bumped requested `SO_RCVBUF`/`SO_SNDBUF` from 8 MB → 32 MB in [`bluefin/src/utils/mod.rs`](../../bluefin/src/utils/mod.rs)'s `get_udp_socket_impl`. **Requires** `sudo sysctl -w kern.ipc.maxsockbuf=33554432 net.inet.udp.recvspace=8388608` on macOS at runtime, otherwise the kernel silently caps the actual buffer at the existing `kern.ipc.maxsockbuf` (8 MB by default). Kept as a small reliability win for the steady-state path. Discovered while investigating round K — the buffer is *not* the binding constraint for paired vectorised I/O on macOS, but it does reduce transient overrun in the per-datagram baseline. |
 | **2026-05-10** (M) | local | flat (median avg 1.76 GB/s, peak 4.09 GB/s, bilateral 15/20 over 10 runs — within round-L noise) | Eliminated the `payload_bytes_in_datagram` per-send walk in [`bluefin/src/worker/writer.rs`](../../bluefin/src/worker/writer.rs). Was: spawned sender task scanned every 20-byte header in the just-formatted ~15 KiB datagram to recover the user-payload count for `pending_bytes`/`flush()` accounting. Now: `consume_data_into` returns `usize` (payload bytes packed; `0` = nothing produced) — the count is computed for free as it already iterates `max_bytes_to_take` per packet. Channel changed from `mpsc::unbounded_channel::<Vec<u8>>` to `mpsc::unbounded_channel::<(Vec<u8>, usize)>` so the sender consumes the count without re-walking. `payload_bytes_in_datagram` kept as `#[allow(dead_code)]` — it's still a useful audit/debug helper, just not on the hot path. Hygiene win: ~750 byte-reads + 750 cmp+adds per datagram removed; bench is bound elsewhere (probably writer→sender mpsc hop + per-conn `connect()`-on-recv-socket from live bottleneck #6) so no measurable Δ surfaces. |
 | **2026-05-10** (N) | local | peak 4.09 → 4.48 GB/s (**+10%**); median peak 3.58 → 3.84 GB/s (**+7%**); median avg 1.76 → 1.84 GB/s (**+5%**); bilateral 15/20 → 31/40 (~flat ~78%); 0 hangs over 20 runs | Closed the "the buffer pool is a lie" gap in [`bluefin/src/worker/writer.rs`](../../bluefin/src/worker/writer.rs)::`read_data`. Was: 12-Vec `datagram_pool` allocated once at startup, but every `mem::replace(&mut datagram_pool[i], Vec::with_capacity(15200))` swapped in a *fresh* allocation and the just-sent vec was dropped by the spawned sender after `try_send` returned `Ok` — i.e. one 15 KiB heap allocation + free per outgoing datagram, regardless of the pool. Now: a second unbounded mpsc channel ships emptied vecs sender → packetiser. Sender's hot loop ends with `datagram.clear(); let _ = recycle_tx.send(datagram);` (clear keeps capacity — `len = 0` write, no realloc). Packetiser's swap line becomes `recycle_rx.try_recv().unwrap_or_else(|_| Vec::with_capacity(15200))` — at steady state the recycle channel always has a Vec ready and the fallback never triggers. Initial pool of 12 + the writer's `mpsc::channel(4096)` cap bound the in-flight vec count; unbounded recycle channel is fine because cycle is 1:1 at steady state. The `read_ack` task uses a similar but already-honest pool (single-task, no cross-task hop, just `pending_send` swap on backpressure) and was left unchanged. The mpsc allocator pressure was apparently a real bottleneck — clean +10% peak with no other shape change. |
+| **2026-05-10** (O) | local | within noise of round N: max peak 4.40 vs 4.48 (5-run sweep); median avg 1.79 vs 1.84; bilateral 4/5 (rd-N 31/40 = 78%) | **Bounded the round-N recycle channel.** `mpsc::unbounded_channel::<Vec<u8>>()` → `mpsc::channel::<Vec<u8>>(16)`; sender's `recycle_tx.send(datagram)` → `recycle_tx.try_send(datagram).ok()`. Pure hygiene — no throughput impact expected or measured. **Why it matters**: the unbounded version hoarded ~hundreds of empty 15 KiB Vecs at process exit (the `mpsc::channel(4096)` writer cap times the per-iteration recycle rate); tokio's task drop freed them serially via `madvise(DONT_NEED)` and they showed up as **21.9% of all leaf samples** in the 2026-05-10 client flamegraph rooted at `drop_in_place<UnboundedReceiver<Vec<u8>>>`. With `try_send`, a full channel drops the just-cleared Vec in place — there is no `await` on the sender side so no deadlock risk. At steady state cycle is 1:1 so the bound never fires; at exit there's ≤16 Vecs to drop. **Lesson**: *always bound recycle channels.* An unbounded mpsc full of large Vecs makes graceful shutdown surprisingly slow, and contaminates every flamegraph capture with teardown-frame noise that crowds out real hotspots. The fix is two-line and free at steady state. |
+| **2026-05-10** (F1, bench-only) | local | median avg 1.79 → 1.82 GB/s (+1.7 %); max avg 1.82 → 1.85 (+1.6 %); peak max 4.40 → 4.48 (within noise); bilateral 4/5 → 4/5 (flat) over 5 runs each | **Killed the per-recv `tokio::time::timeout(2s, conn.recv(...))` storm in [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs).** Was: `timeout()` allocates a fresh `Sleep` per call and registers it on the timer wheel — at ~270K recvs/s = >540K `clock_gettime` calls/s = `server::run::_{{closure}}` self-time 6.19 % + `Timespec::now`/`clock_gettime`/`mach_absolute_time` chains ~4.85 % in the 2026-05-10 server flamegraph (live bottleneck #12). Now: one `tokio::pin!`'d `Sleep` driven by `tokio::select! { recv = conn.recv(...) => ..., _ = idle_sleep.as_mut() => break }`; the deadline is pushed forward via `idle_sleep.as_mut().reset(...)` only every 4 096 iterations (≈15 ms at bench rate). This is the documented tokio idiom for hot loops (`tokio::time::timeout` rustdoc explicitly recommends it). **Calibration effect confirmed**: the saved bench CPU went to actual recv drain (avg +1.7 %) rather than apparent peak (flat) — exactly what the SKILL predicted. Library is unaffected. *Ergonomic trade-off*: idle exit fires within `IDLE + ~15 ms` of last byte instead of the original `IDLE + tokio-tick-resolution`. Acceptable for the bench. **Lesson**: in tokio hot loops, replace `timeout(d, fut).await` with one pinned `Sleep` + `select!` + coarse `reset()`; never re-arm the wheel at I/O rate. |
+| **2026-05-10** (F2) | local | within noise of F1: avg median 1.81 vs F1 1.82 GB/s; peak max 4.48 vs 4.48; bilateral 11/15 (≈73%) vs 4/5 (80%) over 15 vs 5 runs | **Zero-copy `recv_bytes` API; bench server switched.** Added `OrderedBytes::consume_bytes(&mut Vec<Bytes>, max_packets) -> ConsumeResult` (whole-payload `Bytes` slices over the recv buffer — refcount bumps, no memcpy; carry-over from any prior `consume()` is prepended cleanly so the two APIs interoperate). Wrappers: `ConnectionBuffer::consume_bytes`, `ReaderRxChannel::read_bytes`, public `BluefinConnection::recv_bytes(&mut Vec<Bytes>, max_packets) -> usize`. Existing `recv(&mut [u8])` left untouched for stack-buffer callers — no API break. Bench server in [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs) reuses one 16-cap `Vec<Bytes>` across recvs (drain after each call to preserve capacity). **Throughput-flat result is genuinely the expected outcome**: the 4.98 % `_platform_memmove` from the 2026-05-10 server flamegraph is real CPU saved, but the bench's 4.48 GB/s peak is bounded by something other than recv-side library CPU (most likely client send-pipe + kernel UDP path), so the freed cycles go to idle. Same shape as rounds E (`Bytes` payload) and M (`consume_data_into` returns usize): cleanups that don't visibly move the bench but unblock the next profiling pass. **Lesson**: when removing a copy doesn't move the bench, that's evidence the bench was bound elsewhere — *re-flamegraph immediately* to find the new top frame, not iterate on what just got fixed. **Side benefit**: `recv_bytes` is now the recommended hot-path API for any consumer that doesn't need a contiguous `[u8]`; it's strictly cheaper than `recv`. |
+| **2026-05-10** (G3) | local | within noise of F2 on the *cool* runs (2/4/5/7/8/9 → avg median **1.82 vs F2 1.81 GB/s**, peak median 3.68 across 12 conn-samples); thermal drift confirmed in runs 11–15 (avg 1.69–1.81, peak 3.02–3.76 — uniformly slower from sustained CPU load); peak max single sample **3.77** (vs F2's 4.48 baseline median over 20 runs — small-sample size + thermal state explain the gap; sustained avg matches exactly) | **Replaced `% MAX_BUFFER_SIZE` with branch-and-subtract wrap in [`OrderedBytes`](../../bluefin/src/net/ordered_bytes.rs).** `MAX_BUFFER_SIZE = 2000` is **not** a power of two, so `(base + offset) % MAX_BUFFER_SIZE` was emitting a 20–30 cycle `idiv`/`udiv`. Now: a single shared `#[inline(always)] fn wrap_index(base, offset) -> usize` returns `if base + offset >= MAX_BUFFER_SIZE { sum - MAX_BUFFER_SIZE } else { sum }` — ~1–2 cycles. Both call-site invariants give `base + offset < 2 * MAX_BUFFER_SIZE` (`smallest_packet_number_index < MAX_BUFFER_SIZE` is the buffer's own invariant; `offset < MAX_BUFFER_SIZE` is checked above the call site). Used in `buffer_in_packet` (1×), `consume` (3 sites + the `+1` advance), `consume_bytes` (2 sites + the `+1` advance). The `consume*` hot loops also went from **3× wrap-per-iter** to **2× wrap-per-iter** by hoisting `let slot = wrap_index(base, ix);` once after the while-condition (the body's three slot accesses now share one local). Targets the post-F2 `OrderedBytes::buffer_in_packet` self-time of 1.27 % (largest pure-library frame on the server). **Throughput-flat as predicted** for a profile-cleanup round (recv side wasn't the binding constraint; saved cycles go to idle). 50/50 tests pass. **Lesson**: when a circular-buffer modulus is **not** a power of two, `%` compiles to a real division — replace with `if x >= N { x - N } else { x }` after proving `x < 2N`. Compounding: hoist the wrap once per iteration whenever a hot loop indexes the same slot multiple times. Either change alone wins; both is free. *(Nudge for future-me: changing `MAX_BUFFER_SIZE` to 2048 would let the compiler auto-strength-reduce `% 2048` → `& 2047` and need no helper, but it's a buffer-size semantic change. The branch trick preserves semantics, which is why it shipped instead.)* |
+| **2026-05-10** (F3) | local | within thermal-drift noise of G3: avg median **1.73 vs G3 cool 1.82 GB/s** over 4 healthy runs (2/3/5/7), peak median **3.30 vs G3 cool 3.68**; peak max single sample **3.91 — actually higher than G3's 3.77** (consistent with "less per-recv work → faster bursts"); avg drop matches the same thermal-drift envelope as G3's runs 11–15 because the bench was run back-to-back after G3's 15-run sweep | **1-slot recv-buffer recycle in [`worker/conn_reader.rs`](../../bluefin/src/worker/conn_reader.rs).** Both recv loops (`tx_impl` for the Linux SO_REUSEPORT path and `recv_and_buffer_inline` for the macOS hot path) now keep a `let mut recycle: Option<Bytes> = None;` across iterations. Each iter: `recycle.take().map(try_into_mut)` returns the prior 15 KiB `BytesMut` allocation when refcount has dropped to 1 (we're the only holder); else fall back to `BytesMut::with_capacity(MAX)`. After freeze, stash one refcount via `recycle = Some(frozen.clone())` so next iter has something to attempt to reclaim. Targets the post-F1+F2+O `BytesMut::with_capacity` malloc chain at ~0.65 % server CPU (live bottleneck #14). **Why a single slot, not a channel + custom Drop**: a 1-slot stash needs ~0 lines of supporting code (no `from_owner`, no recycle channel, no extra alloc per recv — `from_owner` would add ~24–48 B per recv to wrap the owner) and matches the bench's actual workload (consumer drains synchronously after each `recv_bytes`, so by the time the loop comes back the prior slices are gone and `try_into_mut` succeeds). **Why the clone happens BEFORE `from_bytes_into`**: `from_bytes_into(buf: Bytes, ...)` takes `frozen` by value; we have to clone first or we can't stash. The clone is one atomic increment — cheap. **Throughput-flat as predicted** — we were not recv-CPU-bound. **Lesson**: `Bytes::try_into_mut()` is a free recycling primitive when you can hold one extra refcount across the buffer's lifetime. Cheaper than `Bytes::from_owner` + recycle channel, and the bounded-memory cost (one extra buffer-lifetime per task) is negligible for any reasonable channel pattern. **Next:** re-flamegraph the server to confirm `BytesMut::with_capacity` chain is gone; if so, this completes the server-side polish. |
+| **2026-05-10** (P) | local | back at full G3-cool baseline after the F3 thermal-drift batch: 16 healthy conn-samples (8/10 bilateral runs) gave **avg median 1.81 GB/s, max 1.84**; **peak max 3.90 GB/s**, median 3.73 — cleanly above F3 (3.91 was the F3 max with thermal noise) and at the F2 cool ceiling, ~13 % below the F2 absolute max of 4.48 (a 20-run high) | **Round P / live bottleneck #17 — swapped both writer mpsc channels in [`worker/writer.rs`](../../bluefin/src/worker/writer.rs) to `flume`.** Channel #1 (`Sender<Bytes>` / `mpsc::channel(4096)` → `flume::bounded(4096)`): the 10M-sends-per-conn data path. Channel #2 (`mpsc::unbounded_channel::<(Vec<u8>, usize)>()` → `flume::unbounded()`): the internal packetiser → sender hop, ~250K crossings per conn. Both were ringing tokio's `list::Tx::find_block` / `Rx::pop` for a 32-slot list-block alloc/free every 32 messages — ~3.82 % of client CPU on the post-O capture (madvise + mvm_deallocate_plat chains, mostly dtrace-orphaned but the chain shape matches the parented ones). Channel #3 (`mpsc::channel::<Vec<u8>>(16)` recycle, `try_recv` only) left as tokio mpsc — capacity 16 ≤ one tokio block, no churn possible. API mapping: `try_send` direct, `send().await` → `send_async().await`, `recv_many(b, 20).await` reconstructed as `recv_async().await` + `try_recv()` loop until depth or empty (flume has no native batched-recv). Receivers in flume are `Send + Sync` and don't need `&mut` — dropped the `mut` qualifier on `read_data`'s `rx`. **Throughput-flat as predicted (`#17` was 3.5 % of client CPU but both sides are ~25–30 % idle on macOS loopback)** — saved cycles go straight to idle, not to GB/s. The deliverable is the missing mpsc-list-block churn on the next client flamegraph. Bench is *visibly cleaner* than F3 (back at the G3-cool envelope after F3's thermally-drifted batch) which is consistent with "less producer-side work in the bench's tight loop". 50/50 tests pass. New dependency: `flume = "0.11"` (default-features = false, +async only) — ~30 KB compiled, no proc-macros. **Lesson**: when a hot-path mpsc shows `Tx::find_block`/`Rx::pop`/`madvise` chains in the profile, the structural fix is an array-backed channel. flume's drop-in: `flume::{bounded,unbounded}` + s/`send().await`/`send_async().await`/g + reconstruct `recv_many` as 1×`recv_async()` + N×`try_recv()`. The swap is mechanical. Whether it moves throughput depends on whether you were CPU-bound on the channel — if you were idle-bound (we were), expect throughput-flat + a cleaner profile. Don't expect the swap to magically unlock anything. |
+| **2026-05-10** (20-run sweep, post-P canonical) | local; `bench_logs/sweep_20260510_201419/` | 20 runs of `bench_run_with_timeout.sh 30`. Bilateral healthy 17/20 (85 %). Healthy-conn population (n=35): **avg median 1.82 GB/s** (min 1.73, p25 1.80, p75 1.83, max 1.84, mean 1.81, **stdev 0.02 = 1.1 %**); **peak median 3.85 GB/s** (min 3.20, p25 3.76, p75 3.90, max 4.04, mean 3.82, stdev 0.16). 0 wallclock timeouts. Sender-side rate (healthy n=35) median **2.75 GB/s** (stdev 0.04) — pre-flush, expected lower than server-observed avg because clients enqueue faster than the writer can drain. | **No code change — calibration sweep.** Largest single sweep since baseline. Sustained-avg distribution is now extremely tight (1.1 % stdev on healthy conns), which is the polish-rounds story end-to-end: every round from O onward has either tightened the distribution or moved cycles from CPU to idle without moving throughput. The 3 unhealthy runs were: (1) run 1 — server log missing FINAL but client #0 sent successfully (suspected `pkill -9` race in the wrapper itself, not a regression); (2) run 5 — conn 1 truncated to 5.4 GB at FINAL (server's idle-2s timeout fired before client #1 had drained; this is the live bottleneck #11 starvation pattern, ~5 % across 35 conns); (3) run 13 — both conns truncated mid-run (server early-exit; cause unclear from logs, no panic backtrace recovered, single occurrence). **Lesson**: with 20 runs the distribution finally separates from noise — bilateral 17/20 (85 %) is a stable healthy-rate metric you can compare across rounds. Smaller sweeps (5–10 runs) bilateral % is noisy enough to mislead. **Use this distribution as the canonical post-polish reference.** |
 
-**Total documented gain**: 2.50 → ~4.48 GB/s peak (single conn, two-process bench) = **+79%** since baseline. Sustained per-conn `avg` ~1.84 GB/s (median over 20 paired runs).
+**Total documented gain**: 2.50 GB/s baseline (`origin/main`) → 1.82 GB/s sustained per-conn / **3.85 GB/s median peak per-conn / 4.04 GB/s max peak / 4.48 GB/s historical max**, single 1500 B payload, 2-conn loopback bench. **Sustained per-conn +47 % / median peak +54 % vs baseline.** Reference distribution: 20-run sweep `bench_logs/sweep_20260510_201419/` (n=35 healthy conns, stdev 0.02 GB/s on sustained avg — 1.1 % run-to-run noise after polish). Rounds O / F1 / F2 / G3 / F3 / P (hygiene + per-call CPU savings) all shipped throughput-flat as predicted — the bench is empirically not CPU-bound on either side; saved cycles went to idle.
 
 ## What's already implemented (don't re-propose)
 
@@ -236,10 +468,13 @@ Implementation details and rationale are in [`docs/archive/`](../../docs/archive
 - **macOS UDP recv buffer is hard-capped at `kern.ipc.maxsockbuf`** (default 8 MB; bump with `sudo sysctl -w kern.ipc.maxsockbuf=33554432 net.inet.udp.recvspace=8388608`). At 5 GB/s drain, 8 MB is **1.6 ms of buffering** — any pause longer than that drops UDP datagrams silently. The socket-creation path in [`bluefin/src/utils/mod.rs`](../../bluefin/src/utils/mod.rs) requests 32 MB; it only takes effect after the sysctl bump.
 - **`socket.try_send` swallows `ECONNREFUSED`; `sendmsg_x` does not.** Any future vectorised-send experiment must either propagate the error to a `BluefinError::ConnectionLost` *or* drain `pending_bytes` and continue — returning from the spawned sender task hangs `flush()` because new enqueues accumulate without a consumer. (Round K, 2026-05-10.)
 - **Vectorised I/O must be paired**. A reader-side batch (`recvmsg_x`) wins only when the writer also bursts; otherwise each call returns 1 datagram and pays the per-call setup overhead (round J: −9 % avg, −21 % peak). A writer-side batch (`sendmsg_x`) without a faster reader just exposes recv-buffer drops faster (round I: 75 % loss). Land them together — with pacing.
+- **Thermal drift inflates apparent regressions on small post-bench sweeps.** A 5-run sweep started immediately after a heavy bench session (e.g. a multi-N smoke test or a flamegraph capture) will read **~5–10 % low on peak** and may show 1–2 fewer bilateral-healthy runs than canonical. *Avg is much more stable* (typical drift <2 %). When investigating a suspected regression: (1) cool down for ~2 min; (2) insert ~8 s gaps between runs; (3) compare against the same metric on the same sweep size. Confirmed 2026-05-10 post N-parameterisation: warm 5-run peak median 3.56 → cool 5-run peak median 3.79 (canonical 20-run is 3.85), avg 1.82 across all three. **Avg-flat is the canonical "no regression" signal**; small-sweep peak deltas need cooldown verification before trusting. (Originally surfaced in rounds G3 → F3, recorded as a meta-rule here for next-time discipline.)
 
 ## Benchmarking protocol
 
 The benchmark binaries were updated 2026-05-09 to add an idle timeout, instantaneous-throughput reporting, a `--task <ix>` per-process mode, and explicit error reporting on `connect()` / task-join failures. See [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs) and [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs).
+
+> **Cooldown discipline.** *Always cool down (~2 min idle, or 8 s gaps between runs) before treating a small-sweep peak drop as a regression.* Thermal effects are the #1 source of false-positive "regression" signals on this machine — a 5-run sweep right after a heavy session reads ~5–10 % low on peak and 1–2 bilateral conns short. Avg-flat is the canonical no-regression signal; it's much more stable than peak. See tactical rules above and the post-N-change verification dataset (2026-05-10) for the worked example.
 
 **Pick by intent — there are two scripts:**
 
@@ -264,10 +499,23 @@ The benchmark binaries were updated 2026-05-09 to add an idle timeout, instantan
 **`bench_run_with_timeout.sh` (single shot, hard cap; assumes you've already `cargo build --release`):**
 
 ```bash
-./bench_run_with_timeout.sh             # 30 s wall-clock cap (default)
-./bench_run_with_timeout.sh 25          # 25 s cap; what we used for the round-J/K sweeps
-# Logs land in bench_logs/<timestamp>_to/{server,c0,c1}.log
+./bench_run_with_timeout.sh             # 30 s wall-clock cap, 2 conns (default)
+./bench_run_with_timeout.sh 25          # 25 s cap, 2 conns; what we used for the round-J/K sweeps
+./bench_run_with_timeout.sh 30 3        # 30 s cap, 3 conns (passes 3 to the server's argv[1])
+./bench_run_with_timeout.sh 30 5        # 30 s cap, 5 conns (max = DEFAULT_PORTS in client.rs)
+# Logs land in bench_logs/<timestamp>_to/{server,c0,c1,...}.log
 ```
+
+**N-connection observations (smoke-tested 2026-05-10, post-P):**
+
+| N | per-conn avg (GB/s) | per-conn peak (GB/s) | aggregate avg (GB/s) | starvation? |
+|--:|--------------------:|---------------------:|---------------------:|:-----------:|
+| 1 | 2.13                | 3.95                 | 2.13                 | none        |
+| 2 | 1.82 / 1.81         | 3.75 / 3.85          | ~3.6                 | none        |
+| 3 | 1.71–1.73           | 2.74–3.95            | ~5.2                 | conn #2 truncated to 12 GB |
+| 5 | 0.01–1.10 (server-observed)  | 0–3.53           | ~10 (clients sent 75 GB total) | severe — 4 of 5 conns stalled at <1 GB delivered before the 2 s idle fired |
+
+The sharp cliff at N≥3 is **not** new — it surfaces live bottlenecks #6 (per-connection `connect()`-ed socket defeats `SO_REUSEPORT` on Linux and isn't fanned across cores on macOS either) and #11 (server has 3 reader workers; once recv falls behind the kernel UDP queue, the per-conn 2 s idle deadline fires before the client's `flush().await` completes). **N=2 is the canonical bench because it stresses send-side parallelism without crossing the recv-starvation cliff.** Higher N is useful for stressing scaling specifically (e.g. validating a future change to the per-conn socket model).
 
 **The 10-run sweep pattern (round-J/K dataset, 2026-05-10):**
 

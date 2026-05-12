@@ -73,7 +73,7 @@ Per connection, there are two shared buffers, both `Arc<Mutex<...>>`, bundled as
 | `ConnectionBuffer` ([`net/connection.rs`](../../bluefin/src/net/connection.rs)) | Ordered data bytes (via inner `OrderedBytes`) + handshake packet slot + addr + waker | `ConnReaderHandler` (data) / `ReaderTxChannel` (handshake) | `ReaderRxChannel::read` (data) / `HandshakeConnectionBuffer` (handshake) |
 | `AckBuffer` ([`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs)) | A `SlidingWindow` of received ack packet numbers + waker | `ConnReaderHandler` (ack packets) | `AckConsumer` (currently a no-op consumer) |
 
-`OrderedBytes` ([`net/ordered_bytes.rs`](../../bluefin/src/net/ordered_bytes.rs)) is a circular array of `Option<BluefinPacket>` indexed by packet number, with a `carry_over_bytes: Option<Vec<u8>>` for partial consumes.
+`OrderedBytes` ([`net/ordered_bytes.rs`](../../bluefin/src/net/ordered_bytes.rs)) is a circular array of `Option<BluefinPacket>` indexed by packet number, with a `carry_over_bytes: Option<Bytes>` for partial consumes. The whole pipeline carries payloads as `bytes::Bytes` slices over a single per-recv `BytesMut` allocation — see [bluefin-performance](../bluefin-performance/SKILL.md) round E.
 
 `ConnectionManager = dashmap::DashMap<(src_conn_id, dst_conn_id), ConnectionManagedBuffers>` — lock-free routing from packet → buffer.
 
@@ -87,7 +87,7 @@ Each *connection* additionally spawns:
 
 - **One `ConnReaderHandler`** ([`worker/conn_reader.rs`](../../bluefin/src/worker/conn_reader.rs)) on a *new* connected UDP socket. Spawns N tx tasks (1 on macOS, num_cpus on Linux) that `recv` and forward parsed packets via mpsc to one `rx_impl` task that buffers them.
 - **One `WriterHandler`** ([`worker/writer.rs`](../../bluefin/src/worker/writer.rs)) with two children:
-  - `read_data` task: receives `Bytes` payloads from user, packetizes into datagrams, hands off to a *third* spawned task that does the actual `socket.try_send`. The user-facing channel is `mpsc::channel(4096)` (bounded — ~6 MiB cap, ~since 2026-05/#10); enqueueing carries an owned `Bytes` (refcount bump, not a copy, ~since 2026-05/#2).
+  - `read_data` task: receives `Bytes` payloads from user, packetizes into datagrams, hands off to a *third* spawned task that does the actual `socket.try_send`. The user-facing channel is `flume::bounded(4096)` (bounded — ~6 MiB cap; swapped from `tokio::sync::mpsc::channel(4096)` in 2026-05/P to eliminate per-32-message list-block alloc/free churn); enqueueing carries an owned `Bytes` (refcount bump, not a copy, ~since 2026-05/#2).
   - `read_ack` task: receives `AckData` records, builds ack-only datagrams, sends directly with `try_send` (no second hop). Ack channel is unbounded — low-volume, no need to add a new failure mode.
 - **One `AckConsumer`** ([`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs)) that wakes on every ack batch and writes `largest_recv_acked_packet_num` (currently no readers — dead code, kept for future retransmission).
 
@@ -110,11 +110,23 @@ BluefinConnection {
     async fn send_bytes_async(&mut self, Bytes) -> BluefinResult<usize>
 
     async fn recv(&mut self, &mut [u8], len: usize) -> BluefinResult<usize>
+
+    // Zero-copy variant: pushes whole-payload `Bytes` slices into `out`
+    // (refcount views over the recv buffer — no memcpy). Strictly cheaper
+    // than `recv` for any consumer that doesn't need a contiguous `[u8]`.
+    // Added 2026-05/F2.
+    async fn recv_bytes(&mut self, out: &mut Vec<Bytes>, max_packets: usize)
+        -> BluefinResult<usize>
+
+    // Awaits until every byte previously handed to send/send_bytes/send_bytes_async
+    // is on the wire. Cheap to call; returns immediately if nothing pending.
+    // Added 2026-05/D.
+    async fn flush(&self) -> BluefinResult<()>
 }
 ```
 
 The sync `send`/`send_bytes` variants enqueue into the writer's bounded
-`mpsc::Sender<Bytes>` (cap 4096) and return immediately; the actual UDP send
+`flume::Sender<Bytes>` (cap 4096) and return immediately; the actual UDP send
 happens later on a worker task. If the queue is full (slow consumer or stalled
 socket), they return `BluefinError::WriteError`. The async `send_bytes_async`
 awaits the channel slot instead of failing — use it on the hot path of bursty

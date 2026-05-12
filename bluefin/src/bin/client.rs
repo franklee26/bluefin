@@ -19,6 +19,25 @@ const SERVER_PORT: u16 = 1318;
 /// an explicit yield the only scheduling point per task is the periodic sleep.
 const SENDS_PER_YIELD: usize = 256;
 
+/// Default number of 1500-byte payloads each connection sends in the main
+/// payload loop. 10 M = 15 GB of application data per conn, which is the
+/// canonical bench target on dev hardware.
+///
+/// CI overrides this via `BLUEFIN_NUM_SENDS` because hosted macos-latest
+/// runners can't sustain enough throughput to deliver 15 GB inside the
+/// server's recv-idle window. CI ships ~500 K (= 750 MB) so conns finish
+/// naturally instead of being TRUNCated by the timeout. Production traffic
+/// is unaffected unless the env var is explicitly set.
+const DEFAULT_NUM_SENDS: usize = 10_000_000;
+
+fn num_sends() -> usize {
+    env::var("BLUEFIN_NUM_SENDS")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_NUM_SENDS)
+}
+
 /// CLI:
 ///   client                    -> spawn 2 tasks in this process (default, like before)
 ///   client --task <ix>        -> spawn ONE task using DEFAULT_PORTS[ix].
@@ -134,8 +153,14 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
     // payloads that the writer hasn't shipped yet.
     let payload: Bytes = Bytes::from_static(&[0u8; 1500]);
     let start = Instant::now();
-    const NUM_SENDS: usize = 10_000_000;
-    for i in 0..NUM_SENDS {
+    let n_sends = num_sends();
+    if n_sends != DEFAULT_NUM_SENDS {
+        eprintln!(
+            "(client #{}) NUM_SENDS overridden via env: {} (default {})",
+            task_ix, n_sends, DEFAULT_NUM_SENDS,
+        );
+    }
+    for i in 0..n_sends {
         total_bytes += conn.send_bytes_async(payload.clone()).await?;
         // Yield often enough that other tasks (the other connection, the
         // writer pump, the reader, etc.) can actually run. Without this, a
@@ -157,7 +182,7 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
     let mb_per_sec = (total_bytes as f64 / elapsed) / 1e6;
     eprintln!(
         "(client #{}) sent {} bytes ({} sends) in {:.3} s ~ {:.2} mb/s",
-        task_ix, total_bytes, NUM_SENDS, elapsed, mb_per_sec
+        task_ix, total_bytes, n_sends, elapsed, mb_per_sec
     );
 
     Ok(())

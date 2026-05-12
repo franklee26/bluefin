@@ -176,6 +176,33 @@ The server's FINAL line reports `bytes / elapsed`, where `elapsed` is computed a
 
 Filtering to GOOD conns only (≥ `GOOD_CONN_MIN_BYTES` delivered) is still the right gate strategy because TRUNC conns deliver too few bytes for *any* avg to be meaningful, regardless of whether the divisor is corrected.
 
+### Pathology 4: hosted-runner allocation has a long left tail
+
+This was the lesson that took the most iterations to fully internalise. We initially modelled hosted `macos-latest` as **bimodal** (two modes: "normal ~8/10 good" and "bad ~3/10 good"), and built around the assumption that one retry would clear a bad allocation. Multiple CI runs in the 2026-05-11 window proved that wrong:
+
+| run snapshot | aggregate good/total | shape |
+|---|---:|---|
+| typical day | 8–10 / 10 | normal |
+| moderate contention | 3–5 / 10 | "bimodal" mode |
+| **observed catastrophic days** | **1–3 / 10** even after 12–14 attempts across 5 runs | long left tail |
+
+What we learned about the catastrophic mode specifically:
+
+1. **It's not always "noisy neighbour for one attempt"** — in the worst-observed runs, *every* attempt across 5 runs was degraded. Retrying gives diminishing returns once the runner is in a sustained pathological state; the 2nd and 3rd retries hit the same starvation as the 1st.
+
+2. **It splits into two distinct sub-failures by `raw_max_peak`:**
+   - **Total starvation** (`raw_peak < 0.5 GB/s`): recv loop barely scheduled, no amount of timeout/retry tuning rescues it. The runner is genuinely too contended to make progress.
+   - **Bursty starvation** (`raw_peak 2–3 GB/s` but conn TRUNCs anyway): peer *can* push bytes when scheduled, but stalls > recv-idle timeout mid-stream. **This one IS fixable** by raising `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` (10 → 20 s reduced TRUNC rate measurably; bursts up to 5–10 s have been observed mid-stream).
+
+3. **Reader-worker count matters more than expected on 3-vCPU runners.** Going from `set_num_reader_workers(3)` → `2` dropped the catastrophic-allocation rate noticeably without affecting steady-state throughput (reader workers are only on the handshake hot path; data flows through the per-conn socket). On a 3-vCPU runner, every hot thread you add is competing against tokio worker threads + per-conn tasks + the second bench process.
+
+4. **`good_conns` had to be reframed.** It was originally trying to gate two things — protocol liveness AND runner reliability — but the second is fundamentally adversarial noise. It's now a **light liveness gate** (≥ 2 of 10) that pairs with the GOOD-only throughput floors. The throughput floors gate against real perf regressions; `good_conns` only catches the pathological case where bluefin can't complete *any* end-to-end transfer.
+
+**Heuristic for triaging a CI failure:**
+- `good_conns` failed but `mean_avg` / `max_peak` clear easily on the conns that did succeed → almost always runner-allocation noise. Re-run the job once before investigating code.
+- `mean_avg` or `max_peak` failed (with ≥ 1 GOOD conn to measure) → real perf regression suspect. Bisect.
+- Both failing with `raw_peak < 0.5 GB/s` everywhere → full runner outage. Wait it out or move job off `macos-latest`.
+
 ## Ratcheting up after a perf gain
 
 After a confirmed gain (typically: a successful round of optimisations recorded in `bluefin-performance`'s round table, with a fresh local sweep), tighten the floors:

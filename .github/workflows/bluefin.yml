@@ -220,7 +220,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup update stable
+        run: |
+          if command -v rustup &>/dev/null; then
+            rustup update stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Build release binaries

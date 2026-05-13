@@ -46,6 +46,16 @@ impl BluefinSecurityFields {
             header_protection_mask,
         }
     }
+
+    #[inline]
+    pub fn encrypted(&self) -> bool {
+        self.header_encrypted
+    }
+
+    #[inline]
+    pub fn mask(&self) -> u8 {
+        self.header_protection_mask
+    }
 }
 
 impl Serialisable for BluefinSecurityFields {

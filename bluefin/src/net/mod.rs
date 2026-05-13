@@ -27,6 +27,58 @@ pub(crate) const MAX_BLUEFIN_PACKETS_IN_UDP_DATAGRAM: usize = 10;
 pub(crate) const MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM: usize = MAX_BLUEFIN_PACKETS_IN_UDP_DATAGRAM
     * (BLUEFIN_HEADER_SIZE_BYTES + MAX_BLUEFIN_PAYLOAD_SIZE_BYTES);
 
+// ---------------------------------------------------------------------------
+// Diagnostic events (opt-in, zero cost when disabled)
+// ---------------------------------------------------------------------------
+
+/// Events emitted by the Bluefin runtime when an optional diagnostic channel
+/// is wired up. The channel is `Option<flume::Sender<DiagnosticEvent>>` so
+/// there is zero overhead when diagnostics are disabled.
+#[derive(Debug, Clone)]
+pub enum DiagnosticEvent {
+    /// We received ACK packets from the peer (the peer is acknowledging
+    /// data we sent). `base_packet_num` is the first packet number in the
+    /// contiguous range and `count` is how many packets were acknowledged.
+    AckReceived {
+        base_packet_num: u64,
+        count: usize,
+    },
+    /// We sent an ACK to the peer (acknowledging data we received).
+    /// `base_packet_num` + `count` describe the contiguous range we acked.
+    AckSent {
+        base_packet_num: u64,
+        count: usize,
+    },
+    /// Data packets were serialized and queued for sending.
+    /// `start_packet_num` is the first packet number assigned;
+    /// `num_packets` is how many packets were created; `num_bytes` is the
+    /// total user-payload bytes packed.
+    DataSent {
+        start_packet_num: u64,
+        num_packets: u64,
+        num_bytes: usize,
+    },
+    /// Data packets were consumed from the receive buffer.
+    /// `base_packet_num` is the first packet number in the consumed range;
+    /// `num_packets` is how many packets were consumed; `num_bytes` is the
+    /// total payload bytes delivered.
+    DataReceived {
+        base_packet_num: u64,
+        num_packets: usize,
+        num_bytes: usize,
+    },
+}
+
+pub(crate) type DiagSender = flume::Sender<DiagnosticEvent>;
+
+/// Best-effort send: if the channel is full or disconnected we silently drop.
+#[inline]
+pub(crate) fn diag_try_send(tx: &Option<DiagSender>, event: DiagnosticEvent) {
+    if let Some(ref sender) = tx {
+        let _ = sender.try_send(event);
+    }
+}
+
 /// Implemented by every buffer type that owns an `Option<Waker>` and is
 /// shared between a producer task and a consumer task via `Arc<Mutex<...>>`.
 ///
@@ -57,6 +109,7 @@ pub(crate) trait Wakeable {
 pub(crate) struct ConnectionManagedBuffers {
     pub(crate) conn_buff: Arc<Mutex<ConnectionBuffer>>,
     pub(crate) ack_buff: Arc<Mutex<AckBuffer>>,
+    pub(crate) diag_tx: Option<DiagSender>,
 }
 
 /// Helper to build `num_tx_workers` number of tx workers to run.

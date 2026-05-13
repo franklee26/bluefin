@@ -12,10 +12,10 @@ use super::{
     build_and_start_ack_consumer_workers, build_and_start_conn_reader_tx_channels,
     get_connected_udp_socket,
     ordered_bytes::{ConsumeResult, OrderedBytes},
-    AckBuffer, ConnectionManagedBuffers, Wakeable,
+    AckBuffer, ConnectionManagedBuffers, DiagSender, DiagnosticEvent, Wakeable,
 };
 use crate::{
-    core::packet::BluefinPacket,
+    core::{header::BluefinSecurityFields, packet::BluefinPacket},
     worker::{reader::ReaderRxChannel, writer::WriterHandler},
 };
 use bluefin_proto::context::BluefinHost;
@@ -257,6 +257,9 @@ pub struct BluefinConnection {
     pub dst_conn_id: u32,
     reader_rx: ReaderRxChannel,
     writer_handler: WriterHandler,
+    diag_rx: Option<flume::Receiver<DiagnosticEvent>>,
+    version: u8,
+    security_fields: BluefinSecurityFields,
 }
 
 impl BluefinConnection {
@@ -268,7 +271,18 @@ impl BluefinConnection {
         ack_buffer: Arc<Mutex<AckBuffer>>,
         dst_addr: SocketAddr,
         src_addr: SocketAddr,
+        diag_tx: Option<DiagSender>,
     ) -> Self {
+        // If diagnostics are enabled, create a bounded channel. The tx half
+        // goes into the internal workers (ConnReaderHandler + ReaderRxChannel);
+        // the rx half stays on the connection for the caller to poll.
+        let (diag_tx_workers, diag_rx) = if diag_tx.is_some() {
+            let (tx, rx) = flume::bounded::<DiagnosticEvent>(256);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
         build_and_start_ack_consumer_workers(1, Arc::clone(&ack_buffer));
         let s = get_connected_udp_socket(src_addr, dst_addr);
         if let Err(e) = s {
@@ -282,6 +296,7 @@ impl BluefinConnection {
             src_conn_id,
             dst_conn_id,
         );
+        writer_handler.diag_tx = diag_tx_workers.clone();
         if let Err(e) = writer_handler.start() {
             panic!("Cannot start connection due to error: {:?}", e);
         }
@@ -289,17 +304,25 @@ impl BluefinConnection {
         let conn_bufs = Arc::new(ConnectionManagedBuffers {
             conn_buff: Arc::clone(&conn_buffer),
             ack_buff: Arc::clone(&ack_buffer),
+            diag_tx: diag_tx_workers.clone(),
         });
 
         let _ = build_and_start_conn_reader_tx_channels(Arc::clone(&conn_socket), conn_bufs);
 
-        let reader_rx = ReaderRxChannel::new(Arc::clone(&conn_buffer), writer_handler.clone());
+        let reader_rx = ReaderRxChannel::new(
+            Arc::clone(&conn_buffer),
+            writer_handler.clone(),
+            diag_tx_workers,
+        );
 
         Self {
             src_conn_id,
             dst_conn_id,
             reader_rx,
             writer_handler,
+            diag_rx,
+            version: 0x0,
+            security_fields: BluefinSecurityFields::default(),
         }
     }
 
@@ -378,5 +401,25 @@ impl BluefinConnection {
     #[inline]
     pub async fn flush(&self) -> BluefinResult<()> {
         self.writer_handler.flush().await
+    }
+
+    /// Returns a reference to the diagnostic event receiver, if one was
+    /// wired up at connection time. Use `try_recv()` to poll for events
+    /// without blocking.
+    #[inline]
+    pub fn diag_rx(&self) -> Option<&flume::Receiver<DiagnosticEvent>> {
+        self.diag_rx.as_ref()
+    }
+
+    /// Protocol version negotiated for this connection.
+    #[inline]
+    pub fn version(&self) -> u8 {
+        self.version
+    }
+
+    /// Security fields (encrypted flag + header-protection mask).
+    #[inline]
+    pub fn security_fields(&self) -> &BluefinSecurityFields {
+        &self.security_fields
     }
 }

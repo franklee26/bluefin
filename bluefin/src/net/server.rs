@@ -7,7 +7,7 @@ use std::{
 use super::{
     build_and_start_tx,
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
-    AckBuffer, ConnectionManagedBuffers,
+    AckBuffer, ConnectionManagedBuffers, DiagSender,
 };
 use crate::{
     core::{header::PacketType, Serialisable},
@@ -28,6 +28,7 @@ pub struct BluefinServer {
     conn_manager: Arc<ConnectionManager>,
     pending_accept_ids: Arc<Mutex<Vec<u32>>>,
     num_reader_workers: u16,
+    diag_tx: Option<DiagSender>,
 }
 
 impl BluefinServer {
@@ -38,6 +39,7 @@ impl BluefinServer {
             pending_accept_ids: Arc::new(Mutex::new(Vec::new())),
             src_addr,
             num_reader_workers: NUM_TX_WORKERS_FOR_SERVER_DEFAULT,
+            diag_tx: None,
         }
     }
 
@@ -50,6 +52,14 @@ impl BluefinServer {
         }
         self.num_reader_workers = num_reader_workers;
         Ok(())
+    }
+
+    /// Enable diagnostic event reporting. Call before `bind()`. The
+    /// sender half is threaded into each accepted connection's internal
+    /// workers; poll the corresponding receiver to see ACK events.
+    #[inline]
+    pub fn set_diagnostics(&mut self, tx: DiagSender) {
+        self.diag_tx = Some(tx);
     }
 
     pub async fn bind(&mut self) -> BluefinResult<()> {
@@ -80,6 +90,7 @@ impl BluefinServer {
         let conn_mgr_buffers = ConnectionManagedBuffers {
             conn_buff: Arc::clone(&conn_buffer),
             ack_buff: Arc::clone(&ack_buffer),
+            diag_tx: self.diag_tx.clone(),
         };
 
         let hello_key = (src_conn_id, 0);
@@ -137,6 +148,7 @@ impl BluefinServer {
             Arc::clone(&ack_buffer),
             addr,
             self.src_addr,
+            self.diag_tx.clone(),
         ))
     }
 }

@@ -7,7 +7,10 @@ use crate::core::packet::BluefinPacket;
 use crate::core::Extract;
 use crate::net::ack_handler::AckBuffer;
 use crate::net::connection::ConnectionBuffer;
-use crate::net::{ConnectionManagedBuffers, Wakeable, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM};
+use crate::net::{
+    diag_try_send, ConnectionManagedBuffers, DiagSender, DiagnosticEvent, Wakeable,
+    MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
+};
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
 use bytes::{Bytes, BytesMut};
@@ -270,7 +273,7 @@ impl ConnReaderHandler {
         match first_type {
             PacketType::Ack => {
                 let guard = conn_bufs.ack_buff.lock().unwrap();
-                Self::buffer_in_ack_packets(guard, packets)
+                Self::buffer_in_ack_packets(guard, packets, &conn_bufs.diag_tx)
             }
             _ => {
                 let guard = conn_bufs.conn_buff.lock().unwrap();
@@ -283,13 +286,24 @@ impl ConnReaderHandler {
     fn buffer_in_ack_packets(
         mut guard: MutexGuard<'_, AckBuffer>,
         packets: &mut Vec<BluefinPacket>,
+        diag_tx: &Option<DiagSender>,
     ) -> BluefinResult<()> {
         let mut e: Option<BluefinError> = None;
         // `drain(..)` empties the vec but keeps its capacity, so the caller's
         // carrier vec is reusable for the next datagram without realloc.
         for p in packets.drain(..) {
+            let base = p.header.packet_number;
+            let count = p.header.type_specific_payload as usize;
             if let Err(err) = guard.buffer_in_ack_packet(p) {
                 e = Some(err);
+            } else {
+                diag_try_send(
+                    diag_tx,
+                    DiagnosticEvent::AckReceived {
+                        base_packet_num: base,
+                        count,
+                    },
+                );
             }
         }
         // Clone the waker out (cheap atomic refcount), then drop the guard

@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
-    AckBuffer, ConnectionManagedBuffers,
+    AckBuffer, ConnectionManagedBuffers, DiagSender,
 };
 use crate::utils::get_udp_socket;
 use crate::{
@@ -31,6 +31,7 @@ pub struct BluefinClient {
     conn_manager: Arc<ConnectionManager>,
     num_reader_workers: u16,
     handshake_handler: HandshakeHandler,
+    diag_tx: Option<DiagSender>,
 }
 
 impl BluefinClient {
@@ -42,6 +43,7 @@ impl BluefinClient {
             src_addr,
             num_reader_workers: NUM_TX_WORKERS_FOR_CLIENT_DEFAULT,
             handshake_handler: HandshakeHandler::new(BluefinHost::Client),
+            diag_tx: None,
         }
     }
 
@@ -54,6 +56,14 @@ impl BluefinClient {
         }
         self.num_reader_workers = num_reader_workers;
         Ok(())
+    }
+
+    /// Enable diagnostic event reporting. Call before `connect()`. The
+    /// sender half is threaded into the connection's internal workers;
+    /// poll the corresponding receiver to see ACK events.
+    #[inline]
+    pub fn set_diagnostics(&mut self, tx: DiagSender) {
+        self.diag_tx = Some(tx);
     }
 
     pub async fn connect(&mut self, dst_addr: SocketAddr) -> BluefinResult<BluefinConnection> {
@@ -81,6 +91,7 @@ impl BluefinClient {
         let conn_mgrs_buffs = ConnectionManagedBuffers {
             conn_buff: Arc::clone(&conn_buffer),
             ack_buff: Arc::clone(&ack_buff),
+            diag_tx: self.diag_tx.clone(),
         };
         let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
 
@@ -149,6 +160,7 @@ impl BluefinClient {
             Arc::clone(&ack_buff),
             self.dst_addr.unwrap(),
             self.src_addr,
+            self.diag_tx.clone(),
         ))
     }
 }

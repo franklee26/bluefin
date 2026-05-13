@@ -1,0 +1,19 @@
+[package]
+name = "bluefintool"
+version.workspace = true
+edition.workspace = true
+description = "netcat-like CLI for the Bluefin protocol"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bluefin = { path = "../bluefin" }
+bluefin-proto = { path = "../bluefin-proto" }
+tokio = { workspace = true, features = ["full"] }
+bytes = { workspace = true }
+rand = { workspace = true }
+flume = { workspace = true }
+
+[[bin]]
+name = "bluefintool"
+path = "src/main.rs"

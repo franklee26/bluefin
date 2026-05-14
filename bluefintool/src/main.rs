@@ -230,6 +230,9 @@ async fn run_pipe(
     }
 
     loop {
+        // Always drain diagnostic events so async writer events aren't lost.
+        drain_diag(&conn, &peer_tag);
+
         // Drain any pending stdin data into the connection.
         let mut did_send = false;
         if let Some(ref mut receiver) = rx {
@@ -247,7 +250,7 @@ async fn run_pipe(
                 }
             }
             if did_send {
-                // Show data-sent packet numbers right after the send output.
+                // Drain again to catch data-sent events that arrived during send.
                 drain_diag(&conn, &peer_tag);
                 // Re-print the prompt after all diagnostic output is done.
                 if show_prompt {

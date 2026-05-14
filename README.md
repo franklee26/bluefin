@@ -70,6 +70,19 @@ async fn main() -> BluefinResult<()> {
 }
 ```
 
+### bluefintool
+
+A netcat-like CLI for quick smoke-testing and interactive data transfer over
+Bluefin. Install with `cargo install --path bluefintool`, then:
+
+```bash
+bluefintool -l 9000            # listen
+bluefintool 127.0.0.1 9000     # connect (in another shell)
+```
+
+Pass `-d` for diagnostics (hex dumps, packet numbers, ACK events). See
+[bluefintool/README.md](bluefintool/README.md) for full usage.
+
 [Latest Version]: https://img.shields.io/crates/v/bluefin.svg
 
 [crates.io]: https://crates.io/crates/bluefin

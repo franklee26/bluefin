@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
-    AckBuffer, ConnectionManagedBuffers, DiagSender,
+    AckBuffer, ConnectionManagedBuffers, DiagSender, HelloState,
 };
 use crate::utils::get_udp_socket;
 use crate::{
@@ -77,7 +77,7 @@ impl BluefinClient {
             self.num_reader_workers,
             Arc::clone(self.socket.as_ref().unwrap()),
             Arc::clone(&self.conn_manager),
-            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(HelloState::new())),
             BluefinHost::Client,
         );
 

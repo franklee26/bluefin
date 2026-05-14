@@ -144,7 +144,7 @@ After the handshake, each side begins data with the next packet number after its
 
 ### Open issue: hello buffering
 
-The reference implementation has a known race: a `ClientHello` arriving before the server has called `accept()` may be dropped. The RFC SHOULD require servers to buffer up to N hellos for some bounded time, but the exact policy is **TBD**. See [bluefin-architecture §7](../bluefin-architecture/SKILL.md#7-known-architectural-debt) and live bottleneck #11 in [bluefin-performance](../bluefin-performance/SKILL.md).
+~~The reference implementation has a known race: a `ClientHello` arriving before the server has called `accept()` may be dropped.~~ **FIXED.** The server now maintains a bounded hello queue (`HelloState` in [`net/mod.rs`](../../bluefin/src/net/mod.rs)) shared between the `ReaderTxChannel` workers and `BluefinServer::accept()`. Hellos arriving before an `accept()` slot exists are queued (up to `MAX_QUEUED_HELLOS = 64` entries); `accept()` drains the queue before blocking. The check and queue/route happen under a single mutex acquisition — no TOCTOU race. Client-side stagger workarounds have been removed. The RFC SHOULD still specify a server-side hello buffering requirement with bounded capacity.
 
 ## 7. Data transfer
 

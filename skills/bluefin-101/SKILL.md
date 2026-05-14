@@ -62,7 +62,7 @@ Three-way handshake driven by `bluefin-proto/src/handshake/state_machine.rs`:
 Server entry: [`BluefinServer::accept`](../../bluefin/src/net/server.rs).
 Client entry: [`BluefinClient::connect`](../../bluefin/src/net/client.rs).
 
-> **Known live bug**: when two clients hello within ~100 ms of each other, the server can drop the second hello before its `accept()` slot is wired up. Client side surfaces as `TimedOut("Failed to read from handshake connection buffer")` after 3 s. Mitigated by ≥500 ms inter-client stagger; properly fixing it requires queueing parsed hellos in [`net/server.rs`](../../bluefin/src/net/server.rs) until `accept()` is called. See live bottleneck #11 in the [performance skill](../bluefin-performance/SKILL.md) and historical context in [`docs/archive/BINARY_RACE_CONDITIONS.md`](../../docs/archive/BINARY_RACE_CONDITIONS.md).
+> **Handshake hello queue**: when a `ClientHello` arrives before the server has called `accept()`, it is buffered in a shared `HelloState` queue (cap 64, [`net/mod.rs`](../../bluefin/src/net/mod.rs)) rather than dropped. `accept()` drains this queue before blocking on the `HandshakeConnectionBuffer`. This eliminates the previous race that required client-side stagger workarounds. See [bluefin-architecture §4](../bluefin-architecture/SKILL.md) and historical context in [`docs/archive/BINARY_RACE_CONDITIONS.md`](../../docs/archive/BINARY_RACE_CONDITIONS.md).
 
 ## The buffer types
 
@@ -150,7 +150,7 @@ The producer side (the worker task that buffers in a packet) wakes the consumer 
 
 ## Running the benchmark
 
-Use [`bench_two_process.sh`](../../bench_two_process.sh) — it builds release, kills stale processes, spawns one server and N client processes (each invoked with `--task <ix>` to run a single connection), waits for the server's 2 s idle-timeout exit, and prints a summary. Defaults to 2 connections, 0.5 s inter-client stagger (works around the handshake race noted above), and up to 2 auto-retries.
+Use [`bench_two_process.sh`](../../bench_two_process.sh) — it builds release, kills stale processes, spawns one server and N client processes (each invoked with `--task <ix>` to run a single connection), waits for the server's 2 s idle-timeout exit, and prints a summary. Defaults to 2 connections, no inter-client stagger (the hello queue makes it unnecessary), and up to 2 auto-retries.
 
 ```bash
 ./bench_two_process.sh                  # 2 connections

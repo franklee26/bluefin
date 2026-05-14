@@ -39,11 +39,6 @@ CLIENT_PIDS=()
 for ((ix = 0; ix < NUM_CONNS; ix++)); do
     ./target/release/client --task "$ix" >"$LOG_DIR/c${ix}.log" 2>&1 &
     CLIENT_PIDS+=($!)
-    # Stagger to dodge the handshake race (see live bottleneck #11). 100ms
-    # is what the in-process client uses between its two tasks; matches.
-    if (( ix + 1 < NUM_CONNS )); then
-        sleep 0.1
-    fi
 done
 
 # Wall-clock watchdog. SIGTERM first so client/server panic handlers get

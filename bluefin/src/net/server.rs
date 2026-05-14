@@ -7,7 +7,7 @@ use std::{
 use super::{
     build_and_start_tx,
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
-    AckBuffer, ConnectionManagedBuffers, DiagSender,
+    AckBuffer, ConnectionManagedBuffers, DiagSender, HelloState,
 };
 use crate::{
     core::{header::PacketType, Serialisable},
@@ -26,7 +26,7 @@ pub struct BluefinServer {
     socket: Option<Arc<UdpSocket>>,
     src_addr: SocketAddr,
     conn_manager: Arc<ConnectionManager>,
-    pending_accept_ids: Arc<Mutex<Vec<u32>>>,
+    hello_state: Arc<Mutex<HelloState>>,
     num_reader_workers: u16,
     diag_tx: Option<DiagSender>,
 }
@@ -36,7 +36,7 @@ impl BluefinServer {
         Self {
             socket: None,
             conn_manager: Arc::new(dashmap::DashMap::new()),
-            pending_accept_ids: Arc::new(Mutex::new(Vec::new())),
+            hello_state: Arc::new(Mutex::new(HelloState::new())),
             src_addr,
             num_reader_workers: NUM_TX_WORKERS_FOR_SERVER_DEFAULT,
             diag_tx: None,
@@ -70,7 +70,7 @@ impl BluefinServer {
             self.num_reader_workers,
             Arc::clone(self.socket.as_ref().unwrap()),
             Arc::clone(&self.conn_manager),
-            Arc::clone(&self.pending_accept_ids),
+            Arc::clone(&self.hello_state),
             BluefinHost::PackLeader,
         );
 
@@ -97,10 +97,28 @@ impl BluefinServer {
         if self.conn_manager.insert(hello_key, conn_mgr_buffers.clone()).is_some() {
             return Err(BluefinError::ConnectionAlreadyExists);
         }
-        self.pending_accept_ids.lock().unwrap().push(src_conn_id);
+
+        // Atomically: check the hello queue for a pre-arrived ClientHello,
+        // otherwise register our accept slot so the reader can route to us.
+        let queued_hello = {
+            let mut state = self.hello_state.lock().unwrap();
+            if let Some(hello) = state.hello_queue.pop_front() {
+                // A ClientHello arrived before this accept() — use it
+                // directly. Don't push to pending_accept_ids since we
+                // don't need the reader to route anything.
+                Some(hello)
+            } else {
+                state.pending_accept_ids.push_back(src_conn_id);
+                None
+            }
+        };
 
         let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
-        let (packet, addr) = handshake_buf.read().await;
+        let (packet, addr) = if let Some((pkt, addr)) = queued_hello {
+            (pkt, addr)
+        } else {
+            handshake_buf.read().await
+        };
         let dst_conn_id = packet.header.source_connection_id;
         let key = (src_conn_id, dst_conn_id);
         let client_packet_num = packet.header.packet_number;

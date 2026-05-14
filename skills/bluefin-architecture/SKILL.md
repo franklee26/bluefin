@@ -68,7 +68,7 @@ Properties:
 
 - **Lock-free for reads**, sharded mutex for writes (DashMap default). Read-heavy workload: every received handshake datagram does a lookup; every `accept()`/connection-finalise does an insert.
 - **Single source of truth**: the listener-socket reader (`ReaderTxChannel`) consults this map to figure out which `ConnectionBuffer` to drop a parsed handshake packet into.
-- **Handshake hack**: during step 1, the server doesn't yet know the client's `src_conn_id`, so it stores the in-progress accept under `(server_chosen_id, 0)`. After step 3 it removes the placeholder and reinserts under `(server_chosen_id, client_id)`. This is the source of the well-known race (see §7).
+- **Handshake hello queue**: during step 1, the server doesn't yet know the client's `src_conn_id`, so it stores the in-progress accept under `(server_chosen_id, 0)`. After step 3 it removes the placeholder and reinserts under `(server_chosen_id, client_id)`. A shared `HelloState` struct ([`net/mod.rs`](../../bluefin/src/net/mod.rs)) holds both `pending_accept_ids` (FIFO `VecDeque` of accept slots) and a bounded `hello_queue` (`VecDeque` of pre-arrived `ClientHello` packets, capped at 64). The `ReaderTxChannel` and `accept()` coordinate under a single mutex — hellos arriving before an accept slot are queued, and `accept()` drains the queue before blocking.
 
 The per-connection data socket bypasses this table entirely — that's the whole point of §3.
 
@@ -166,7 +166,7 @@ The big load-bearing assumptions that may have to change before / during RFC sta
 
 | # | Issue | Where |
 |---|-------|-------|
-| 1 | **Hello-buffering race** at the server: a `ClientHello` arriving before `accept()` is dropped. Mitigated by client-side stagger in benches; not fixed. Requires a server-side hello queue with bounded time + capacity. | [`net/server.rs`](../../bluefin/src/net/server.rs), [bluefin-protocol §6 open issue](../bluefin-protocol/SKILL.md#open-issue-hello-buffering). |
+| 1 | ~~**Hello-buffering race**~~ — **FIXED.** `ClientHello` packets arriving before `accept()` are now queued in a bounded `HelloState.hello_queue` (cap 64) and drained by `accept()`. Client-side stagger workarounds removed. | [`net/mod.rs`](../../bluefin/src/net/mod.rs), [`net/server.rs`](../../bluefin/src/net/server.rs), [`worker/reader.rs`](../../bluefin/src/worker/reader.rs). |
 | 2 | **Per-connection `connect()`-ed socket** defeats `SO_REUSEPORT` recv-side fan-out. Caps recv parallelism per connection. See §3. | [`net/connection.rs`](../../bluefin/src/net/connection.rs). |
 | 3 | **`AckConsumer` is dead** — wakes constantly, writes a value nobody reads. Retransmission needs to either consume that signal or replace the consumer entirely. | [`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs). |
 | 4 | **`BluefinHost::PackFollower` is reserved but unused.** The protocol name "Bluefin" implies a multi-path / follower-leader topology that has never been built. The RFC has to decide whether to keep it as v1 scope or punt to v2. | [`bluefin-proto/src/context.rs`](../../bluefin-proto/src/context.rs). |
@@ -179,7 +179,7 @@ The big load-bearing assumptions that may have to change before / during RFC sta
 These are choices an RFC can't punt to "implementation detail" because they leak through to interoperability or behaviour visible to applications:
 
 - **Per-connection socket vs single demuxed listener.** §3 picks one; an RFC must mandate or allow both.
-- **Hello queue depth and timeout.** Or some other mitigation that doesn't require client-side stagger.
+- **Hello queue depth and timeout.** The reference implementation now buffers up to 64 hellos. The RFC should specify whether this bound is mandatory and what the expiry policy is.
 - **Multi-path / pack-follower.** In or out for v1.
 - **Flush semantics.** What does "the application has finished sending" mean on a stream protocol with no graceful close packet?
 - **Retransmission location.** Per-connection? Per-stream (if streams ever land)? Driven by ack consumer or by sender-side timer?

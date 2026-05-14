@@ -346,7 +346,6 @@ async fn basic_server_client_multiple_connections_send_recv(loopback_ip_addr: &I
                     "Did not send the expected number of bytes"
                 );
             });
-            sleep(Duration::from_millis(5)).await;
         }
     }
 

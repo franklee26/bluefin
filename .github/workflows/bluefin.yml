@@ -24,6 +24,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@v3
+      - name: Install Rust
+        run: |
+          if command -v rustup &>/dev/null; then
+            rustup update stable
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
       - name: Cache cargo
         # Caches ~/.cargo/registry, ~/.cargo/git, and target/ keyed on
         # Cargo.lock + rustc version + OS. The bench job already uses this;

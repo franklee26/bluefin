@@ -222,10 +222,19 @@ async fn run_pipe(
         }
     };
 
+    // Print the initial prompt. Subsequent prompts are printed by the main
+    // loop after all diagnostic output for a send has been flushed.
+    let show_prompt = interactive && rx.is_some();
+    if show_prompt {
+        eprint!("> ");
+    }
+
     loop {
         // Drain any pending stdin data into the connection.
+        let mut did_send = false;
         if let Some(ref mut receiver) = rx {
             while let Ok(data) = receiver.try_recv() {
+                did_send = true;
                 let len = data.len();
                 if let Err(e) = conn.send(&data) {
                     eprintln!("send error: {e:?}");
@@ -237,8 +246,14 @@ async fn run_pipe(
                     hex_dump(&format!("  [{peer_tag}] >>>"), &data);
                 }
             }
-            // Show data-sent packet numbers right after the send output.
-            drain_diag(&conn, &peer_tag);
+            if did_send {
+                // Show data-sent packet numbers right after the send output.
+                drain_diag(&conn, &peer_tag);
+                // Re-print the prompt after all diagnostic output is done.
+                if show_prompt {
+                    eprint!("> ");
+                }
+            }
         }
 
         // Receive from the peer with a short timeout so we loop back to
@@ -293,9 +308,6 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
         let mut reader = BufReader::new(stdin);
         let mut line = String::new();
         loop {
-            if interactive {
-                eprint!("> ");
-            }
             line.clear();
             match reader.read_line(&mut line).await {
                 Ok(0) | Err(_) => break,
@@ -419,6 +431,7 @@ async fn main() {
   ╚═════╝ ╚══════╝ ╚═════╝ ╚══════╝╚═╝     ╚═╝╚═╝  ╚═══╝
         "#
         );
+        eprintln!("  v{}\n", env!("CARGO_PKG_VERSION"));
     }
 
     let result = match mode {

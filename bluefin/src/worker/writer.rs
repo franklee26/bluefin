@@ -10,7 +10,10 @@ use std::{
 use crate::core::Extract;
 use crate::{
     core::header::{BluefinHeader, BluefinSecurityFields, PacketType},
-    net::{MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM, MAX_BLUEFIN_PAYLOAD_SIZE_BYTES},
+    net::{
+        diag_try_send, DiagSender, DiagnosticEvent, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
+        MAX_BLUEFIN_PAYLOAD_SIZE_BYTES,
+    },
 };
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
@@ -69,6 +72,7 @@ pub(crate) struct WriterHandler {
     /// registering after the notify-call but before pending becomes non-zero
     /// again is still woken correctly.
     flush_notify: Arc<Notify>,
+    pub(crate) diag_tx: Option<DiagSender>,
 }
 
 impl WriterHandler {
@@ -87,6 +91,7 @@ impl WriterHandler {
             ack_sender: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
             flush_notify: Arc::new(Notify::new()),
+            diag_tx: None,
         }
     }
 
@@ -102,6 +107,7 @@ impl WriterHandler {
         let socket = Arc::clone(&self.socket);
         let pending_bytes = Arc::clone(&self.pending_bytes);
         let flush_notify = Arc::clone(&self.flush_notify);
+        let diag_tx = self.diag_tx.clone();
         spawn(async move {
             Self::read_data(
                 data_r,
@@ -111,6 +117,7 @@ impl WriterHandler {
                 socket,
                 pending_bytes,
                 flush_notify,
+                diag_tx,
             )
             .await;
         });
@@ -192,6 +199,7 @@ impl WriterHandler {
         socket: Arc<UdpSocket>,
         pending_bytes: Arc<AtomicUsize>,
         flush_notify: Arc<Notify>,
+        diag_tx: Option<DiagSender>,
     ) {
         let mut data_queue: VecDeque<Bytes> = VecDeque::with_capacity(64);
         let mut next_packet_num = next_packet_num;
@@ -307,6 +315,7 @@ impl WriterHandler {
             // Batch packetization: create up to 12 datagrams per iteration
             for i in 0..12 {
                 datagram_pool[i].clear();
+                let pkt_num_before = next_packet_num;
                 let payload_bytes = Self::consume_data_into(
                     &mut data_queue,
                     &mut next_packet_num,
@@ -315,6 +324,15 @@ impl WriterHandler {
                     &mut datagram_pool[i],
                 );
                 if payload_bytes > 0 {
+                    let num_packets = next_packet_num - pkt_num_before;
+                    diag_try_send(
+                        &diag_tx,
+                        DiagnosticEvent::DataSent {
+                            start_packet_num: pkt_num_before,
+                            num_packets,
+                            num_bytes: payload_bytes,
+                        },
+                    );
                     // Pull a recycled buffer (cap-preserving, zero-alloc) out
                     // of the return channel before falling back to a fresh
                     // allocation. At steady state the recycle channel always

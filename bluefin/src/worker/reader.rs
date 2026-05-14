@@ -11,8 +11,8 @@ use crate::{
     net::{
         ack_handler::AckBuffer,
         connection::{ConnectionBuffer, ConnectionManager},
-        is_client_ack_packet, is_hello_packet, ConnectionManagedBuffers,
-        MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
+        diag_try_send, is_client_ack_packet, is_hello_packet, ConnectionManagedBuffers,
+        DiagSender, DiagnosticEvent, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
     },
 };
 use bluefin_proto::context::BluefinHost;
@@ -46,6 +46,7 @@ pub(crate) struct ReaderRxChannel {
     writer_handler: WriterHandler,
     packets_consumed: usize,
     packets_consumed_before_ack: usize,
+    diag_tx: Option<DiagSender>,
 }
 
 #[derive(Clone)]
@@ -79,13 +80,18 @@ impl Future for ReaderRxChannelFuture {
 }
 
 impl ReaderRxChannel {
-    pub(crate) fn new(buffer: Arc<Mutex<ConnectionBuffer>>, writer_handler: WriterHandler) -> Self {
+    pub(crate) fn new(
+        buffer: Arc<Mutex<ConnectionBuffer>>,
+        writer_handler: WriterHandler,
+        diag_tx: Option<DiagSender>,
+    ) -> Self {
         let future = ReaderRxChannelFuture { buffer };
         Self {
             future,
             writer_handler,
             packets_consumed: 0,
             packets_consumed_before_ack: 200,
+            diag_tx,
         }
     }
 
@@ -104,6 +110,17 @@ impl ReaderRxChannel {
         let base_packet_num = consume_res.get_base_packet_number();
         self.packets_consumed += num_packets_consumed;
 
+        if num_packets_consumed > 0 {
+            diag_try_send(
+                &self.diag_tx,
+                DiagnosticEvent::DataReceived {
+                    base_packet_num,
+                    num_packets: num_packets_consumed,
+                    num_bytes: consume_res.get_bytes_consumed() as usize,
+                },
+            );
+        }
+
         // We need to send an ack.
         if num_packets_consumed > 0
             && base_packet_num != 0
@@ -112,6 +129,13 @@ impl ReaderRxChannel {
             let _ = self
                 .writer_handler
                 .send_ack(base_packet_num, num_packets_consumed);
+            diag_try_send(
+                &self.diag_tx,
+                DiagnosticEvent::AckSent {
+                    base_packet_num,
+                    count: num_packets_consumed,
+                },
+            );
             self.packets_consumed = 0;
         }
 
@@ -141,6 +165,17 @@ impl ReaderRxChannel {
         let base_packet_num = consume_res.get_base_packet_number();
         self.packets_consumed += num_packets_consumed;
 
+        if num_packets_consumed > 0 {
+            diag_try_send(
+                &self.diag_tx,
+                DiagnosticEvent::DataReceived {
+                    base_packet_num,
+                    num_packets: num_packets_consumed,
+                    num_bytes: consume_res.get_bytes_consumed() as usize,
+                },
+            );
+        }
+
         if num_packets_consumed > 0
             && base_packet_num != 0
             && self.packets_consumed >= self.packets_consumed_before_ack
@@ -148,6 +183,13 @@ impl ReaderRxChannel {
             let _ = self
                 .writer_handler
                 .send_ack(base_packet_num, num_packets_consumed);
+            diag_try_send(
+                &self.diag_tx,
+                DiagnosticEvent::AckSent {
+                    base_packet_num,
+                    count: num_packets_consumed,
+                },
+            );
             self.packets_consumed = 0;
         }
 

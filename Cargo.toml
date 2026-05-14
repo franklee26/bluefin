@@ -1,5 +1,5 @@
 [workspace]
-members = ["bluefin", "bluefin-io", "bluefin-proto"]
+members = ["bluefin", "bluefin-io", "bluefin-proto", "bluefintool"]
 resolver = "2"
 
 [workspace.package]

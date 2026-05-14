@@ -25,15 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: Install Rust
-        run: |
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
-          if command -v rustup &>/dev/null; then
-            rustup update stable
-          else
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          fi
-          cargo --version
+        uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         # Caches ~/.cargo/registry, ~/.cargo/git, and target/ keyed on
         # Cargo.lock + rustc version + OS. The bench job already uses this;
@@ -61,7 +53,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: rustup update stable
+        uses: dtolnay/rust-toolchain@stable
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Generate code coverage
@@ -230,17 +222,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
-        run: |
-          # Ensure ~/.cargo/bin is on PATH for this and all subsequent steps.
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$PATH"
-          if command -v rustup &>/dev/null; then
-            rustup update stable
-          else
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          fi
-          # Sanity check — fail fast if cargo isn't available.
-          cargo --version
+        uses: dtolnay/rust-toolchain@stable
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
       - name: Build release binaries

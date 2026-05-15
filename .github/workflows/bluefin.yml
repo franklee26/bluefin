@@ -222,7 +222,7 @@ jobs:
       # bursts that would otherwise overflow the kernel UDP buffer.
       # Production binaries unaffected unless these env vars are set.
       BLUEFIN_CLIENT_SEND_THROTTLE_US:      "25"
-      BLUEFIN_CLIENT_SEND_THROTTLE_EVERY:   "2048"
+      BLUEFIN_CLIENT_SEND_THROTTLE_EVERY:   "3000"
       # Per-run retry knobs. Hosted macos-latest runners occasionally land
       # on a deeply contended host where both bench peers get starved and
       # the run yields 0 GOOD conns despite no actual code regression.

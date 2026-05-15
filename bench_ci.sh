@@ -416,10 +416,10 @@ esac
     throttle_every="${BLUEFIN_CLIENT_SEND_THROTTLE_EVERY:-256}"
     if [[ "$throttle_us" =~ ^[0-9]+$ ]] && (( throttle_us > 0 )); then
         echo
-        echo "**Client throttle:** \`BLUEFIN_CLIENT_SEND_THROTTLE_US=${throttle_us}\` µs every \`BLUEFIN_CLIENT_SEND_THROTTLE_EVERY=${throttle_every}\` sends (stand-in for congestion control while it's being designed; tokio's ~1 ms sleep floor means the effective rate cap ≈ \`THROTTLE_EVERY × 1500 B / 1 ms\`)"
+        echo "**Client throttle:** ${throttle_us} µs sleep every ${throttle_every} sends"
     else
         echo
-        echo "**Client throttle:** off (\`BLUEFIN_CLIENT_SEND_THROTTLE_US\` unset/0)"
+        echo "**Client throttle:** off"
     fi
     # Surface retry summary so a green PR comment still reveals if the
     # gate had to absorb a catastrophic-allocation event. Counts runs that

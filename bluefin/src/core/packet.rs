@@ -138,7 +138,9 @@ impl BluefinPacket {
                 PacketType::Ack
                 | PacketType::UnencryptedClientHello
                 | PacketType::UnencryptedServerHello
-                | PacketType::ClientAck => {
+                | PacketType::ClientAck
+                | PacketType::Fin
+                | PacketType::FinAck => {
                     // Acks + handshake packets contain no payload (for now)
                     packets.push(BluefinPacket {
                         header,
@@ -204,7 +206,9 @@ impl BluefinPacket {
                 PacketType::Ack
                 | PacketType::UnencryptedClientHello
                 | PacketType::UnencryptedServerHello
-                | PacketType::ClientAck => {
+                | PacketType::ClientAck
+                | PacketType::Fin
+                | PacketType::FinAck => {
                     packets.push(BluefinPacket {
                         header,
                         payload: Bytes::new(),

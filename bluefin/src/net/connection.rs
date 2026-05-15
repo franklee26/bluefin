@@ -1,7 +1,7 @@
 use std::{
     future::Future,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicBool, Arc, Mutex},
     task::{Poll, Waker},
     time::Duration,
 };
@@ -10,6 +10,7 @@ use bytes::Bytes;
 
 use super::{
     build_and_start_ack_consumer_workers, build_and_start_conn_reader_tx_channels,
+    close_handler::CloseBuffer,
     get_connected_udp_socket,
     ordered_bytes::{ConsumeResult, OrderedBytes},
     AckBuffer, ConnectionManagedBuffers, DiagSender, DiagnosticEvent, Wakeable,
@@ -203,6 +204,15 @@ impl ConnectionBuffer {
         self.ordered_bytes.peek()
     }
 
+    /// Returns the peer's `SocketAddr` if it has been buffered yet (it
+    /// is set during the handshake before any data flows). Used by
+    /// [`crate::worker::reader::ReaderRxChannel`] to construct the EOF
+    /// return tuple after the peer has sent us a `Fin`.
+    #[inline]
+    pub(crate) fn addr(&self) -> Option<SocketAddr> {
+        self.addr
+    }
+
     #[inline]
     pub(crate) fn get_waker(&self) -> Option<&Waker> {
         self.waker.as_ref()
@@ -257,6 +267,15 @@ pub struct BluefinConnection {
     pub dst_conn_id: u32,
     reader_rx: ReaderRxChannel,
     writer_handler: WriterHandler,
+    /// Per-connection close-side state. Held here so [`Self::close`]
+    /// can drive the FIN / FIN-ACK exchange and so a peer-initiated
+    /// close can be observed via the public state accessors.
+    close_buffer: Arc<Mutex<CloseBuffer>>,
+    /// Host-wide connection registry. [`Self::close`] removes this
+    /// connection's entry once the FIN / FIN-ACK exchange completes (or
+    /// is force-closed after the retransmit budget) so the conn_reader
+    /// stops routing further packets into a dead buffer.
+    conn_manager: Arc<ConnectionManager>,
     diag_rx: Option<flume::Receiver<DiagnosticEvent>>,
     version: u8,
     security_fields: BluefinSecurityFields,
@@ -269,6 +288,9 @@ impl BluefinConnection {
         next_send_packet_num: u64,
         conn_buffer: Arc<Mutex<ConnectionBuffer>>,
         ack_buffer: Arc<Mutex<AckBuffer>>,
+        close_buffer: Arc<Mutex<CloseBuffer>>,
+        peer_fin_observed: Arc<AtomicBool>,
+        conn_manager: Arc<ConnectionManager>,
         dst_addr: SocketAddr,
         src_addr: SocketAddr,
         diag_tx: Option<DiagSender>,
@@ -301,9 +323,29 @@ impl BluefinConnection {
             panic!("Cannot start connection due to error: {:?}", e);
         }
 
+        // Spawn the FinAck-send drainer. The conn_reader sends a packet
+        // number on `fin_ack_tx` whenever a peer `Fin` arrives; this task
+        // forwards it to `WriterHandler::send_fin_ack` which formats and
+        // emits a header-only FIN-ACK datagram on the per-connection
+        // socket. Bounded so a flood of duplicate FINs cannot grow the
+        // queue without bound; the drainer keeps up easily since each
+        // emit is a single 20-byte try_send.
+        let (fin_ack_tx, fin_ack_rx) = flume::bounded::<u64>(8);
+        {
+            let writer_for_finack = writer_handler.clone();
+            tokio::spawn(async move {
+                while let Ok(pn) = fin_ack_rx.recv_async().await {
+                    let _ = writer_for_finack.send_fin_ack(pn).await;
+                }
+            });
+        }
+
         let conn_bufs = Arc::new(ConnectionManagedBuffers {
             conn_buff: Arc::clone(&conn_buffer),
             ack_buff: Arc::clone(&ack_buffer),
+            close_buff: Arc::clone(&close_buffer),
+            peer_fin_observed: Arc::clone(&peer_fin_observed),
+            fin_ack_tx: Some(fin_ack_tx),
             diag_tx: diag_tx_workers.clone(),
         });
 
@@ -311,6 +353,7 @@ impl BluefinConnection {
 
         let reader_rx = ReaderRxChannel::new(
             Arc::clone(&conn_buffer),
+            Arc::clone(&peer_fin_observed),
             writer_handler.clone(),
             diag_tx_workers,
         );
@@ -320,12 +363,20 @@ impl BluefinConnection {
             dst_conn_id,
             reader_rx,
             writer_handler,
+            close_buffer: Arc::clone(&close_buffer),
+            conn_manager,
             diag_rx,
             version: 0x0,
             security_fields: BluefinSecurityFields::default(),
         }
     }
 
+    /// Reads up to `len` bytes from the connection into `buf`. Returns the
+    /// number of bytes actually read.
+    ///
+    /// Returns `Ok(0)` when the peer has gracefully closed the connection
+    /// with a `Fin` and the receive buffer has been fully drained
+    /// (end-of-stream). Subsequent calls also return `Ok(0)`.
     #[inline]
     pub async fn recv(&mut self, buf: &mut [u8], len: usize) -> BluefinResult<usize> {
         let (size, _) = self.reader_rx.read(len, buf).await?;
@@ -401,6 +452,114 @@ impl BluefinConnection {
     #[inline]
     pub async fn flush(&self) -> BluefinResult<()> {
         self.writer_handler.flush().await
+    }
+
+    /// Initiates a graceful close of this connection per bluefin-protocol
+    /// §10bis (FIN / FIN-ACK exchange).
+    ///
+    /// Sequence:
+    /// 1. [`Self::flush`] — drain every byte already accepted by `send_*`
+    ///    onto the wire.
+    /// 2. Mark the writer closed so any further `send_*` returns
+    ///    [`BluefinError::ConnectionClosed`].
+    /// 3. Reserve the FIN's packet number (the next available in the
+    ///    sender's space, post-flush) and emit a header-only `Fin`.
+    /// 4. Park on the close-buffer's notify until the peer's matching
+    ///    `FinAck` arrives, with a 200 ms idle timeout. On timeout,
+    ///    retransmit the `Fin` (up to 3 attempts total). After the budget
+    ///    is exhausted the connection is force-closed locally and
+    ///    [`BluefinError::TimedOut`] is returned.
+    /// 5. Mark the close buffer `Closed` and return.
+    ///
+    /// Idempotent on the writer side (a second call sees the closed flag
+    /// already set), but a second call MAY still send another `Fin` —
+    /// callers SHOULD invoke this exactly once per connection.
+    pub async fn close(&self) -> BluefinResult<()> {
+        // Drain the writer pipeline first so the FIN is strictly ordered
+        // after every previously-accepted data byte.
+        self.writer_handler.flush().await?;
+
+        // Forbid further data sends. Done BEFORE reserving the FIN's
+        // packet number so a racing send cannot claim a number after ours.
+        self.writer_handler.mark_closed();
+
+        // Reserve the FIN's packet number. After flush() returned, the
+        // writer task is idle and the shared atomic mirrors the writer's
+        // local counter accurately. `fetch_add(1)` reserves our pn and
+        // bumps the counter for any future caller (defensive).
+        let fin_pn = self.writer_handler.reserve_close_packet_num();
+
+        // Record locally that we have initiated close, then send.
+        {
+            let mut g = self.close_buffer.lock().unwrap();
+            g.record_local_fin_sent(fin_pn);
+        }
+
+        // Take the notify handle out before the retransmit loop so we
+        // don't hold the close-buffer mutex across `await`.
+        let notify = self.close_buffer.lock().unwrap().fin_ack_notify();
+
+        const MAX_FIN_ATTEMPTS: usize = 3;
+        const PER_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
+
+        for _attempt in 0..MAX_FIN_ATTEMPTS {
+            self.writer_handler.send_fin(fin_pn).await?;
+
+            // Standard `Notify` double-check pattern: register interest
+            // before re-reading the state so a notify that fires between
+            // the read and the await is not lost.
+            let notified = notify.notified();
+            if self.close_buffer.lock().unwrap().received_fin_ack_for() == Some(fin_pn) {
+                self.close_buffer.lock().unwrap().mark_closed();
+                self.deregister_from_conn_manager();
+                return Ok(());
+            }
+            match tokio::time::timeout(PER_ATTEMPT_TIMEOUT, notified).await {
+                Ok(_) => {
+                    if self.close_buffer.lock().unwrap().received_fin_ack_for() == Some(fin_pn) {
+                        self.close_buffer.lock().unwrap().mark_closed();
+                        self.deregister_from_conn_manager();
+                        return Ok(());
+                    }
+                    // Spurious wake — fall through to the next attempt
+                    // (which will retransmit the FIN).
+                }
+                Err(_) => {
+                    // Per-attempt timeout — retransmit on the next loop.
+                }
+            }
+        }
+
+        // Force-close locally and surface the timeout to the caller.
+        self.close_buffer.lock().unwrap().mark_closed();
+        self.deregister_from_conn_manager();
+        Err(BluefinError::TimedOut(
+            "close: peer did not send FinAck within retransmit budget",
+        ))
+    }
+
+    /// Remove this connection's entry from the host-wide
+    /// [`ConnectionManager`]. After this returns, the conn_reader stops
+    /// routing further inbound packets into our buffers. Safe to call
+    /// more than once: `DashMap::remove` is a no-op on missing keys.
+    #[inline]
+    fn deregister_from_conn_manager(&self) {
+        let _ = self
+            .conn_manager
+            .remove(&(self.src_conn_id, self.dst_conn_id));
+    }
+
+    /// Returns `true` once this connection has been fully closed (either
+    /// because [`Self::close`] completed locally, or because the peer's
+    /// `Fin` arrived and the FIN/FIN-ACK exchange has been driven to
+    /// completion).
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        use crate::net::close_handler::CloseState;
+        matches!(
+            self.close_buffer.lock().unwrap().state(),
+            CloseState::Closed
+        )
     }
 
     /// Returns a reference to the diagnostic event receiver, if one was

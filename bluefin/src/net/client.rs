@@ -88,9 +88,16 @@ impl BluefinClient {
             BluefinHost::Client,
         )));
         let ack_buff = Arc::new(Mutex::new(AckBuffer::new(packet_number + 2)));
+        let peer_fin_observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let close_buff = Arc::new(Mutex::new(
+            crate::net::close_handler::CloseBuffer::new(Arc::clone(&peer_fin_observed)),
+        ));
         let conn_mgrs_buffs = ConnectionManagedBuffers {
             conn_buff: Arc::clone(&conn_buffer),
             ack_buff: Arc::clone(&ack_buff),
+            close_buff: Arc::clone(&close_buff),
+            peer_fin_observed: Arc::clone(&peer_fin_observed),
+            fin_ack_tx: None,
             diag_tx: self.diag_tx.clone(),
         };
         let handshake_buf = HandshakeConnectionBuffer::new(Arc::clone(&conn_buffer));
@@ -158,6 +165,9 @@ impl BluefinClient {
             packet_number + 2,
             Arc::clone(&conn_buffer),
             Arc::clone(&ack_buff),
+            Arc::clone(&close_buff),
+            Arc::clone(&peer_fin_observed),
+            Arc::clone(&self.conn_manager),
             self.dst_addr.unwrap(),
             self.src_addr,
             self.diag_tx.clone(),

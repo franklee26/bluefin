@@ -12,6 +12,18 @@ pub enum PacketType {
     #[default]
     UnencryptedData = 0x03,
     Ack = 0x04,
+    /// Graceful-close request. Header-only (no payload). Sender promises
+    /// no further data packets will be sent on this connection. Carries
+    /// the next sender packet number after all in-flight data so the
+    /// peer knows the final stream length. `type_specific_payload` is
+    /// reserved (MUST be 0 in v0); a future version may use it for a
+    /// reason code. See bluefin-protocol §4.
+    Fin = 0x05,
+    /// Acknowledgement of a previously-received [`PacketType::Fin`].
+    /// Header-only. `packet_number` MUST equal the `packet_number` of
+    /// the `Fin` being acknowledged. `type_specific_payload` reserved
+    /// (MUST be 0 in v0).
+    FinAck = 0x06,
 }
 
 impl PacketType {
@@ -22,6 +34,8 @@ impl PacketType {
             0x02 => Self::ClientAck,
             0x03 => Self::UnencryptedData,
             0x04 => Self::Ack,
+            0x05 => Self::Fin,
+            0x06 => Self::FinAck,
             _ => panic!("Unknown packet type {}", value),
         }
     }
@@ -242,5 +256,55 @@ mod tests {
             Ok(d_field) => assert_eq!(d_field, header),
             Err(_) => assert!(false),
         }
+    }
+
+    #[test]
+    fn fin_packet_type_round_trips() {
+        let security_fields = BluefinSecurityFields::new(false, 0x0);
+        let mut header = BluefinHeader::new(
+            0xaaaa_bbbb,
+            0xccccdddd,
+            PacketType::Fin,
+            0x0,
+            security_fields,
+        );
+        header.with_packet_number(0xdead_beef_cafe_babe);
+
+        let serialised = header.serialise();
+        assert_eq!(serialised.len(), 20);
+        // First byte: version (0x0) << 4 | type (0x05) = 0x05.
+        assert_eq!(serialised[0], 0x05);
+
+        let deserialised = BluefinHeader::deserialise(&serialised).unwrap();
+        assert_eq!(deserialised, header);
+        assert_eq!(deserialised.type_field, PacketType::Fin);
+    }
+
+    #[test]
+    fn fin_ack_packet_type_round_trips() {
+        let security_fields = BluefinSecurityFields::new(false, 0x0);
+        let mut header = BluefinHeader::new(
+            0x1111_2222,
+            0x3333_4444,
+            PacketType::FinAck,
+            0x0,
+            security_fields,
+        );
+        header.with_packet_number(42);
+
+        let serialised = header.serialise();
+        assert_eq!(serialised.len(), 20);
+        // First byte: version (0x0) << 4 | type (0x06) = 0x06.
+        assert_eq!(serialised[0], 0x06);
+
+        let deserialised = BluefinHeader::deserialise(&serialised).unwrap();
+        assert_eq!(deserialised, header);
+        assert_eq!(deserialised.type_field, PacketType::FinAck);
+    }
+
+    #[test]
+    fn fin_and_fin_ack_have_distinct_wire_codes() {
+        assert_eq!(PacketType::Fin as u8, 0x05);
+        assert_eq!(PacketType::FinAck as u8, 0x06);
     }
 }

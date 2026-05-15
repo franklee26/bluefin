@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
@@ -14,11 +15,13 @@ use crate::{
 use ack_handler::{AckBuffer, AckConsumer};
 use bluefin_proto::context::BluefinHost;
 use bluefin_proto::BluefinResult;
+use close_handler::CloseBuffer;
 use connection::{ConnectionBuffer, ConnectionManager};
 use tokio::{net::UdpSocket, spawn};
 
 pub mod ack_handler;
 pub mod client;
+pub mod close_handler;
 pub mod connection;
 pub mod ordered_bytes;
 pub mod server;
@@ -92,6 +95,22 @@ pub enum DiagnosticEvent {
         num_packets: usize,
         num_bytes: usize,
     },
+    /// We emitted a `Fin` (header-only, own-datagram) per
+    /// bluefin-protocol §10bis — local side initiated graceful close.
+    /// `packet_num` is the FIN's packet number (the next pn after the
+    /// last data packet, reserved by [`crate::worker::writer::WriterHandler::reserve_close_packet_num`]).
+    FinSent { packet_num: u64 },
+    /// We emitted a `FinAck` in reply to the peer's `Fin`. `packet_num`
+    /// equals the `packet_num` of the `Fin` being acknowledged.
+    FinAckSent { packet_num: u64 },
+    /// The peer's `Fin` was observed at the receive path. Fires once per
+    /// `Fin` packet seen on the wire; duplicates from the peer's
+    /// retransmits will produce multiple events.
+    FinReceived { packet_num: u64 },
+    /// The peer's `FinAck` was observed at the receive path,
+    /// acknowledging our local close. `packet_num` matches the `Fin` we
+    /// previously sent.
+    FinAckReceived { packet_num: u64 },
 }
 
 pub(crate) type DiagSender = flume::Sender<DiagnosticEvent>;
@@ -134,6 +153,21 @@ pub(crate) trait Wakeable {
 pub(crate) struct ConnectionManagedBuffers {
     pub(crate) conn_buff: Arc<Mutex<ConnectionBuffer>>,
     pub(crate) ack_buff: Arc<Mutex<AckBuffer>>,
+    /// Per-connection close-side state (FIN / FIN-ACK). See
+    /// [`close_handler`].
+    pub(crate) close_buff: Arc<Mutex<CloseBuffer>>,
+    /// Lock-free mirror of "peer FIN observed". Cloned out of
+    /// [`CloseBuffer`] at construction so the recv hot path in
+    /// [`crate::worker::reader::ReaderRxChannel`] can poll for EOF
+    /// without acquiring the close-buffer mutex.
+    pub(crate) peer_fin_observed: Arc<AtomicBool>,
+    /// Sender side of a small mpsc that pipes "the peer just sent us a
+    /// `Fin` with packet number N — please emit a `FinAck(N)`" requests
+    /// from the conn_reader (which has no socket reference) into a small
+    /// spawned task that owns a [`crate::worker::writer::WriterHandler`]
+    /// reference. `None` for the handshake-time managed buffers since
+    /// those are torn down before close-time.
+    pub(crate) fin_ack_tx: Option<flume::Sender<u64>>,
     pub(crate) diag_tx: Option<DiagSender>,
 }
 

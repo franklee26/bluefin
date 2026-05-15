@@ -224,11 +224,13 @@ run_attempt() {
         echo "       client #$ix exit=$code$note"
     done
 
-    # Server exits naturally only after `RECV_IDLE_TIMEOUT_SECS` of no
-    # incoming bytes. Default is 2 s; CI bumps it to 10 s. Our grace must
-    # always be at least that long + a small safety margin, otherwise we
-    # SIGTERM the server before it prints its FINAL lines and the bench
-    # parser sees zero measurements.
+    # Healthy server exits ~immediately after every connected client has
+    # sent its `Fin`: `recv_bytes` returns `Ok(0)` (EOF), the per-conn
+    # task prints `FINAL` and the join_set drains. The `BLUEFIN_RECV_IDLE_TIMEOUT_SECS`
+    # window is now a safety net for crashed/SIGKILL'd clients only; we
+    # still wait `recv_idle + 3` seconds so that if a client *did* die
+    # without closing we don't SIGTERM the server before its idle-fallback
+    # path prints FINAL.
     local recv_idle_secs="${BLUEFIN_RECV_IDLE_TIMEOUT_SECS:-2}"
     if ! [[ "$recv_idle_secs" =~ ^[0-9]+$ ]] || (( recv_idle_secs <= 0 )); then
         recv_idle_secs=2

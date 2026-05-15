@@ -60,9 +60,11 @@ for pid in "${CLIENT_PIDS[@]}"; do
     wait "$pid" 2>/dev/null
     CLIENT_EXITS+=($?)
 done
-# Server prints `FINAL` after 2 seconds of recv-idle on each connection.
-# Give it up to 6s to do that on its own; only SIGTERM if it's still
-# running after the watchdog grace.
+# Server prints `FINAL` as soon as each client's `Fin` arrives and the
+# corresponding `recv_bytes` returns EOF. The recv-idle timer is now a
+# safety net for crashed clients only. Give the server up to 6 s to
+# finish printing and drain the join_set; only SIGTERM if it's still
+# running after that grace.
 for _ in $(seq 1 60); do
     if ! kill -0 "$SVR" 2>/dev/null; then break; fi
     sleep 0.1

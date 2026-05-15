@@ -24,11 +24,20 @@ async fn main() -> BluefinResult<()> {
     )));
     server.bind().await?;
 
-    while let Ok(conn) = s.accept().await {
+    while let Ok(mut conn) = s.accept().await {
         let _ = spawn(async move {
             let mut recv_bytes = [0u8; 1024];
             loop {
                 let size = conn.recv(&mut recv_bytes, 1024).await.unwrap();
+                // `recv` returns `Ok(0)` once the peer's `Fin` has been
+                // observed and all buffered data has been delivered.
+                if size == 0 {
+                    println!(
+                        "({:x}_{:x}) >>> peer closed (EOF)",
+                        conn.src_conn_id, conn.dst_conn_id,
+                    );
+                    break;
+                }
 
                 println!(
                     "({:x}_{:x}) >>> Received: {:?}",
@@ -37,6 +46,12 @@ async fn main() -> BluefinResult<()> {
                     &recv_bytes[..size],
                 );
             }
+            // The peer already FIN'd us, so its half of the connection
+            // is closed; calling `close()` here would just time out
+            // waiting for a `FinAck` that will never arrive. If you
+            // initiated the shutdown (e.g. on Ctrl-C), call
+            // `conn.close().await` to send your own `Fin` and wait for
+            // the peer's `FinAck`.
         });
     }
 
@@ -65,6 +80,13 @@ async fn main() -> BluefinResult<()> {
     let bytes = [1, 2, 3, 4];
     let size = conn.send(&bytes);
     println!("Sent {} bytes", size);
+
+    // Gracefully close the connection: flushes any pending data, sends a
+    // `Fin` and waits for the peer's `FinAck` (with a small retransmit
+    // budget). The peer's `recv` will return `Ok(0)` once our `Fin`
+    // arrives. Skipping this leaves the peer to time out on its
+    // recv-idle safety net.
+    conn.close().await?;
 
     Ok(())
 }

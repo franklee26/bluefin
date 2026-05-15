@@ -2,6 +2,7 @@
 use std::{
     env,
     net::{Ipv4Addr, SocketAddrV4},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -10,6 +11,11 @@ use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
 use bytes::Bytes;
 use tokio::{spawn, task::yield_now, time::sleep};
+
+/// Set to `true` by the SIGINT handler installed in `main`. The send loop
+/// in [`run_connection`] checks this every iteration so a Ctrl-C cleanly
+/// triggers `flush()` + `close()` instead of orphaning the connection.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// Client-side source ports. One per spawned connection task.
 const DEFAULT_PORTS: [u16; 5] = [1320, 1322, 1323, 1324, 1325];
@@ -46,6 +52,16 @@ fn num_sends() -> usize {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[tokio::main]
 async fn main() -> BluefinResult<()> {
+    // SIGINT handler: flip the global shutdown flag and let the
+    // connection tasks exit their send loop. They will still call
+    // `flush()` + `close()` so the server observes a clean FIN.
+    spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("(client) ^C received — finishing in-flight sends then closing");
+            SHUTDOWN.store(true, Ordering::Release);
+        }
+    });
+
     // console_subscriber::init();
     let args: Vec<String> = env::args().collect();
     let single_task_index: Option<usize> = match args.get(1).map(String::as_str) {
@@ -162,6 +178,16 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
         // tight `for` loop monopolises the worker thread.
         if i % SENDS_PER_YIELD == 0 {
             yield_now().await;
+            // Cheap relaxed check is fine here; we only need to notice
+            // shutdown within one yield window. Break out so the rest of
+            // the function still runs (flush + close).
+            if SHUTDOWN.load(Ordering::Acquire) {
+                eprintln!(
+                    "(client #{}) shutdown observed at send {}/{} — stopping early",
+                    task_ix, i, n_sends,
+                );
+                break;
+            }
         }
     }
 
@@ -172,6 +198,16 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
     // `sleep(2 s)`, which was visibly too short on contended runs (server
     // received a fraction of the bytes the client claimed to send).
     conn.flush().await?;
+
+    // Graceful close per bluefin-protocol §10bis. Sends a `Fin` (header-
+    // only, no payload, packet number = next-after-data) and waits for
+    // the peer's `FinAck`. This is what lets the server exit immediately
+    // on this connection's `recv` instead of having to fall back to its
+    // recv-idle timer. Errors here are non-fatal for the bench — log and
+    // continue so we still report the throughput we measured.
+    if let Err(e) = conn.close().await {
+        eprintln!("(client #{}) close() returned {:?} -- continuing", task_ix, e);
+    }
 
     let elapsed = start.elapsed().as_secs_f64();
     let mb_per_sec = (total_bytes as f64 / elapsed) / 1e6;

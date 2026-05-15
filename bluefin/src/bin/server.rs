@@ -6,14 +6,26 @@ use std::{
     cmp::{max, min},
     env,
     net::{Ipv4Addr, SocketAddrV4},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 use tokio::{spawn, task::JoinSet, time::sleep};
 
+/// Set to `true` by the SIGINT handler installed in `main`. Per-conn
+/// tasks observe this in the recv `select!` and exit cleanly via the
+/// usual FINAL-line path so a Ctrl-C produces the same diagnostics as a
+/// healthy run.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
 /// If no bytes arrive on a connection for this long, the per-connection
 /// task assumes the peer is gone, prints a final summary, and exits.
-/// Bluefin currently has no protocol-level FIN, so this is the only way
-/// the benchmark server can terminate cleanly.
+///
+/// As of the FIN / FIN-ACK exchange landing this is a *safety net* for
+/// a crashed/SIGKILL'd client — a healthy client now calls
+/// `BluefinConnection::close()` and our `recv_bytes` returns `Ok(0)`
+/// (EOF), at which point the per-conn task breaks immediately. The
+/// timeout still exists so the bench server cannot hang forever if a
+/// peer dies mid-stream.
 ///
 /// CI overrides this via `BLUEFIN_RECV_IDLE_TIMEOUT_SECS` because hosted
 /// macos-latest runners deliver bytes at ~1–10 % of dev-box throughput,
@@ -65,6 +77,16 @@ const IDLE_RESET_EVERY: i64 = 4096;
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[tokio::main]
 async fn main() -> BluefinResult<()> {
+    // SIGINT handler: flip the global shutdown flag. Per-conn tasks
+    // observe this on the next recv-loop tick and break out cleanly so
+    // we still produce FINAL lines.
+    spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("(server) ^C received — closing connections gracefully ...");
+            SHUTDOWN.store(true, Ordering::Release);
+        }
+    });
+
     let _ = spawn(async move {
         let _ = run().await;
     })
@@ -166,7 +188,26 @@ async fn run() -> BluefinResult<()> {
             let idle_sleep = sleep(recv_idle);
             tokio::pin!(idle_sleep);
 
+            // Tracks why we exited the recv loop. `true` means the peer
+            // sent a `Fin` and `recv_bytes` returned `Ok(0)` — the
+            // clean-shutdown path, which means the FINAL elapsed time
+            // should NOT have the idle-timeout window subtracted from
+            // it (there is no idle window in this path). `false` means
+            // the idle deadline fired, in which case the historical
+            // tail-subtraction still applies. Defaults to `false` so
+            // that if the loop breaks via the `recv error` arm we keep
+            // the conservative subtraction.
+            let mut clean_eof = false;
+
             loop {
+                // Cheap pre-check so a Ctrl-C between recv windows still
+                // breaks out promptly. The select arms below also race
+                // a short-lived sleep that lets the SIGINT-driven flag
+                // wake the loop without waiting for the next recv.
+                if SHUTDOWN.load(Ordering::Acquire) {
+                    eprintln!("(#{}) shutdown observed — closing", _num);
+                    break;
+                }
                 // `recv_bytes` is the zero-copy variant of `recv`: it pushes
                 // `Bytes` slices over the recv buffer into our carrier vec
                 // instead of memcpying into a `[u8]`. The bench has no need
@@ -190,6 +231,16 @@ async fn run() -> BluefinResult<()> {
                         break;
                     }
                 };
+                // `recv_bytes` returning `Ok(0)` with an empty carrier vec
+                // means the peer sent a `Fin` and there is nothing left to
+                // drain (see [`BluefinConnection::recv_bytes`] EOF
+                // semantics). Break out cleanly so the FINAL line reports
+                // un-padded elapsed time.
+                if size == 0 && chunks.is_empty() {
+                    eprintln!("(#{}) peer closed (EOF) -- exiting", _num);
+                    clean_eof = true;
+                    break;
+                }
                 // Push the idle deadline forward on a coarse cadence so we
                 // re-arm the timer wheel at <100Hz instead of recv-rate.
                 if iteration % IDLE_RESET_EVERY == 0 {
@@ -236,18 +287,24 @@ async fn run() -> BluefinResult<()> {
             // Final summary on exit so we always see a meaningful number,
             // even for short-lived connections.
             //
-            // The loop only exits when the recv-idle deadline fires, which
-            // is approximately `recv_idle` seconds after the last incoming
-            // byte. Including that tail in the divisor under-reports the
-            // real throughput by `recv_idle / transfer_time`, which is
-            // ~30 % on dev hardware (2 s tail / 5 s transfer) and *much*
-            // worse in CI under the bumped 10 s timeout. Subtract the tail
-            // so FINAL avg reports bytes / actual-transfer-time. Clamp to a
-            // minimum positive value so a transfer that was fully consumed
-            // by the idle wait (i.e. zero real progress) doesn't divide by
-            // zero or report a wildly inflated number.
+            // Two exit paths feed this block:
+            //   1. Clean EOF: the client called `close()`, we observed a
+            //      `Fin`, and `recv_bytes` returned `Ok(0)`. There is no
+            //      idle tail in the elapsed time — use it as-is.
+            //   2. Idle deadline: the client never sent a `Fin` (or
+            //      crashed). `elapsed_raw` includes ~`recv_idle` seconds
+            //      of waiting-for-nothing at the end; subtract it so the
+            //      reported avg reflects real transfer time.
+            //
+            // Clamp to a minimum positive value so a transfer that was
+            // fully consumed by the idle wait (i.e. zero real progress)
+            // doesn't divide by zero or report a wildly inflated number.
             let elapsed_raw = now.elapsed().as_secs_f64();
-            let elapsed = (elapsed_raw - recv_idle.as_secs_f64()).max(1e-3);
+            let elapsed = if clean_eof {
+                elapsed_raw.max(1e-3)
+            } else {
+                (elapsed_raw - recv_idle.as_secs_f64()).max(1e-3)
+            };
             let avg_throughput_mb = if total_bytes > 0 {
                 (total_bytes as f64 / elapsed) / 1e6
             } else {
@@ -261,6 +318,22 @@ async fn run() -> BluefinResult<()> {
                 fmt_throughput_mb(avg_throughput_mb),
                 fmt_throughput_mb(max_throughput),
             );
+
+            // Mirror the client's graceful close so the peer observes a
+            // `Fin` from our side too — but ONLY when we exited the recv
+            // loop for a reason other than the peer already closing. If
+            // `clean_eof` is true the client has already torn its side
+            // down, deregistered itself, and is no longer listening for
+            // our FIN; sending one would just waste 600 ms re-transmitting
+            // before hitting the retransmit budget. In the
+            // shutdown / idle / error paths the peer may still be alive,
+            // so closing produces a real FIN that the client's recv can
+            // observe.
+            if !clean_eof {
+                if let Err(e) = conn.close().await {
+                    eprintln!("(#{}) close() returned {:?}", _num, e);
+                }
+            }
         });
     }
 

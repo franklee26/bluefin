@@ -275,11 +275,91 @@ impl ConnReaderHandler {
                 let guard = conn_bufs.ack_buff.lock().unwrap();
                 Self::buffer_in_ack_packets(guard, packets, &conn_bufs.diag_tx)
             }
+            PacketType::Fin | PacketType::FinAck => {
+                Self::buffer_in_close_packets(packets, conn_bufs)
+            }
             _ => {
                 let guard = conn_bufs.conn_buff.lock().unwrap();
                 Self::buffer_in_data_packets(guard, packets)
             }
         }
+    }
+
+    /// Routes `Fin` / `FinAck` packets into the per-connection
+    /// [`crate::net::close_handler::CloseBuffer`] and, on `Fin`, wakes any
+    /// task currently parked in [`crate::worker::reader::ReaderRxChannel`]
+    /// so that it can surface EOF to the application.
+    ///
+    /// Per spec \u00a78, all packets in a single UDP datagram are the same
+    /// class. A datagram whose first packet is a `Fin`/`FinAck` is therefore
+    /// expected to contain a single such packet (\u00a710bis: own datagram).
+    /// We tolerate a hypothetical batched form by walking the vec.
+    #[inline]
+    fn buffer_in_close_packets(
+        packets: &mut Vec<BluefinPacket>,
+        conn_bufs: &ConnectionManagedBuffers,
+    ) -> BluefinResult<()> {
+        let mut saw_fin = false;
+        let mut pending_fin_ack_pn: Option<u64> = None;
+        {
+            let mut guard = conn_bufs.close_buff.lock().unwrap();
+            for p in packets.drain(..) {
+                match p.header.type_field {
+                    PacketType::Fin => {
+                        diag_try_send(
+                            &conn_bufs.diag_tx,
+                            DiagnosticEvent::FinReceived {
+                                packet_num: p.header.packet_number,
+                            },
+                        );
+                        guard.buffer_in_fin(&p);
+                        saw_fin = true;
+                    }
+                    PacketType::FinAck => {
+                        diag_try_send(
+                            &conn_bufs.diag_tx,
+                            DiagnosticEvent::FinAckReceived {
+                                packet_num: p.header.packet_number,
+                            },
+                        );
+                        guard.buffer_in_fin_ack(&p);
+                    }
+                    _ => unreachable!(
+                        "buffer_in_close_packets only routes Fin/FinAck"
+                    ),
+                }
+            }
+            // Drain at most one FinAck-send obligation per call. If we
+            // received the peer's FIN, take the pn we owe back.
+            if saw_fin {
+                pending_fin_ack_pn = guard.take_pending_fin_ack_send();
+            }
+            // Drop the close-buffer guard before touching the data buffer
+            // to keep the locks strictly nested in one direction.
+        }
+
+        // Fire the FinAck send (if any). Best-effort try_send: if the
+        // bounded channel is full, the in-flight drainer will catch up
+        // shortly and the next duplicate FIN from the peer (if needed)
+        // will re-arm `pending_fin_ack_send`.
+        if let (Some(pn), Some(tx)) = (pending_fin_ack_pn, conn_bufs.fin_ack_tx.as_ref()) {
+            let _ = tx.try_send(pn);
+        }
+
+        if saw_fin {
+            // Wake the data buffer's waker so a pending recv() observes
+            // `peer_fin_observed == true` and returns EOF. Cloning the
+            // waker out under the data-buffer mutex, then dropping the
+            // guard before waking, follows the same producer pattern as
+            // `buffer_in_data_packets` (see bluefin-architecture \u00a75).
+            let mut guard = conn_bufs.conn_buff.lock().unwrap();
+            let waker = guard.take_waker_clone();
+            drop(guard);
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -350,5 +430,174 @@ impl ConnReaderHandler {
             return Err(e.unwrap());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::header::{BluefinHeader, BluefinSecurityFields, PacketType};
+    use crate::core::packet::BluefinPacket;
+    use crate::net::ack_handler::AckBuffer;
+    use crate::net::close_handler::{CloseBuffer, CloseState};
+    use crate::net::connection::ConnectionBuffer;
+    use bluefin_proto::context::BluefinHost;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Wake, Waker};
+
+    /// Test waker that records whether it was invoked.
+    struct CountingWaker {
+        woken: AtomicBool,
+    }
+
+    impl Wake for CountingWaker {
+        fn wake(self: Arc<Self>) {
+            self.woken.store(true, Ordering::Release);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.woken.store(true, Ordering::Release);
+        }
+    }
+
+    fn fin_packet(src: u32, dst: u32, pn: u64) -> BluefinPacket {
+        let mut header = BluefinHeader::new(
+            src,
+            dst,
+            PacketType::Fin,
+            0x0,
+            BluefinSecurityFields::default(),
+        );
+        header.with_packet_number(pn);
+        BluefinPacket::builder().header(header).build()
+    }
+
+    fn fin_ack_packet(src: u32, dst: u32, pn: u64) -> BluefinPacket {
+        let mut header = BluefinHeader::new(
+            src,
+            dst,
+            PacketType::FinAck,
+            0x0,
+            BluefinSecurityFields::default(),
+        );
+        header.with_packet_number(pn);
+        BluefinPacket::builder().header(header).build()
+    }
+
+    fn make_managed_bufs() -> (ConnectionManagedBuffers, Arc<AtomicBool>) {
+        let conn_buff = Arc::new(Mutex::new(ConnectionBuffer::new(
+            0xaaaa_bbbb,
+            BluefinHost::Client,
+        )));
+        // Set an addr so callers that need it (not us, but the recv path
+        // does) don't trip up. Buffer-in is harmless here.
+        let _ = conn_buff
+            .lock()
+            .unwrap()
+            .buffer_in_addr(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1));
+        let ack_buff = Arc::new(Mutex::new(AckBuffer::new(0)));
+        let peer_fin_observed = Arc::new(AtomicBool::new(false));
+        let close_buff = Arc::new(Mutex::new(CloseBuffer::new(Arc::clone(
+            &peer_fin_observed,
+        ))));
+        let bufs = ConnectionManagedBuffers {
+            conn_buff,
+            ack_buff,
+            close_buff,
+            peer_fin_observed: Arc::clone(&peer_fin_observed),
+            fin_ack_tx: None,
+            diag_tx: None,
+        };
+        (bufs, peer_fin_observed)
+    }
+
+    #[test]
+    fn buffer_in_packets_routes_fin_to_close_buffer_and_wakes_data_waker() {
+        let (bufs, peer_fin_observed) = make_managed_bufs();
+
+        // Register a waker on the conn_buff so we can assert it was woken
+        // by the close-handler code path.
+        let counter = Arc::new(CountingWaker {
+            woken: AtomicBool::new(false),
+        });
+        let waker: Waker = counter.clone().into();
+        {
+            let mut g = bufs.conn_buff.lock().unwrap();
+            g.set_waker_if_changed(&waker);
+        }
+        // Touch the cx parameter shape to ensure the waker round-trips
+        // (smoke check, no real polling here).
+        let _cx = Context::from_waker(&waker);
+
+        let mut packets = vec![fin_packet(0x1, 0x2, 9_999)];
+        let res = ConnReaderHandler::buffer_in_packets(&mut packets, &bufs);
+        assert!(res.is_ok());
+
+        // Close buffer transitioned and lock-free flag is set.
+        assert!(peer_fin_observed.load(Ordering::Acquire));
+        let close_state = bufs.close_buff.lock().unwrap().state();
+        assert_eq!(
+            close_state,
+            CloseState::PeerFinReceived {
+                fin_packet_num: 9_999,
+            }
+        );
+        // Data buffer's waker was invoked so a parked recv() returns EOF.
+        assert!(counter.woken.load(Ordering::Acquire));
+        // Vec drained.
+        assert!(packets.is_empty());
+    }
+
+    #[test]
+    fn buffer_in_packets_routes_fin_ack_to_close_buffer_without_setting_peer_fin_flag() {
+        let (bufs, peer_fin_observed) = make_managed_bufs();
+
+        let mut packets = vec![fin_ack_packet(0x1, 0x2, 1234)];
+        ConnReaderHandler::buffer_in_packets(&mut packets, &bufs).unwrap();
+
+        // FinAck does NOT mean we received a peer FIN.
+        assert!(!peer_fin_observed.load(Ordering::Acquire));
+        let cb = bufs.close_buff.lock().unwrap();
+        assert_eq!(cb.received_fin_ack_for(), Some(1234));
+        assert_eq!(cb.state(), CloseState::Active);
+    }
+
+    #[test]
+    fn fin_with_no_data_waker_registered_is_still_ok() {
+        let (bufs, peer_fin_observed) = make_managed_bufs();
+
+        let mut packets = vec![fin_packet(0x1, 0x2, 5)];
+        // No waker was registered; the close-handler code path should not
+        // error in that case (unlike the data/ack paths which return
+        // NoSuchWakerError when nobody is parked).
+        ConnReaderHandler::buffer_in_packets(&mut packets, &bufs).unwrap();
+        assert!(peer_fin_observed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn future_resolves_when_peer_fin_observed_with_empty_buffer() {
+        // Construct ReaderRxChannelFuture-shaped state by hand: the future
+        // is private to `worker::reader`, so we exercise the same logic
+        // here \u2014 lock-free atomic check after empty `peek()`.
+        let (bufs, peer_fin_observed) = make_managed_bufs();
+
+        // Initially, peer_fin_observed = false; no data; `peek` returns
+        // BufferEmpty. A real future would return Pending.
+        {
+            let g = bufs.conn_buff.lock().unwrap();
+            assert!(g.peek().is_err());
+        }
+        assert!(!peer_fin_observed.load(Ordering::Acquire));
+
+        // Inject FIN; flag flips to true.
+        let mut packets = vec![fin_packet(0x1, 0x2, 1)];
+        ConnReaderHandler::buffer_in_packets(&mut packets, &bufs).unwrap();
+        assert!(peer_fin_observed.load(Ordering::Acquire));
+        // Buffer is still empty; recv path will see (peer_fin_observed && peek().is_err())
+        // and return Ok((0, addr)) \u2014 EOF.
+        let g = bufs.conn_buff.lock().unwrap();
+        assert!(g.peek().is_err());
+        assert!(g.addr().is_some());
     }
 }

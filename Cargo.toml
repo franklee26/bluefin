@@ -3,7 +3,7 @@ members = ["bluefin", "bluefin-io", "bluefin-proto", "bluefintool"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.6"
+version = "0.2.0"
 edition = "2021"
 description = "An experimental, secure, P2P, transport-layer protocol."
 license = "MIT"

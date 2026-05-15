@@ -414,6 +414,14 @@ async fn run_pipe(
             }
         }
     } else {
+        // Our auto-`FinAck` is sent by a separate drainer task fed via
+        // `fin_ack_tx` (see `worker::conn_reader::buffer_in_close_packets`)
+        // so the on-wire send — and its `FinAckSent` diag event — race
+        // with our `recv -> Ok(0)` wakeup. Give the drainer a short
+        // window to run and then drain again so the diag stream reflects
+        // what actually went out before we tear the connection down.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drain_diag(&conn, &peer_tag);
         eprintln!("[{peer_tag}] connection closed (peer Fin observed)");
     }
     Ok(())

@@ -69,12 +69,7 @@ async fn main() -> BluefinResult<()> {
         None => (0..2).collect(),
     };
 
-    for (spawn_ix, task_ix) in task_indices.into_iter().enumerate() {
-        // Small delay to ensure server has both accept() calls ready before
-        // the second connection's hello arrives.
-        if spawn_ix > 0 {
-            sleep(Duration::from_millis(100)).await;
-        }
+    for (_spawn_ix, task_ix) in task_indices.into_iter().enumerate() {
         let port = DEFAULT_PORTS[task_ix];
         let connection_task = spawn(async move {
             run_connection(task_ix, port).await

@@ -14,10 +14,11 @@
 #   ./bench_two_process.sh --retry 3        # auto-retry up to 3 times if a handshake fails
 #   ./bench_two_process.sh --skip-build     # reuse existing release binaries
 #
-# The handshake-race retry is needed because the Bluefin server has a known
-# race (see docs/archive/BINARY_RACE_CONDITIONS.md) where a client hello can
-# arrive before the server's next accept() slot is ready. The 500ms default
-# stagger avoids it most of the time on loopback; --retry catches the rest.
+# --retry catches transient failures (e.g. CI runner noise).
+#
+# The server-side hello queue (HelloState) eliminates the previous
+# handshake race. Stagger defaults to 0; --stagger is preserved for
+# manual experimentation.
 #
 # Output goes to ./bench_logs/<timestamp>/{server,client_<ix>}.log
 # A short summary (FINAL lines + recent inst lines) is printed at the end.
@@ -28,7 +29,7 @@ set -euo pipefail
 NUM_CONNS=2
 CLIENT_TIMEOUT=120          # hard cap on how long any client may run
 SETTLE_AFTER_BUILD=2        # seconds to wait for server bind() to complete
-STAGGER=0.5                 # seconds between spawning successive clients
+STAGGER=0                   # seconds between spawning successive clients (0 = no stagger)
 RETRY=2                     # retry attempts on handshake failure (0 = no retry)
 SKIP_BUILD=0
 PORTS=(1320 1322 1323 1324 1325)   # must match DEFAULT_PORTS in client.rs
@@ -189,10 +190,7 @@ run_attempt() {
         fi
         CLIENT_PIDS+=($!)
         echo "       client #$ix pid: ${CLIENT_PIDS[$ix]} -> $client_log"
-        # Stagger the next client so the server's accept() slot is ready
-        # before its hello arrives. See docs/archive/BINARY_RACE_CONDITIONS.md
-        # for the underlying protocol race this papers over.
-        if (( ix + 1 < NUM_CONNS )); then
+        if (( ix + 1 < NUM_CONNS )) && [[ "$STAGGER" != "0" ]]; then
             sleep "$STAGGER"
         fi
     done
@@ -216,11 +214,11 @@ run_attempt() {
             note=" (hit ${CLIENT_TIMEOUT}s timeout)"
         elif [[ "$code" -ne 0 ]]; then
             note=" (NON-ZERO -- check log)"
-            # Detect the known handshake race so the caller can retry.
+            # Detect handshake failures so the caller can retry.
             if grep -q "Failed to read from handshake connection buffer" \
                 "$attempt_log_dir/client_${ix}.log"; then
                 handshake_failed=1
-                note="$note  [HANDSHAKE RACE]"
+                note="$note  [HANDSHAKE FAIL]"
             fi
         fi
         echo "       client #$ix exit=$code$note"
@@ -337,9 +335,9 @@ for ((attempt = 1; attempt <= RETRY + 1; attempt++)); do
         final_status=0
         break
     elif [[ "$rc" -eq 3 ]]; then
-        # Handshake race: known protocol bug, retry transparently.
+        # Handshake failure, retry transparently.
         echo
-        echo ">>> attempt $attempt hit the known handshake race (see docs/archive/BINARY_RACE_CONDITIONS.md)."
+        echo ">>> attempt $attempt hit a handshake failure."
         if (( attempt < RETRY + 1 )); then
             echo ">>> retrying ($((attempt + 1)) of $((RETRY + 1)))..."
             continue

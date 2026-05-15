@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
@@ -20,6 +22,29 @@ pub mod client;
 pub mod connection;
 pub mod ordered_bytes;
 pub mod server;
+
+/// Maximum number of `ClientHello` packets to buffer when no `accept()` slot
+/// is ready yet. Prevents unbounded memory growth from a flood of hellos.
+pub(crate) const MAX_QUEUED_HELLOS: usize = 64;
+
+/// Shared state between the server's `accept()` and the `ReaderTxChannel`
+/// workers. Protected by a single mutex so that checking `pending_accept_ids`
+/// and pushing to / popping from `hello_queue` is atomic — no TOCTOU race.
+pub(crate) struct HelloState {
+    /// Accept slots that are ready for incoming hellos (FIFO).
+    pub(crate) pending_accept_ids: VecDeque<u32>,
+    /// `ClientHello` packets that arrived before their `accept()` slot existed.
+    pub(crate) hello_queue: VecDeque<(BluefinPacket, SocketAddr)>,
+}
+
+impl HelloState {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending_accept_ids: VecDeque::new(),
+            hello_queue: VecDeque::new(),
+        }
+    }
+}
 
 pub(crate) const BLUEFIN_HEADER_SIZE_BYTES: usize = 20;
 pub(crate) const MAX_BLUEFIN_PAYLOAD_SIZE_BYTES: usize = 1500;
@@ -118,10 +143,10 @@ fn build_and_start_tx(
     num_tx_workers: u16,
     socket: Arc<UdpSocket>,
     conn_manager: Arc<ConnectionManager>,
-    pending_accept_ids: Arc<Mutex<Vec<u32>>>,
+    hello_state: Arc<Mutex<HelloState>>,
     host_type: BluefinHost,
 ) {
-    let tx = ReaderTxChannel::new(socket, conn_manager, pending_accept_ids, host_type);
+    let tx = ReaderTxChannel::new(socket, conn_manager, hello_state, host_type);
 
     for id in 0..num_tx_workers {
         let mut tx_clone = tx.clone();

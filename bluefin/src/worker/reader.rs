@@ -12,7 +12,8 @@ use crate::{
         ack_handler::AckBuffer,
         connection::{ConnectionBuffer, ConnectionManager},
         diag_try_send, is_client_ack_packet, is_hello_packet, ConnectionManagedBuffers,
-        DiagSender, DiagnosticEvent, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
+        DiagSender, DiagnosticEvent, HelloState, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
+        MAX_QUEUED_HELLOS,
     },
 };
 use bluefin_proto::context::BluefinHost;
@@ -32,7 +33,7 @@ pub(crate) struct ReaderTxChannel {
     pub(crate) id: u16,
     socket: Arc<UdpSocket>,
     conn_manager: Arc<ConnectionManager>,
-    pending_accept_ids: Arc<Mutex<Vec<u32>>>,
+    hello_state: Arc<Mutex<HelloState>>,
     host_type: BluefinHost,
 }
 
@@ -197,58 +198,75 @@ impl ReaderRxChannel {
     }
 }
 
+/// Result of checking whether a packet is a hello that should be
+/// handled specially by the handshake path.
+enum HelloAction {
+    /// Not a hello packet — proceed with normal data routing.
+    NotHello,
+    /// Hello was matched to a pending `accept()` slot.
+    /// The `u32` is the server-side connection ID to route to.
+    Routed(u32),
+    /// No `accept()` slot was ready — packet has been queued (or
+    /// dropped if the queue is full). Caller should `continue`.
+    Queued,
+}
+
 impl ReaderTxChannel {
     pub(crate) fn new(
         socket: Arc<UdpSocket>,
         conn_manager: Arc<ConnectionManager>,
-        pending_accept_ids: Arc<Mutex<Vec<u32>>>,
+        hello_state: Arc<Mutex<HelloState>>,
         host_type: BluefinHost,
     ) -> Self {
         Self {
             id: 0,
             socket,
             conn_manager,
-            pending_accept_ids,
+            hello_state,
             host_type,
         }
     }
 
+    /// Checks whether the single packet in `packets` is a hello and, if
+    /// so, either routes it to a pending `accept()` slot or queues it for
+    /// a future `accept()` — all under a single `HelloState` lock.
     #[inline]
-    fn handle_for_handshake(
+    fn handle_hello_single(
         &self,
-        packet: &BluefinPacket,
-        is_hello: &mut bool,
-        src_conn_id: &mut u32,
-    ) -> BluefinResult<()> {
-        if is_hello_packet(self.host_type, &packet) {
-            match self.host_type {
-                BluefinHost::PackLeader => {
-                    // Choose a conn id to buffer this in FIFO order
-                    // Use remove(0) instead of pop() to get first element (FIFO)
-                    let mut pending = self.pending_accept_ids.lock().unwrap();
-                    if !pending.is_empty() {
-                        *src_conn_id = pending.remove(0);
-                        *is_hello = true;
-                        return Ok(());
-                    } else {
-                        *is_hello = false;
-                        return Err(BluefinError::CouldNotAcceptConnectionError(
-                            "No pending accepts ready".to_string(),
-                        ));
-                    }
-                }
-                BluefinHost::Client => {
-                    *is_hello = true;
-                    return Ok(());
-                }
-                _ => {
-                    unimplemented!();
-                }
-            }
+        packets: &mut Vec<BluefinPacket>,
+        addr: SocketAddr,
+    ) -> HelloAction {
+        debug_assert_eq!(packets.len(), 1);
+
+        // is_hello_packet only inspects the header (a Copy struct), so
+        // an immutable borrow of packets[0] is fine here.
+        if !is_hello_packet(self.host_type, &packets[0]) {
+            return HelloAction::NotHello;
         }
 
-        *is_hello = false;
-        Ok(())
+        match self.host_type {
+            BluefinHost::PackLeader => {
+                // Take ownership BEFORE locking so that the queue push
+                // (if needed) happens inside the same critical section
+                // as the pending-slot check.
+                let pkt = packets.drain(..).next().unwrap();
+                let mut state = self.hello_state.lock().unwrap();
+                if let Some(id) = state.pending_accept_ids.pop_front() {
+                    // Put the packet back so the caller's normal
+                    // buffer_in_data loop processes it.
+                    packets.push(pkt);
+                    HelloAction::Routed(id)
+                } else if state.hello_queue.len() < MAX_QUEUED_HELLOS {
+                    state.hello_queue.push_back((pkt, addr));
+                    HelloAction::Queued
+                } else {
+                    // Queue full — drop the packet.
+                    HelloAction::Queued
+                }
+            }
+            BluefinHost::Client => HelloAction::Routed(0),
+            _ => unimplemented!(),
+        }
     }
 
     #[inline]
@@ -359,11 +377,15 @@ impl ReaderTxChannel {
             // If there is only one packet, then it's possible it is a handshake packet. Handshakes are sent
             // via one udp datagram carries exactly one bluefin packet
             if packets.len() == 1 {
-                if self
-                    .handle_for_handshake(&packets[0], &mut is_hello, &mut src_conn_id)
-                    .is_err()
-                {
-                    continue;
+                match self.handle_hello_single(&mut packets, addr) {
+                    HelloAction::Routed(id) => {
+                        if self.host_type == BluefinHost::PackLeader {
+                            src_conn_id = id;
+                        }
+                        is_hello = true;
+                    }
+                    HelloAction::NotHello => { /* fall through to normal routing */ }
+                    HelloAction::Queued => { continue; }
                 }
             }
 

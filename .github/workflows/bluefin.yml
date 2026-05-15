@@ -202,6 +202,16 @@ jobs:
       # the contended runner without losing meaningful demux parallelism
       # for the 2 concurrent handshakes the bench performs.
       BLUEFIN_NUM_READER_WORKERS:           "2"         # 3 -> 2 to fit hosted-runner thread budget
+      # Client-side pacing knob. Bluefin has no on-wire congestion
+      # control yet (bluefin-architecture §8), so a tight client send
+      # loop on a contended 3-vCPU hosted runner can outrun the
+      # receiver's drain rate, overflow the kernel UDP buffer, and
+      # trigger packet loss the protocol can't recover from. A 50 µs
+      # sleep every SENDS_PER_YIELD (256) iterations gives the receiver
+      # a real scheduling window without meaningfully impacting peak
+      # throughput on healthy runners. Production binaries unaffected
+      # unless this env var is set.
+      BLUEFIN_CLIENT_SEND_THROTTLE_US:      "50"
       # Per-run retry knobs. Hosted macos-latest runners occasionally land
       # on a deeply contended host where both bench peers get starved and
       # the run yields 0 GOOD conns despite no actual code regression.

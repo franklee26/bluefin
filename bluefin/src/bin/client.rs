@@ -44,6 +44,33 @@ fn num_sends() -> usize {
         .unwrap_or(DEFAULT_NUM_SENDS)
 }
 
+/// Optional per-yield-window throttle, in **microseconds**, read from
+/// `BLUEFIN_CLIENT_SEND_THROTTLE_US`. When set to a positive integer the
+/// client send loop sleeps that many microseconds every
+/// [`SENDS_PER_YIELD`] iterations, on top of the unconditional
+/// `yield_now().await`. Default `0` (no throttle) so production /
+/// dev-box behaviour is unchanged.
+///
+/// **Why this exists.** Bluefin has no on-wire congestion control yet
+/// (see bluefin-architecture §8 "Congestion control: None"). On a healthy
+/// dev box this is fine — the writer's bounded `flume::bounded(4096)`
+/// queue and the kernel UDP socket buffers absorb bursts. On contended
+/// hosted-CI runners (3 vCPUs, see bluefin-ci), the reader and writer
+/// tasks are co-scheduled with everything else; a tight client send loop
+/// can overwhelm the receiver's drain rate, overflow the kernel UDP
+/// buffer, and trigger packet loss that bluefin's retransmit-free
+/// pipeline can't recover from. A small inter-batch sleep (10–100 µs)
+/// gives the receiver a scheduling opportunity per ~256 sends without
+/// meaningfully impacting steady-state throughput.
+const DEFAULT_SEND_THROTTLE_US: u64 = 0;
+
+fn send_throttle_us() -> u64 {
+    env::var("BLUEFIN_CLIENT_SEND_THROTTLE_US")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SEND_THROTTLE_US)
+}
+
 /// CLI:
 ///   client                    -> spawn 2 tasks in this process (default, like before)
 ///   client --task <ix>        -> spawn ONE task using DEFAULT_PORTS[ix].
@@ -171,6 +198,16 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
             task_ix, n_sends, DEFAULT_NUM_SENDS,
         );
     }
+    let throttle_us = send_throttle_us();
+    let throttle = if throttle_us > 0 {
+        eprintln!(
+            "(client #{}) SEND_THROTTLE_US set: {} us every {} sends",
+            task_ix, throttle_us, SENDS_PER_YIELD,
+        );
+        Some(Duration::from_micros(throttle_us))
+    } else {
+        None
+    };
     for i in 0..n_sends {
         total_bytes += conn.send_bytes_async(payload.clone()).await?;
         // Yield often enough that other tasks (the other connection, the
@@ -178,6 +215,12 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
         // tight `for` loop monopolises the worker thread.
         if i % SENDS_PER_YIELD == 0 {
             yield_now().await;
+            // Optional pacing: sleep gives the peer (and the local
+            // writer/socket) a real scheduling window beyond what
+            // `yield_now()` provides. No-op when the env var is unset.
+            if let Some(d) = throttle {
+                sleep(d).await;
+            }
             // Cheap relaxed check is fine here; we only need to notice
             // shutdown within one yield window. Break out so the rest of
             // the function still runs (flush + close).

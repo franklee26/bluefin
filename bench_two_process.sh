@@ -130,6 +130,120 @@ kv()      { # kv "key" "value"
     printf '  %s%-13s%s %s%s%s\n' "$C_DIM" "$1" "$C_RESET" "$C_BOLD" "$2" "$C_RESET"
 }
 
+# --- live progress bar ----------------------------------------------------
+# Spawned as a backgrounded subshell during the "waiting for clients"
+# step. Tails the in-progress server log (which the per-conn task writes
+# as `<ix> avg <…> | inst <X> [kg]b/s | …` every ~3500 iters) and
+# refreshes ONE line in place using \r + ANSI clear-to-EOL, rendering
+# ONE small bar per connection side-by-side. Disabled automatically on
+# non-TTY stdout so CI logs stay clean.
+#
+# **CI contract** (do not remove the `[[ -t 1 ]]` guard): `bench_ci.sh`
+# runs this script through `... | tee "$run_stdout"` and greps the
+# captured stdout for `^\[log-dir\] `. The tee pipe is not a TTY, so the
+# monitor short-circuits there and emits no `\r` / ANSI bytes. Same
+# protection covers GitHub-hosted runners (no PTY) and any user who
+# pipes the script (`./bench_two_process.sh | grep ...`).
+#
+# Per-conn progress is estimated from the server log's running average:
+# `bytes_so_far ≈ avg_rate × elapsed_seconds`, compared against the
+# expected payload (`BLUEFIN_NUM_SENDS × 1500 B` per conn, with the
+# default matching the client binary). It's an estimate, not exact -- a
+# starved conn whose `avg` rate hasn't built up yet will show low pct
+# even after a while. That's fine and informative: it tells you which
+# conn is the slow one. Bars cap at 100 % so a finished conn just stays
+# pegged until the monitor is killed by `stop_progress_monitor`.
+PROGRESS_PID=""
+PROGRESS_BAR_WIDTH=10            # per-conn bar width
+start_progress_monitor() {
+    [[ -t 1 ]] || return 0
+    local server_log="$1"
+    local start_ts="$2"
+    shift 2
+    local ixs=("$@")
+    # Expected payload per conn = num_sends × 1500 B (matches
+    # client.rs:DEFAULT_NUM_SENDS and the BLUEFIN_NUM_SENDS override).
+    local num_sends="${BLUEFIN_NUM_SENDS:-10000000}"
+    [[ "$num_sends" =~ ^[0-9]+$ ]] || num_sends=10000000
+    local expected_bytes=$(( num_sends * 1500 ))
+    (
+        # Subshell -- our own trap so cleanup() doesn't kill our parent's
+        # state. Exit silently when signalled.
+        trap 'exit 0' TERM INT
+        # Cap refresh at ~4 Hz; faster wastes CPU and flickers more.
+        local interval=0.25
+        while true; do
+            local now elapsed segment ix latest avg_val avg_unit inst_val inst_unit
+            local avg_bps bytes_so_far pct filled empty bar line=""
+            now="$(date +%s)"
+            elapsed=$(( now - start_ts ))
+            (( elapsed < 0 )) && elapsed=0
+            for ix in "${ixs[@]}"; do
+                # Pull the last server-log line for this conn.
+                latest="$(grep -E "^${ix} " "$server_log" 2>/dev/null | tail -n 1)"
+                pct=0
+                inst_val=""; inst_unit=""
+                if [[ -n "$latest" ]]; then
+                    if [[ "$latest" =~ avg\ ([0-9]+\.[0-9]+)\ ([kmg]b/s) ]]; then
+                        avg_val="${BASH_REMATCH[1]}"
+                        avg_unit="${BASH_REMATCH[2]}"
+                        # Convert to bytes/sec via the unit.
+                        case "$avg_unit" in
+                            gb/s) avg_bps="$(awk -v v="$avg_val" 'BEGIN{printf "%.0f", v*1e9}')" ;;
+                            mb/s) avg_bps="$(awk -v v="$avg_val" 'BEGIN{printf "%.0f", v*1e6}')" ;;
+                            kb/s) avg_bps="$(awk -v v="$avg_val" 'BEGIN{printf "%.0f", v*1e3}')" ;;
+                            *)    avg_bps=0 ;;
+                        esac
+                        bytes_so_far=$(( avg_bps * elapsed ))
+                        if (( expected_bytes > 0 )); then
+                            pct=$(( bytes_so_far * 100 / expected_bytes ))
+                            (( pct > 100 )) && pct=100
+                            (( pct < 0 )) && pct=0
+                        fi
+                    fi
+                    if [[ "$latest" =~ inst\ ([0-9]+\.[0-9]+)\ ([kmg]b/s) ]]; then
+                        inst_val="${BASH_REMATCH[1]}"
+                        inst_unit="${BASH_REMATCH[2]}"
+                    fi
+                fi
+                filled=$(( pct * PROGRESS_BAR_WIDTH / 100 ))
+                empty=$(( PROGRESS_BAR_WIDTH - filled ))
+                bar="$(printf '█%.0s' $(seq 1 $filled 2>/dev/null) 2>/dev/null)$(printf '·%.0s' $(seq 1 $empty 2>/dev/null) 2>/dev/null)"
+                if [[ -n "$inst_val" ]]; then
+                    segment="$(printf '%sc%d%s %s[%s]%s %3d%% %s%s %s%s' \
+                        "$C_BOLD" "$ix" "$C_RESET" \
+                        "$C_CYAN" "$bar" "$C_RESET" \
+                        "$pct" \
+                        "$C_DIM" "$inst_val $inst_unit" "$C_RESET" "")"
+                else
+                    segment="$(printf '%sc%d%s %s[%s]%s %3d%% %s%s%s' \
+                        "$C_BOLD" "$ix" "$C_RESET" \
+                        "$C_CYAN" "$bar" "$C_RESET" \
+                        "$pct" \
+                        "$C_DIM" "(warming up)" "$C_RESET")"
+                fi
+                if [[ -z "$line" ]]; then
+                    line="$segment"
+                else
+                    line="$line   $segment"
+                fi
+            done
+            printf '\r      %s\033[K' "$line"
+            sleep "$interval"
+        done
+    ) &
+    PROGRESS_PID=$!
+}
+stop_progress_monitor() {
+    if [[ -n "$PROGRESS_PID" ]]; then
+        kill "$PROGRESS_PID" 2>/dev/null || true
+        wait "$PROGRESS_PID" 2>/dev/null || true
+        PROGRESS_PID=""
+        # Wipe the live line so subsequent ok/warn output starts clean.
+        [[ -t 1 ]] && printf '\r\033[K'
+    fi
+}
+
 # --- top banner -----------------------------------------------------------
 banner "Bluefin two-process throughput benchmark"
 kv "connections" "$NUM_CONNS"
@@ -155,6 +269,9 @@ CLIENT_PIDS=()
 cleanup() {
     local exit_code=$?
     printf '\n'
+    # Kill the live progress monitor first so it stops repainting over
+    # subsequent cleanup output.
+    stop_progress_monitor
     step "cleanup: stopping background processes"
     if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
         kill "$SERVER_PID" 2>/dev/null || true
@@ -259,6 +376,10 @@ run_attempt() {
 
     # --- 5. wait for clients, then drain server ----------------------------
     step "waiting for clients to finish"
+    local start_wait_ts ixs=()
+    start_wait_ts="$(date +%s)"
+    for ((ix = 0; ix < NUM_CONNS; ix++)); do ixs+=("$ix"); done
+    start_progress_monitor "$attempt_log_dir/server.log" "$start_wait_ts" "${ixs[@]}"
     CLIENT_EXIT_CODES=()
     for pid in "${CLIENT_PIDS[@]}"; do
         set +e
@@ -267,6 +388,7 @@ run_attempt() {
         set -e
         CLIENT_EXIT_CODES+=("$code")
     done
+    stop_progress_monitor
 
     local handshake_failed=0
     for ((ix = 0; ix < NUM_CONNS; ix++)); do

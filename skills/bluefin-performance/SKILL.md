@@ -67,7 +67,67 @@ Full prioritized list lives in [`THROUGHPUT_ANALYSIS_2026.md`](../../THROUGHPUT_
 
 ## Last profiling pass
 
-### 2026-05-10 — server flamegraph, **post G3 + F3 + P** (current `flamegraph.svg`)
+### 2026-05-15 — server + client flamegraphs, **post G3 + F3 + P + CI-throttle**
+
+Two captures taken back-to-back after the new client-side CI throttle landed (`BLUEFIN_CLIENT_SEND_THROTTLE_US=25` / `BLUEFIN_CLIENT_SEND_THROTTLE_EVERY=3000`, dev-box default = off; throttle state of *these* captures unconfirmed — read the percentages with that caveat). The 2026-05-10 entries below are retained for round-attribution; these new entries are the current source of truth for "what's hot now."
+
+**Server top frames** (~6 863 leaf samples):
+
+| Self %  | Symbol | Bucket |
+|--------:|--------|--------|
+| **53.80** | `__recvfrom` | kernel — blocked waiting for next datagram |
+| **24.45** | `park_internal` (tokio worker park) | scheduler idle |
+| **13.89** | `kevent` | tokio I/O driver poll |
+| 6.40 (incl) | `ConnReaderHandler::start::_{{closure}}` | recv loop body |
+| 4.75 | `__sendto` | writer (acks) |
+| 1.18 | `mach_absolute_time` | tokio timer driver |
+| 1.08 | `OrderedBytes::buffer_in_packet` self (74 samples) | demux — flat absolute vs post-G3 (108) |
+| 0.63 | `free_small` | small-object free |
+
+**Client top frames** (11 045 leaf samples):
+
+| Self %  | Symbol | Bucket |
+|--------:|--------|--------|
+| **71.55** | `__sendto` | kernel — writer pushing datagrams |
+| 72.33 (incl) | `WriterHandler::read_data::_{{closure}}::_{{closure}}` | spawned sender task (parent of `__sendto`) |
+| 15.75 (incl) | `WriterHandler::start::_{{closure}}` | packetize task |
+| **6.32** | `_platform_memmove` (698 samples, y=101 under writer subtree) | per-datagram payload copy |
+| 6.52 | `WriterHandler::read_data::_{{closure}}` self | packetize body |
+| 4.09 | `client::run_connection::_{{closure}}` | bench loop body (#16 still resolved) |
+| 4.01 + 3.26 | `park_internal` / timer `Driver::park_internal` | idle (throttle sleeps land here) |
+| 1.26 | `__recvfrom` | client reading ACKs |
+| 1.0 (sum) | `mach_absolute_time` + `clock_gettime` + `Timespec::now` | tokio timer driver (NOT user code; #12/#16 hold) |
+| 0.29 | tokio mpsc `Tx::find_block` + `Rx::pop` | residual ack/recycle channel; P still holds |
+| ~0.5 | malloc/free leaves | well below pre-P (was 4.29 %) |
+
+**Deltas vs post-G3+F3+P (2026-05-10):**
+
+| Bucket | Server 05-10 → 05-15 | Client 05-10 → 05-15 | Verdict |
+|---|---|---|---|
+| `__recvfrom` | — → **53.80 %** (new) | 1.29 % → 1.26 % | server now blocked in recv (throttled / starved pipe) |
+| `__sendto` | 13.21 % → **4.75 %** | orphaned → **71.55 %** | **capture-quality win** on client; parent chain restored |
+| `kevent` | 35.80 % → **13.89 %** | 3.79 % → 0.62 % | shifted into recvfrom / sendto (better attribution) |
+| `_platform_memmove` | gone (F2 holds) | 6.70 % → **6.32 %** | flat — same hotspot, now plausibly attributed to writer subtree |
+| `WriterHandler::read_data` subtree | n/a | 5.76 % (mostly orphaned) → **72.33 % inclusive** | **`__sendto` now correctly parented under writer task** — biggest attribution improvement |
+| tokio mpsc list-block churn | n/a | 0.29 % → 0.29 % | P still holds |
+| malloc/free | flat | 4.29 % → ~0.5 % | down (less per-iter alloc under flume + throttle) |
+| Teardown frames | gone | gone | O still holds |
+
+**Verdict: no regression; the post-P "honest unknown" is no longer unknown.**
+
+The previous client capture's 80 % dtrace-orphan rate hid `__sendto` entirely and left `_platform_memmove` parentless. **This client capture has near-zero orphan rate on the hot subtree**: the full chain `tokio::task::raw::poll → worker::Context::run_task → WriterHandler::read_data::{{closure}}::{{closure}} → __sendto` is intact (7903/11045 samples = 71.55 % at the leaf, 7989 inclusive on the closure), and `_platform_memmove` (698 samples, y=101) sits at the same stack depth as the writer's other leaves under the `read_data` subtree — strongly supporting hypothesis (1) from the post-P entry: **the 6.3 % memmove is `serialize_packet_direct`'s `unsafe { copy_nonoverlapping(payload, ...) }` per-datagram copy**. The K′ scatter-gather `sendmsg_x` fix (still gated on congestion control) remains the only structural lever.
+
+System-wide, client + server form a near-textbook **kernel-I/O-bound symmetric pipe**: client 71.55 % in `__sendto`, server 53.80 % in `__recvfrom`, server has 24.45 % idle headroom (consistent with the throttle starving it). Every userspace round (F1/F2/F3/G3/O/P) re-confirmed.
+
+**Capture-quality learnings (read this before the next flamegraph run).**
+- **Dtrace orphan-rate varies dramatically run-to-run on the same binary.** The post-P client capture had ~80 % orphans (only 2 214 of 11 178 leaves had a recoverable parent); the 2026-05-15 client capture on the same binary has near-zero orphans on the writer subtree. We did **not** change the build profile between the two — the prior speculation that switching to `lto = "thin"` would help may have been unnecessary. **Lesson: re-capture once before concluding "parent unrecoverable" — it might just be a bad sampling run.** Two captures, same shape, *then* it's a profiler limitation.
+- **A high-quality capture rewrites prior "honest unknowns."** The 6.70 % memmove that was officially unattributable in the post-P entry is now plausibly the `serialize_packet_direct` payload copy because its stack y-coordinate matches the writer subtree's other leaves. Stack-depth (y-coord in the SVG) is a useful sanity check when parent symbols are missing — leaves at the same y under the same dominant ancestor are very likely siblings.
+- **`__sendto` 71.55 % is the *client* — not a server-side surprise.** Pair client + server captures from the same run before drawing system-wide conclusions. The 2026-05-10 entries were captured separately (server first, then client) and the two halves don't necessarily tell a consistent story; the 2026-05-15 pair does (client push-bound, server recv-bound, symmetric).
+- **`park_internal` on the client now eats ~7 % combined** (`park_internal` + `Driver::park_internal`). On an unthrottled capture this should drop toward 1–2 %; if it doesn't, the throttle's `tokio::time::sleep` cadence is leaking into the profile (tokio sleep has a ~3 ms macOS floor — see `user-memory:rust-tokio.md`).
+- **Sample-count sanity floor.** Server capture was 6 863 leaves, client was 11 045 — both fine, both > 2 620 of the post-G3+F3+P server capture. Below ~2 000 leaves, percentage noise (~±0.5 pp on small frames) dominates real signal; flag and re-capture rather than drawing conclusions.
+- **Same `flamegraph.svg` filename for both binaries.** The repo convention is to overwrite a single root-level `flamegraph.svg`; capture binary is implied by filesystem mtime + recent activity. Snapshot interesting captures into `flamegraphs/YYYY-MM-DD-{server,client}-rounds.svg` if you want to keep them around for diff'ing.
+
+### 2026-05-10 — server flamegraph, **post G3 + F3 + P** (historical, superseded by 2026-05-15 entry above)
 
 2 620 leaf samples / shorter healthy bench segment. **Headline: server is now ~65 % kernel I/O + scheduler wait.** Pure-library CPU is <8 % of total, every prior round confirmed by absence, no remaining hotspot above 1.3 %. The server is *empirically not CPU-bound* — further library polish on this side is genuinely without ROI.
 
@@ -170,7 +230,7 @@ Full prioritized list lives in [`THROUGHPUT_ANALYSIS_2026.md`](../../THROUGHPUT_
 
 **Calibration after #12.** Once the bench-side `clock_gettime` storm is gone, expect roughly +5–6 % apparent server throughput at the same library cost, because the saved CPU goes to actually draining the recv path. Re-profile after the fix; #13 should then climb the chart proportionally. **→ confirmed in round F1: median avg +1.7 %, peak max held flat — saved CPU went to drain, not to peak. Re-profile shows #13 (`OrderedBytes::consume` memcpy) and #14 (recv `BytesMut`) should now be a larger fraction of the remaining server pie.** **→ second confirmation in the post-F1+F2+O capture above: #13's memmove is gone entirely; #14's malloc chain dropped from ~1.15 % → ~0.65 % (proportionally smaller because total drained CPU also fell). The server is no longer the bottleneck.**
 
-### 2026-05-10 — client flamegraph, **post G3 + F3 + P** (current `flamegraph.svg`)
+### 2026-05-10 — client flamegraph, **post G3 + F3 + P** (historical, superseded by 2026-05-15 entry above)
 
 11 178 total samples / one healthy bench segment. **P delivered exactly what we predicted: tokio mpsc list-block churn is gone.** Two important caveats: (1) this capture has a *much* higher dtrace-orphan rate than the prior client capture (only 2 214 of 11 178 leaves have a recoverable parent — 80 % orphaned), so most apples-to-apples comparisons against pre-P are unsafe; (2) the overall flame is dominated by a single 6.70 % `_platform_memmove` leaf whose parent is unrecoverable — see "honest unknown" below.
 

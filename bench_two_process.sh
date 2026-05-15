@@ -244,6 +244,122 @@ stop_progress_monitor() {
     fi
 }
 
+# --- inst-throughput line chart ------------------------------------------
+# At end-of-run, render an ASCII line chart of each conn's instantaneous
+# throughput over time. TTY-gated for the same CI-safety reasons as the
+# progress monitor. Resolution intentionally low (60 cols × 10 rows) --
+# the goal is "relative trends across conns" not a precise plot.
+#
+# Series source: per-conn `^<ix> ... inst <V> <unit>` lines in the
+# server log (one print every ~3500 iters, see server.rs:print_throughput).
+# Implementation in portable awk; markers are the bare conn ix digit
+# (`0`/`1`/...) with `*` for collisions between conns at the same cell.
+CHART_WIDTH=60
+CHART_HEIGHT=10
+render_inst_chart() {
+    [[ -t 1 ]] || return 0
+    local server_log="$1"
+    [[ -s "$server_log" ]] || return 0
+    awk -v W="$CHART_WIDTH" -v H="$CHART_HEIGHT" '
+    function fmt(v,    s) {
+        if (v >= 1000) { s = sprintf("%.2f gb/s", v/1000); return s }
+        if (v >= 1)    { s = sprintf("%.1f mb/s", v);     return s }
+        s = sprintf("%.0f kb/s", v*1000); return s
+    }
+    # Server prints fields:
+    #   $1=<ix>  $2=avg  $3=<v>  $4=<unit>  $5=|  $6=inst  $7=<v>  $8=<unit>  ...
+    $1 ~ /^[0-9]+$/ && $6 == "inst" {
+        ix = $1 + 0
+        v  = $7 + 0
+        u  = $8
+        if (u == "gb/s")      v = v * 1000   # store everything as mb/s
+        else if (u == "kb/s") v = v / 1000
+        n = ++counts[ix]
+        samples[ix SUBSEP n] = v
+        if (v > vmax)   vmax = v
+        if (ix > max_ix) max_ix = ix
+    }
+    END {
+        if (max_ix < 0 || vmax <= 0) {
+            print "      (no inst samples in server log -- nothing to plot)"
+            exit
+        }
+        # Resample each conn to W columns.
+        for (ix = 0; ix <= max_ix; ix++) {
+            n = counts[ix] + 0
+            if (n == 0) continue
+            for (c = 0; c < W; c++) {
+                if (n == 1) {
+                    series[ix SUBSEP c] = samples[ix SUBSEP 1]
+                    has[ix SUBSEP c] = 1
+                } else if (n <= W) {
+                    src  = c * (n - 1) / (W - 1)
+                    lo   = int(src); hi = lo + 1
+                    if (hi >= n) hi = n - 1
+                    frac = src - lo
+                    series[ix SUBSEP c] = samples[ix SUBSEP (lo+1)] * (1 - frac) \
+                                        + samples[ix SUBSEP (hi+1)] * frac
+                    has[ix SUBSEP c] = 1
+                } else {
+                    s = int(c * n / W) + 1
+                    e = int((c+1) * n / W)
+                    if (e < s) e = s
+                    if (e > n) e = n
+                    sum = 0; k = 0
+                    for (i = s; i <= e; i++) { sum += samples[ix SUBSEP i]; k++ }
+                    if (k > 0) {
+                        series[ix SUBSEP c] = sum / k
+                        has[ix SUBSEP c] = 1
+                    }
+                }
+            }
+        }
+        # Build the 2-D grid (row 0 = top of y-axis).
+        for (r = 0; r < H; r++) for (c = 0; c < W; c++) grid[r SUBSEP c] = " "
+        for (ix = 0; ix <= max_ix; ix++) {
+            for (c = 0; c < W; c++) {
+                if (!has[ix SUBSEP c]) continue
+                y = (series[ix SUBSEP c] / vmax) * (H - 1)
+                r = (H - 1) - int(y + 0.5)
+                if (r < 0)  r = 0
+                if (r >= H) r = H - 1
+                cur = grid[r SUBSEP c]
+                if (cur == " ")                grid[r SUBSEP c] = ix
+                else if (cur != (ix ""))       grid[r SUBSEP c] = "*"
+            }
+        }
+        # Render.
+        for (r = 0; r < H; r++) {
+            if (r % 2 == 0) label = fmt(vmax * (H - 1 - r) / (H - 1))
+            else            label = ""
+            printf "      %10s │", label
+            for (c = 0; c < W; c++) printf "%s", grid[r SUBSEP c]
+            printf "\n"
+        }
+        # X-axis.
+        printf "      %10s └", ""
+        for (c = 0; c < W; c++) printf "─"
+        printf "\n"
+        # X-axis labels.
+        end_label = "end"
+        pad = W - length("start") - length(end_label)
+        if (pad < 1) pad = 1
+        printf "      %10s   start", ""
+        for (i = 0; i < pad; i++) printf " "
+        printf "%s\n", end_label
+        # Legend.
+        printf "      %10s   ", ""
+        for (ix = 0; ix <= max_ix; ix++) {
+            if (counts[ix] + 0 == 0) continue
+            if (ix > 0) printf "  "
+            printf "%d = conn #%d", ix, ix
+        }
+        if (max_ix >= 1) printf "    * = overlap"
+        printf "\n"
+    }
+    ' "$server_log"
+}
+
 # --- top banner -----------------------------------------------------------
 banner "Bluefin two-process throughput benchmark"
 kv "connections" "$NUM_CONNS"
@@ -483,6 +599,13 @@ print_summary() {
             printf '%s\n' "$matches" | sed "s/^/      ${C_GREY}│${C_RESET} /"
         fi
     done
+
+    # TTY-only: ASCII line graph of instantaneous throughput trends across
+    # the whole run. Skipped on CI / piped stdout to keep logs clean.
+    if [[ -t 1 ]]; then
+        section "Instantaneous throughput trend"
+        render_inst_chart "$server_log"
+    fi
 
     section "Per-client report"
     for ((ix = 0; ix < NUM_CONNS; ix++)); do

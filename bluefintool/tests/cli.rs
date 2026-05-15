@@ -230,3 +230,101 @@ fn diagnostics_mode_shows_connection_info() {
         "server hex dump should contain 'diag test' bytes: {server_stderr}"
     );
 }
+
+/// Verifies the FIN / FIN-ACK graceful-close path end-to-end:
+///
+/// - The connect-mode client closes its stdin (Stdio::piped + drop) which
+///   triggers the `nc -N`-style "stdin EOF → close()" path.
+/// - The client's writer should emit a `Fin` and observe the peer's
+///   `FinAck` (visible as `fin-sent` / `fin-ack-recv` diag events) before
+///   printing the `connection closed (local Fin acked by peer)`
+///   confirmation.
+/// - The server should observe the peer's `Fin` (`fin-recv` diag event +
+///   `recv` returning `Ok(0)` → "peer closed (EOF)" branch), auto-emit a
+///   `FinAck` (`fin-ack-sent`), and print the `connection closed (peer
+///   Fin observed)` confirmation.
+#[test]
+fn graceful_close_emits_fin_finack_and_confirmation() {
+    use std::io::Write;
+
+    let port = test_port(200);
+    let port_str = port.to_string();
+
+    let mut server = Command::new(bin())
+        .args(["-l", &port_str, "-d"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn server");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut client = Command::new(bin())
+        .args(["127.0.0.1", &port_str, "-d"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn client");
+
+    let payload = b"close me\n";
+    {
+        let stdin = client.stdin.as_mut().expect("client stdin");
+        stdin.write_all(payload).expect("write");
+    }
+    // Drop the writable end → client sees stdin EOF → connect-mode
+    // triggers `BluefinConnection::close()`.
+    drop(client.stdin.take());
+
+    let (_client_stdout, client_stderr) = wait_or_kill(client, Duration::from_secs(3));
+    std::thread::sleep(Duration::from_millis(500));
+    let (_server_stdout, server_stderr) = wait_or_kill(server, Duration::from_secs(2));
+
+    // -------- client side: local-initiated close --------
+    assert!(
+        client_stderr.contains("closing connection (stdin EOF)"),
+        "client should log stdin-EOF exit reason: {client_stderr}"
+    );
+    assert!(
+        client_stderr.contains("fin-sent:"),
+        "client should emit fin-sent diag event: {client_stderr}"
+    );
+    assert!(
+        client_stderr.contains("fin-ack-recv:"),
+        "client should observe peer's FinAck: {client_stderr}"
+    );
+    assert!(
+        client_stderr.contains("connection closed (local Fin acked by peer)"),
+        "client should confirm clean local close: {client_stderr}"
+    );
+
+    // -------- server side: peer-initiated close --------
+    assert!(
+        server_stderr.contains("fin-recv:"),
+        "server should observe peer's Fin: {server_stderr}"
+    );
+    assert!(
+        server_stderr.contains("fin-ack-sent:"),
+        "server should auto-emit FinAck: {server_stderr}"
+    );
+    assert!(
+        server_stderr.contains("closing connection (peer closed (EOF))"),
+        "server should log peer-EOF exit reason: {server_stderr}"
+    );
+    assert!(
+        server_stderr.contains("connection closed (peer Fin observed)"),
+        "server should confirm peer-initiated close: {server_stderr}"
+    );
+
+    // Neither side should print the timeout / failure variants on the
+    // happy path.
+    assert!(
+        !client_stderr.contains("close() returned"),
+        "client should not log close() error on happy path: {client_stderr}"
+    );
+    assert!(
+        !server_stderr.contains("close() returned"),
+        "server should not log close() error on happy path: {server_stderr}"
+    );
+}

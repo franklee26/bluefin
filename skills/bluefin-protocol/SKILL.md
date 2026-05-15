@@ -13,11 +13,12 @@ Bluefin is a connection-oriented, packet-numbered, reliable-byte-stream protocol
 
 **In scope (today):**
 - 20-byte fixed header.
-- Five packet types: client hello, server hello, client ack, data, ack.
+- Seven packet types: client hello, server hello, client ack, data, ack, fin, fin-ack.
 - Three-way handshake with random connection-ID negotiation.
 - Multi-packet datagrams with same-connection / same-kind invariants.
 - Cumulative ack with contiguous-range encoding.
 - 64-bit packet numbers, no rollover handling specified.
+- Graceful close via FIN / FIN-ACK exchange (header-only, own-datagram).
 
 **Explicitly NOT in scope yet (must be specified before RFC freeze):**
 - Encryption (the `E` flag and `Mask` field exist but no encrypted packet types are defined).
@@ -28,7 +29,7 @@ Bluefin is a connection-oriented, packet-numbered, reliable-byte-stream protocol
 - Connection migration / address change.
 - Pack follower / multi-path operation (the [`BluefinHost::PackFollower`](../../bluefin-proto/src/context.rs) variant is reserved but unimplemented).
 - 0-RTT / resumption.
-- Graceful close (`FIN`/`CLOSE` packet type).
+- FIN reason codes (the `Type-specific payload` field on `Fin` is reserved for this).
 
 ## 2. Versioning
 
@@ -71,7 +72,7 @@ Reference implementation: [`bluefin/src/core/header.rs`](../../bluefin/src/core/
 
 ## 4. Packet types
 
-Five types are defined. The 4-bit `Type` field allows up to 16; values `0x05`–`0xF` are reserved.
+Seven types are defined. The 4-bit `Type` field allows up to 16; values `0x07`–`0xF` are reserved.
 
 | Code | Name | Has payload? | `Type-specific payload` field |
 |------|------|--------------|-------------------------------|
@@ -80,9 +81,10 @@ Five types are defined. The 4-bit `Type` field allows up to 16; values `0x05`–
 | `0x02` | `ClientAck` | No | Reserved; MUST be `0`. |
 | `0x03` | `UnencryptedData` | Yes | Payload length in bytes (1..=1500). |
 | `0x04` | `Ack` | No | Number of contiguous packet numbers being acknowledged, starting at this packet's `Packet number` field (see §8). |
+| `0x05` | `Fin` | No | Reserved; MUST be `0` in v0. Future: close-reason code. See §10bis. |
+| `0x06` | `FinAck` | No | Reserved; MUST be `0`. See §10bis. |
 
-Handshake packets (`0x00`/`0x01`/`0x02`) and ack packets (`0x04`) carry **no payload bytes after the header** in v0. Data packets (`0x03`) carry exactly `Type-specific payload` bytes immediately after the header.
-
+Handshake packets (`0x00`/`0x01`/`0x02`), ack packets (`0x04`), and close packets (`0x05`/`0x06`) carry **no payload bytes after the header** in v0. Data packets (`0x03`) carry exactly `Type-specific payload` bytes immediately after the header.
 ## 5. Connection identity
 
 A Bluefin connection is identified by the **unordered pair** `{src_conn_id, dst_conn_id}` of two random 32-bit values, one chosen by each peer. Routing keys at each endpoint are the **directed pair** `(local_id, peer_id)` — the same connection is keyed `(A, B)` at one end and `(B, A)` at the other.
@@ -200,12 +202,39 @@ A receiver MUST drop, without further action:
 
 Receivers MUST NOT respond to dropped packets in v0. Bluefin v0 has no `RST` or `STOP` notion.
 
+## 10bis. Graceful close (FIN / FIN-ACK)
+
+Either peer MAY initiate a graceful close at any time after the handshake completes by sending a `Fin` (`0x05`) packet:
+
+- **Header-only.** No bytes follow the 20-byte header.
+- **Own datagram.** A `Fin` MUST be sent in its own UDP datagram (no co-packing with data, ack, or `FinAck`). This is the same constraint as handshake packets in §8 and keeps receiver framing trivial.
+- **Packet number.** `Fin.packet_number` is the sender's next packet number after every `UnencryptedData` packet that has been (or will be) sent on this connection. It consumes one packet number in the sender's space — i.e. a peer that observes `Fin.packet_number = N` knows the data stream covers packet numbers up through `N - 1`.
+- **Promise.** After sending a `Fin`, a peer MUST NOT send further `UnencryptedData` on this connection. It MAY still send `Ack` packets covering data received from the other side, and MUST send a `FinAck` in response to the peer's `Fin`.
+
+The receiver of a `Fin` MUST:
+
+1. Surface any already-buffered, in-order data to the application.
+2. Reply with a `FinAck` whose `packet_number` equals the received `Fin.packet_number`.
+3. Treat subsequent application reads as EOF.
+
+`FinAck` (`0x06`) is also header-only and SHOULD be sent in its own UDP datagram in v0. (A future revision MAY allow co-packing with `Ack` since both are receiver-side acknowledgements.)
+
+A peer that has sent a `Fin` SHOULD retransmit it on a timer if no `FinAck` arrives, up to a small bound (the reference implementation uses 3 attempts at 200 ms; the RFC SHOULD specify bounds and leave the values to implementations). After the bound is exhausted, the connection is considered force-closed locally.
+
+A receiver MUST drop, without further action:
+
+- A `Fin` or `FinAck` whose `(src_conn_id, dst_conn_id)` does not match a known active connection.
+- A `FinAck` whose `packet_number` does not match the `packet_number` of an outstanding locally-sent `Fin`.
+- A `Fin` whose `packet_number` is less than any data packet number already received on this connection (would imply the peer "took back" a sent byte).
+
+After a `FinAck` is received (or sent and the peer's `Fin` is acknowledged in the converse direction), both peers MUST tear down per-connection state and remove the connection from their local routing table. Any further packet bearing the closed `(src, dst)` pair MUST be dropped silently.
+
 ## 11. Reserved fields and forward-compatibility
 
 | Field | Reserved value in v0 | Notes |
 |-------|----------------------|-------|
 | `Version` | `0x0` | `0xF` reserved for experimental. |
-| `Type` codes `0x05`–`0xF` | unused | Future packet types (encrypted variants, close, ping, etc.). |
+| `Type` codes `0x07`–`0xF` | unused | Future packet types (encrypted variants, ping, etc.). |
 | `E` (encrypted bit) | `0` | Receivers MUST drop packets with `E=1` in v0. |
 | `Mask` | `0` | Header-protection mask. Receivers MUST ignore in v0; MUST NOT enforce zero (forward-compat). |
 
@@ -222,7 +251,7 @@ These are not bugs — they are deliberate omissions that the reference implemen
 | Congestion control | None. | Slow-start? CUBIC? BBR-style? Probably "implementations MUST implement *some* CC, MUST mark it in the handshake". |
 | Flow control | Send-side bounded queue (impl detail). | Receiver-advertised window, on-wire credit field. |
 | Selective ack | Contiguous ranges only. | SACK encoding for non-contiguous ranges. |
-| Connection close | None. | `Close`/`Goodbye` packet type with optional reason code. |
+| Connection close | `Fin` (`0x05`) and `FinAck` (`0x06`) packet types defined; full state machine and retransmit policy still being implemented. | Reason codes; retransmit cadence; abortive-close (RST) variant. |
 | Address migration | Not supported. | Per-connection key rotation? Address-validation token? |
 | Hello buffering | Race-prone, see §6. | Required server-side hello queue depth and timeout. |
 | Packet-number wrap | Undefined. | Either wraparound rules or mandatory connection rotation before exhaustion. |

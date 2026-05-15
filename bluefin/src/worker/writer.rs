@@ -2,7 +2,7 @@ use std::{
     cmp::min,
     collections::VecDeque,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
 };
@@ -49,7 +49,23 @@ const DATA_CHANNEL_BOUND: usize = 4096;
 #[derive(Clone)]
 pub(crate) struct WriterHandler {
     socket: Arc<UdpSocket>,
+    /// Initial packet number captured at construction. The hot path
+    /// (`read_data`) keeps a local `u64` for cheap `+= 1` and mirrors
+    /// it into [`Self::next_packet_num_shared`] after each batch so
+    /// `close()` can read a recent value without contending with the
+    /// hot path on every increment.
     next_packet_num: u64,
+    /// Lock-free mirror of the writer's local `next_packet_num`. Updated
+    /// by `read_data` after each datagram batch via
+    /// [`Ordering::Release`]; read by [`Self::reserve_close_packet_num`]
+    /// (after [`Self::flush`] guarantees the writer is idle) via
+    /// [`Ordering::Acquire`]. Bumped by `close()` to reserve the FIN's
+    /// packet number.
+    next_packet_num_shared: Arc<AtomicU64>,
+    /// Set by [`Self::mark_closed`] once `close()` has reserved the FIN's
+    /// packet number. Subsequent `send_*` calls bail with
+    /// [`BluefinError::ConnectionClosed`].
+    closed: Arc<AtomicBool>,
     /// Array-backed channel (no per-batch list-block alloc/free that tokio's
     /// linked-block mpsc has on the hot send path).
     data_sender: Option<flume::Sender<Bytes>>,
@@ -87,6 +103,8 @@ impl WriterHandler {
             src_conn_id,
             dst_conn_id,
             next_packet_num,
+            next_packet_num_shared: Arc::new(AtomicU64::new(next_packet_num)),
+            closed: Arc::new(AtomicBool::new(false)),
             data_sender: None,
             ack_sender: None,
             pending_bytes: Arc::new(AtomicUsize::new(0)),
@@ -102,6 +120,7 @@ impl WriterHandler {
         self.ack_sender = Some(ack_s);
 
         let next_packet_num = self.next_packet_num;
+        let next_packet_num_shared = Arc::clone(&self.next_packet_num_shared);
         let src_conn_id = self.src_conn_id;
         let dst_conn_id = self.dst_conn_id;
         let socket = Arc::clone(&self.socket);
@@ -112,6 +131,7 @@ impl WriterHandler {
             Self::read_data(
                 data_r,
                 next_packet_num,
+                next_packet_num_shared,
                 src_conn_id,
                 dst_conn_id,
                 socket,
@@ -194,6 +214,7 @@ impl WriterHandler {
     async fn read_data(
         rx: flume::Receiver<Bytes>,
         next_packet_num: u64,
+        next_packet_num_shared: Arc<AtomicU64>,
         src_conn_id: u32,
         dst_conn_id: u32,
         socket: Arc<UdpSocket>,
@@ -348,6 +369,11 @@ impl WriterHandler {
                     break;
                 }
             }
+            // Mirror the writer's local `next_packet_num` into the shared
+            // atomic so `close()` can read a recent value once `flush()`
+            // returns. Stored once per outer loop iteration (not per
+            // packet) to keep the hot path's cost ≈ 0.
+            next_packet_num_shared.store(next_packet_num, Ordering::Release);
         }
     }
 
@@ -360,6 +386,9 @@ impl WriterHandler {
     /// want to block until the writer drains.
     #[inline]
     pub(crate) fn send_bytes(&self, payload: Bytes) -> BluefinResult<usize> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(BluefinError::ConnectionClosed);
+        }
         match self.data_sender {
             Some(ref sender) => {
                 let len = payload.len();
@@ -387,6 +416,9 @@ impl WriterHandler {
     /// the end to let the writer task drain).
     #[inline]
     pub(crate) async fn send_bytes_async(&self, payload: Bytes) -> BluefinResult<usize> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(BluefinError::ConnectionClosed);
+        }
         match self.data_sender {
             Some(ref sender) => {
                 let len = payload.len();
@@ -410,6 +442,9 @@ impl WriterHandler {
 
     #[inline]
     pub(crate) fn send_data(&self, payload: &[u8]) -> BluefinResult<usize> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(BluefinError::ConnectionClosed);
+        }
         match self.data_sender {
             Some(ref sender) => {
                 let len = payload.len();
@@ -517,6 +552,94 @@ impl WriterHandler {
         if self.ack_sender.as_ref().unwrap().send(data).is_err() {
             return Err(BluefinError::WriteError("Failed to send ack"));
         }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Graceful close: FIN / FIN-ACK transmission. See bluefin-protocol
+    // §10bis. Both packets are 20-byte header-only datagrams sent in
+    // their own UDP datagram (own-datagram rule). Bypasses the data
+    // packetiser pump entirely so a FIN cannot be reordered against the
+    // data stream — `close()` calls `flush().await` first to drain the
+    // pump, then synchronously emits the FIN here.
+    // ------------------------------------------------------------------
+
+    /// Reserves the next available packet number for a `Fin`. Caller MUST
+    /// have awaited [`Self::flush`] first; otherwise the writer task may
+    /// still be assigning packet numbers and the returned value is stale.
+    ///
+    /// Atomically `fetch_add(1)` so a defensive re-call would still be
+    /// monotonic.
+    #[inline]
+    pub(crate) fn reserve_close_packet_num(&self) -> u64 {
+        self.next_packet_num_shared.fetch_add(1, Ordering::AcqRel)
+    }
+
+    /// Marks this writer as closed. Subsequent `send_bytes` /
+    /// `send_bytes_async` / `send_data` calls return
+    /// [`BluefinError::ConnectionClosed`].
+    #[inline]
+    pub(crate) fn mark_closed(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Build a 20-byte header-only datagram of the given control type and
+    /// send it directly on the per-connection socket. Retries on
+    /// `WouldBlock` via `socket.writable().await`. Used by
+    /// [`Self::send_fin`] and [`Self::send_fin_ack`].
+    #[inline]
+    async fn send_control_packet(
+        &self,
+        packet_type: PacketType,
+        packet_number: u64,
+    ) -> BluefinResult<()> {
+        let mut header = BluefinHeader::new(
+            self.src_conn_id,
+            self.dst_conn_id,
+            packet_type,
+            0x0,
+            BluefinSecurityFields::default(),
+        );
+        header.with_packet_number(packet_number);
+        let mut buf = [0u8; 20];
+        header.serialise_into(&mut buf);
+        loop {
+            match self.socket.try_send(&buf) {
+                Ok(_) => return Ok(()),
+                Err(_) => {
+                    self.socket.writable().await?;
+                }
+            }
+        }
+    }
+
+    /// Sends a single `Fin` packet on this connection. Header-only,
+    /// own-datagram per spec §10bis.
+    #[inline]
+    pub(crate) async fn send_fin(&self, packet_number: u64) -> BluefinResult<()> {
+        self.send_control_packet(PacketType::Fin, packet_number).await?;
+        diag_try_send(
+            &self.diag_tx,
+            DiagnosticEvent::FinSent { packet_num: packet_number },
+        );
+        Ok(())
+    }
+
+    /// Sends a single `FinAck` packet on this connection. Header-only,
+    /// own-datagram per spec §10bis. The `packet_number` MUST equal the
+    /// `packet_number` of the `Fin` being acknowledged.
+    #[inline]
+    pub(crate) async fn send_fin_ack(&self, packet_number: u64) -> BluefinResult<()> {
+        self.send_control_packet(PacketType::FinAck, packet_number).await?;
+        diag_try_send(
+            &self.diag_tx,
+            DiagnosticEvent::FinAckSent { packet_num: packet_number },
+        );
         Ok(())
     }
 

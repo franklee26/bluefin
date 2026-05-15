@@ -1,7 +1,10 @@
 use std::{
     future::Future,
     net::SocketAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     task::Poll,
 };
 
@@ -44,6 +47,7 @@ pub(crate) struct ReaderTxChannel {
 /// *receives* bytes *from* the buffer.
 pub(crate) struct ReaderRxChannel {
     future: ReaderRxChannelFuture,
+    peer_fin_observed: Arc<AtomicBool>,
     writer_handler: WriterHandler,
     packets_consumed: usize,
     packets_consumed_before_ack: usize,
@@ -53,6 +57,11 @@ pub(crate) struct ReaderRxChannel {
 #[derive(Clone)]
 struct ReaderRxChannelFuture {
     buffer: Arc<Mutex<ConnectionBuffer>>,
+    /// Lock-free mirror of `CloseBuffer.peer_fin_observed`. When the peer
+    /// has sent us a `Fin` and the data buffer is drained, the future
+    /// resolves so [`ReaderRxChannel::read`] can return EOF (`Ok(0)`)
+    /// instead of parking indefinitely.
+    peer_fin_observed: Arc<AtomicBool>,
 }
 
 // NOTE: an earlier round (G, reverted) tried to merge the consumer's two
@@ -75,6 +84,13 @@ impl Future for ReaderRxChannelFuture {
             return Poll::Ready(());
         }
 
+        // Peer has sent us a FIN and the data buffer is empty. Wake the
+        // caller so `read*` can return EOF instead of parking forever.
+        // See bluefin-protocol §10bis and `net::close_handler`.
+        if self.peer_fin_observed.load(Ordering::Acquire) {
+            return Poll::Ready(());
+        }
+
         guard.set_waker_if_changed(cx.waker());
         Poll::Pending
     }
@@ -83,12 +99,17 @@ impl Future for ReaderRxChannelFuture {
 impl ReaderRxChannel {
     pub(crate) fn new(
         buffer: Arc<Mutex<ConnectionBuffer>>,
+        peer_fin_observed: Arc<AtomicBool>,
         writer_handler: WriterHandler,
         diag_tx: Option<DiagSender>,
     ) -> Self {
-        let future = ReaderRxChannelFuture { buffer };
+        let future = ReaderRxChannelFuture {
+            buffer,
+            peer_fin_observed: Arc::clone(&peer_fin_observed),
+        };
         Self {
             future,
+            peer_fin_observed,
             writer_handler,
             packets_consumed: 0,
             packets_consumed_before_ack: 200,
@@ -103,6 +124,19 @@ impl ReaderRxChannel {
         buf: &mut [u8],
     ) -> BluefinResult<(u64, SocketAddr)> {
         let _ = self.future.clone().await;
+        // EOF fast path: if the peer has sent us a `Fin` and there is
+        // nothing left to consume, surface (0, addr) so the caller sees
+        // a clean end-of-stream. We need the buffer's `addr` for the
+        // return tuple; it was set during the handshake and is stable
+        // for the lifetime of the connection.
+        if self.peer_fin_observed.load(Ordering::Acquire) {
+            let guard = self.future.buffer.lock().unwrap();
+            if guard.peek().is_err() {
+                if let Some(addr) = guard.addr() {
+                    return Ok((0, addr));
+                }
+            }
+        }
         // Minimize lock scope - only hold lock during consume operation
         let (consume_res, addr) = {
             self.future.buffer.lock().unwrap().consume(bytes_to_read, buf).unwrap()
@@ -155,6 +189,15 @@ impl ReaderRxChannel {
         max_packets: usize,
     ) -> BluefinResult<(u64, SocketAddr)> {
         let _ = self.future.clone().await;
+        // EOF fast path — see `read` above.
+        if self.peer_fin_observed.load(Ordering::Acquire) {
+            let guard = self.future.buffer.lock().unwrap();
+            if guard.peek().is_err() {
+                if let Some(addr) = guard.addr() {
+                    return Ok((0, addr));
+                }
+            }
+        }
         let (consume_res, addr) = {
             self.future
                 .buffer

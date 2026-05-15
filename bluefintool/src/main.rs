@@ -11,6 +11,7 @@ use bluefin::net::DiagnosticEvent;
 use bluefin_proto::BluefinResult;
 use rand::Rng;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::watch;
 
 /// When true, received data is printed as a hex dump alongside the UTF-8
 /// representation, and send/recv events are annotated with byte counts.
@@ -170,9 +171,25 @@ fn dump_connection_info(
 /// If `stdin_rx` is `Some`, lines from stdin are sent to the peer. If `None`,
 /// this connection is receive-only (used for the 2nd+ connections in listen
 /// mode, since there's only one stdin).
+///
+/// `close_on_stdin_eof` controls what happens when a non-tty stdin reaches
+/// EOF (e.g. `echo foo | bluefintool ...`). Connect mode passes `true` so
+/// the one-shot pipeline terminates after the input is drained — matches
+/// `nc -N` semantics. Listen mode passes `false`: the listener should not
+/// die just because its (often-`Stdio::null`) stdin closed, so it stays
+/// half-closed on the send side and keeps recv'ing until the peer FINs or
+/// the user hits Ctrl-C.
+///
+/// Exits gracefully (by calling [`BluefinConnection::close`]) on any of:
+/// * Ctrl-C / SIGINT (propagated via `shutdown`).
+/// * Stdin EOF when `close_on_stdin_eof` is true (one-shot mode).
+/// * Peer FIN, i.e. `conn.recv` returns `Ok(0)`.
+/// * Unrecoverable send / recv error.
 async fn run_pipe(
     mut conn: bluefin::net::connection::BluefinConnection,
     stdin_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
+    mut shutdown: watch::Receiver<bool>,
+    close_on_stdin_eof: bool,
 ) -> BluefinResult<()> {
     // Short tag that identifies the peer, e.g. "a1b2c3d4".
     let peer_tag = format!("{:08x}", conn.dst_conn_id);
@@ -217,6 +234,18 @@ async fn run_pipe(
                             "[{peer_tag}] data-recv: pkts 0x{base_packet_num:x}..+{num_packets} ({num_bytes} bytes)"
                         );
                     }
+                    DiagnosticEvent::FinSent { packet_num } => {
+                        eprintln!("[{peer_tag}] fin-sent: pkt 0x{packet_num:x}");
+                    }
+                    DiagnosticEvent::FinAckSent { packet_num } => {
+                        eprintln!("[{peer_tag}] fin-ack-sent: pkt 0x{packet_num:x}");
+                    }
+                    DiagnosticEvent::FinReceived { packet_num } => {
+                        eprintln!("[{peer_tag}] fin-recv: pkt 0x{packet_num:x}");
+                    }
+                    DiagnosticEvent::FinAckReceived { packet_num } => {
+                        eprintln!("[{peer_tag}] fin-ack-recv: pkt 0x{packet_num:x}");
+                    }
                 }
             }
         }
@@ -229,24 +258,45 @@ async fn run_pipe(
         eprint!("> ");
     }
 
+    // Reason we are leaving the loop. Used so the close()-and-cleanup
+    // tail can produce a sensible log line and we don't have three
+    // copies of the exit code.
+    let exit_reason: &str;
+
     loop {
         // Always drain diagnostic events so async writer events aren't lost.
         drain_diag(&conn, &peer_tag);
 
+        // Short-circuit if shutdown was requested between iterations.
+        if *shutdown.borrow() {
+            exit_reason = "shutdown signal";
+            break;
+        }
+
         // Drain any pending stdin data into the connection.
         let mut did_send = false;
+        let mut stdin_eof = false;
         if let Some(ref mut receiver) = rx {
-            while let Ok(data) = receiver.try_recv() {
-                did_send = true;
-                let len = data.len();
-                if let Err(e) = conn.send(&data) {
-                    eprintln!("send error: {e:?}");
-                    return Err(e);
-                }
-                total_sent += len;
-                if diag() {
-                    eprintln!("[{peer_tag}] sent {len} bytes, total {total_sent}");
-                    hex_dump(&format!("  [{peer_tag}] >>>"), &data);
+            loop {
+                match receiver.try_recv() {
+                    Ok(data) => {
+                        did_send = true;
+                        let len = data.len();
+                        if let Err(e) = conn.send(&data) {
+                            eprintln!("send error: {e:?}");
+                            return Err(e);
+                        }
+                        total_sent += len;
+                        if diag() {
+                            eprintln!("[{peer_tag}] sent {len} bytes, total {total_sent}");
+                            hex_dump(&format!("  [{peer_tag}] >>>"), &data);
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        stdin_eof = true;
+                        break;
+                    }
                 }
             }
             if did_send {
@@ -258,14 +308,61 @@ async fn run_pipe(
                 }
             }
         }
+        if stdin_eof {
+            // Stdin is gone (Ctrl-D in interactive mode, pipe EOF
+            // otherwise). Flush any in-flight sends so the peer has
+            // them before we proceed.
+            if let Err(e) = conn.flush().await {
+                eprintln!("[{peer_tag}] flush after stdin EOF returned {e:?}");
+            }
+            if close_on_stdin_eof && !interactive {
+                // Piped/non-tty stdin in connect mode (e.g. `echo foo |
+                // bluefintool host port`): mirror `nc -N` and close the
+                // whole connection once the input is drained.
+                exit_reason = "stdin EOF";
+                break;
+            } else {
+                // Either interactive (tty) or a mode where we shouldn't
+                // tear down on stdin closure (e.g. the listener whose
+                // stdin may be `/dev/null` or a one-line script). Drop
+                // the stdin receiver and keep the recv loop alive until
+                // the peer FINs us or the user hits Ctrl-C.
+                eprintln!(
+                    "[{peer_tag}] stdin EOF — half-closing (recv side stays open; Ctrl-C to exit)"
+                );
+                rx = None;
+            }
+        }
 
         // Receive from the peer with a short timeout so we loop back to
         // check stdin regularly. 100 ms is imperceptible for interactive use.
+        // Race the recv against the shutdown watch so Ctrl-C is observed
+        // without waiting for the next 100 ms tick.
         let buf_len = buf.len();
-        match tokio::time::timeout(Duration::from_millis(100), conn.recv(&mut buf, buf_len))
-            .await
-        {
-            Ok(Ok(n)) if n > 0 => {
+        let recv_outcome = tokio::select! {
+            biased;
+            res = shutdown.changed() => {
+                // Sender dropped or value flipped: in either case we want to exit.
+                let _ = res;
+                Err("shutdown")
+            }
+            res = tokio::time::timeout(Duration::from_millis(100), conn.recv(&mut buf, buf_len)) => {
+                Ok(res)
+            }
+        };
+        match recv_outcome {
+            Err(_shutdown_marker) => {
+                exit_reason = "shutdown signal";
+                break;
+            }
+            Ok(Ok(Ok(0))) => {
+                // Bluefin protocol §10bis: `recv` returning Ok(0) signals
+                // that the peer sent a `Fin` and the local data buffer is
+                // drained. Treat as graceful peer-initiated close.
+                exit_reason = "peer closed (EOF)";
+                break;
+            }
+            Ok(Ok(Ok(n))) => {
                 // Drain diag FIRST so data-recv packet numbers appear
                 // before the hex dump / payload they describe.
                 drain_diag(&conn, &peer_tag);
@@ -282,14 +379,52 @@ async fn run_pipe(
                 }
                 stdout.flush().await.ok();
             }
-            Ok(Ok(_)) => continue,
-            Ok(Err(e)) => {
+            Ok(Ok(Err(e))) => {
                 eprintln!("recv error: {e:?}");
                 return Err(e);
             }
-            Err(_) => continue, // timeout — loop back to drain stdin
+            Ok(Err(_)) => continue, // timeout — loop back to drain stdin
         }
     }
+
+    eprintln!("[{peer_tag}] closing connection ({exit_reason}) ...");
+    // One last diag drain so the writer's post-flush `data-sent` events
+    // (and any in-flight `ack-recv`s) make it to stderr before we tear
+    // the connection down and drop the diag channel.
+    drain_diag(&conn, &peer_tag);
+    // When the peer initiated the close (we observed their `Fin` via the
+    // `recv -> Ok(0)` path) their side is already gone and our auto-
+    // FinAck has been sent by the conn_reader drainer task. Calling
+    // `close()` ourselves here would only burn the retransmit budget
+    // before timing out; skip it.
+    let peer_initiated = exit_reason == "peer closed (EOF)";
+    if !peer_initiated {
+        match conn.close().await {
+            Ok(()) => {
+                drain_diag(&conn, &peer_tag);
+                eprintln!(
+                    "[{peer_tag}] connection closed (local Fin acked by peer)"
+                );
+            }
+            Err(e) => {
+                eprintln!("[{peer_tag}] close() returned {e:?}");
+                eprintln!(
+                    "[{peer_tag}] connection closed (Fin sent; no FinAck from peer)"
+                );
+            }
+        }
+    } else {
+        // Our auto-`FinAck` is sent by a separate drainer task fed via
+        // `fin_ack_tx` (see `worker::conn_reader::buffer_in_close_packets`)
+        // so the on-wire send — and its `FinAckSent` diag event — race
+        // with our `recv -> Ok(0)` wakeup. Give the drainer a short
+        // window to run and then drain again so the diag stream reflects
+        // what actually went out before we tear the connection down.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drain_diag(&conn, &peer_tag);
+        eprintln!("[{peer_tag}] connection closed (peer Fin observed)");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +465,7 @@ fn spawn_stdin_reader() -> tokio::sync::mpsc::Receiver<Vec<u8>> {
 // Listen mode
 // ---------------------------------------------------------------------------
 
-async fn do_listen(bind: &str, port: u16) -> BluefinResult<()> {
+async fn do_listen(bind: &str, port: u16, shutdown: watch::Receiver<bool>) -> BluefinResult<()> {
     let addr: Ipv4Addr = bind.parse().unwrap_or_else(|_| {
         eprintln!("error: invalid bind address: {bind}");
         std::process::exit(1);
@@ -347,13 +482,27 @@ async fn do_listen(bind: &str, port: u16) -> BluefinResult<()> {
     server.bind().await?;
 
     let mut first = true;
+    let mut shutdown_for_loop = shutdown.clone();
     loop {
+        if *shutdown_for_loop.borrow() {
+            eprintln!("shutdown signal received — stopping accept loop");
+            return Ok(());
+        }
         eprintln!("waiting for connection ...");
-        let conn = match server.accept().await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("accept error: {e:?}");
-                continue;
+        let conn = tokio::select! {
+            biased;
+            _ = shutdown_for_loop.changed() => {
+                eprintln!("shutdown signal received — stopping accept loop");
+                return Ok(());
+            }
+            res = server.accept() => {
+                match res {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("accept error: {e:?}");
+                        continue;
+                    }
+                }
             }
         };
         eprintln!(
@@ -374,8 +523,12 @@ async fn do_listen(bind: &str, port: u16) -> BluefinResult<()> {
             None
         };
 
+        let task_shutdown = shutdown.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_pipe(conn, stdin_rx).await {
+            // Listener: never close on stdin EOF (its stdin is often
+            // `Stdio::null` or a one-shot script). Wait for the peer to
+            // FIN or for Ctrl-C.
+            if let Err(e) = run_pipe(conn, stdin_rx, task_shutdown, false).await {
                 eprintln!("pipe error: {e:?}");
             }
         });
@@ -386,7 +539,12 @@ async fn do_listen(bind: &str, port: u16) -> BluefinResult<()> {
 // Connect mode
 // ---------------------------------------------------------------------------
 
-async fn do_connect(host: &str, port: u16, source_port: u16) -> BluefinResult<()> {
+async fn do_connect(
+    host: &str,
+    port: u16,
+    source_port: u16,
+    shutdown: watch::Receiver<bool>,
+) -> BluefinResult<()> {
     let dst_addr: Ipv4Addr = host.parse().unwrap_or_else(|_| {
         eprintln!("error: invalid host address: {host}");
         std::process::exit(1);
@@ -411,7 +569,9 @@ async fn do_connect(host: &str, port: u16, source_port: u16) -> BluefinResult<()
     }
 
     let stdin_rx = spawn_stdin_reader();
-    run_pipe(conn, Some(stdin_rx)).await
+    // Connect mode: piped stdin EOF closes the whole connection so
+    // `echo foo | bluefintool host port` terminates after delivering.
+    run_pipe(conn, Some(stdin_rx), shutdown, true).await
 }
 
 // ---------------------------------------------------------------------------
@@ -437,12 +597,36 @@ async fn main() {
         eprintln!("  v{}\n", env!("CARGO_PKG_VERSION"));
     }
 
+    // Single shutdown watch driven by SIGINT (Ctrl-C). Cloned into every
+    // spawned pipe task and the accept loop so a single Ctrl-C drains
+    // everything via [`BluefinConnection::close`] before the process
+    // exits.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shutdown_observer = shutdown_rx.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("\n^C received — closing connections gracefully ...");
+            let _ = shutdown_tx.send(true);
+        }
+    });
+
     let result = match mode {
-        Mode::Listen { bind, port } => do_listen(&bind, port).await,
-        Mode::Connect { host, port, source_port } => do_connect(&host, port, source_port).await,
+        Mode::Listen { bind, port } => do_listen(&bind, port, shutdown_rx).await,
+        Mode::Connect { host, port, source_port } => {
+            do_connect(&host, port, source_port, shutdown_rx).await
+        }
     };
     if let Err(e) = result {
         eprintln!("fatal: {e:?}");
         std::process::exit(1);
+    }
+    // If Ctrl-C drove us here, the `tokio::io::stdin()` reader task is
+    // still parked in a blocking `read()` syscall on the tty (tokio's
+    // stdin is backed by a blocking thread that can't be cancelled). The
+    // runtime would otherwise wait on that thread before exiting, making
+    // the process appear to hang until the user hits Enter. Bypass that
+    // by `exit`ing explicitly once the workload has finished draining.
+    if *shutdown_observer.borrow() {
+        std::process::exit(0);
     }
 }

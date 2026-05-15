@@ -58,20 +58,25 @@ Three-way handshake driven by `bluefin-proto/src/handshake/state_machine.rs`:
 2. Server → Client: `UnencryptedServerHello` (src=server's chosen id, dst=client's id)
 3. Client → Server: `ClientAck`
 4. Both sides instantiate a `BluefinConnection` and the bidirectional data path is open.
+5. Either side may initiate graceful close by sending `Fin`; the peer auto-replies with `FinAck`. After both sides have closed (or one side observes the peer's `Fin` and calls `close()` itself), the connection is removed from the host's `ConnectionManager`. See [bluefin-protocol §10bis](../bluefin-protocol/SKILL.md) and [`net/close_handler.rs`](../../bluefin/src/net/close_handler.rs).
 
 Server entry: [`BluefinServer::accept`](../../bluefin/src/net/server.rs).
 Client entry: [`BluefinClient::connect`](../../bluefin/src/net/client.rs).
+Graceful close: [`BluefinConnection::close`](../../bluefin/src/net/connection.rs).
 
 > **Handshake hello queue**: when a `ClientHello` arrives before the server has called `accept()`, it is buffered in a shared `HelloState` queue (cap 64, [`net/mod.rs`](../../bluefin/src/net/mod.rs)) rather than dropped. `accept()` drains this queue before blocking on the `HandshakeConnectionBuffer`. This eliminates the previous race that required client-side stagger workarounds. See [bluefin-architecture §4](../bluefin-architecture/SKILL.md) and historical context in [`docs/archive/BINARY_RACE_CONDITIONS.md`](../../docs/archive/BINARY_RACE_CONDITIONS.md).
 
 ## The buffer types
 
-Per connection, there are two shared buffers, both `Arc<Mutex<...>>`, bundled as `ConnectionManagedBuffers`:
+Per connection, there are three shared buffers, all `Arc<Mutex<...>>`, bundled as `ConnectionManagedBuffers`:
 
 | Buffer | Contains | Producer | Consumer |
 |--------|----------|----------|----------|
 | `ConnectionBuffer` ([`net/connection.rs`](../../bluefin/src/net/connection.rs)) | Ordered data bytes (via inner `OrderedBytes`) + handshake packet slot + addr + waker | `ConnReaderHandler` (data) / `ReaderTxChannel` (handshake) | `ReaderRxChannel::read` (data) / `HandshakeConnectionBuffer` (handshake) |
 | `AckBuffer` ([`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs)) | A `SlidingWindow` of received ack packet numbers + waker | `ConnReaderHandler` (ack packets) | `AckConsumer` (currently a no-op consumer) |
+| `CloseBuffer` ([`net/close_handler.rs`](../../bluefin/src/net/close_handler.rs)) | Close-side state machine (`Active` / `PeerFinReceived` / `LocalFinSent` / `Closed`), the pn we owe a `FinAck` for, the pn the peer `FinAck`'d, a `Notify` for waking `close()`, and a waker | `ConnReaderHandler` (Fin / FinAck) | `BluefinConnection::close` + `ReaderRxChannel` (EOF) |
+
+`ConnectionManagedBuffers` also carries two lock-free side-channels: an `Arc<AtomicBool> peer_fin_observed` (so `recv` can return `Ok(0)` EOF without taking the close lock) and an `Option<flume::Sender<u64> fin_ack_tx>` that the conn_reader uses to dispatch "please emit `FinAck(N)`" to a small drainer task that owns a `WriterHandler` clone.
 
 `OrderedBytes` ([`net/ordered_bytes.rs`](../../bluefin/src/net/ordered_bytes.rs)) is a circular array of `Option<BluefinPacket>` indexed by packet number, with a `carry_over_bytes: Option<Bytes>` for partial consumes. The whole pipeline carries payloads as `bytes::Bytes` slices over a single per-recv `BytesMut` allocation — see [bluefin-performance](../bluefin-performance/SKILL.md) round E.
 
@@ -122,6 +127,18 @@ BluefinConnection {
     // is on the wire. Cheap to call; returns immediately if nothing pending.
     // Added 2026-05/D.
     async fn flush(&self) -> BluefinResult<()>
+
+    // Graceful close per bluefin-protocol §10bis. Flushes the writer,
+    // marks it closed (subsequent send_* return `ConnectionClosed`),
+    // reserves the FIN's packet number, sends `Fin`, and awaits the
+    // peer's `FinAck` (200 ms × 3 retransmit budget). On success the
+    // connection is deregistered from `ConnectionManager`. Idempotent
+    // on the writer side but SHOULD be called exactly once.
+    async fn close(&self) -> BluefinResult<()>
+
+    // True after `close()` resolved locally OR after a peer-initiated
+    // close has been driven to completion (`CloseState::Closed`).
+    fn is_closed(&self) -> bool
 }
 ```
 

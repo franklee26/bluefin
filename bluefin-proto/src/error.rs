@@ -76,6 +76,9 @@ pub enum BluefinError {
 
     #[error("`{0}`")]
     InvalidState(String),
+
+    #[error("Connection has been closed")]
+    ConnectionClosed,
 }
 
 /// Allows us to convert from std::io::Error to Bluefin errors. This is mostly a quality

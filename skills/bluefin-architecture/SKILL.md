@@ -69,6 +69,7 @@ Properties:
 - **Lock-free for reads**, sharded mutex for writes (DashMap default). Read-heavy workload: every received handshake datagram does a lookup; every `accept()`/connection-finalise does an insert.
 - **Single source of truth**: the listener-socket reader (`ReaderTxChannel`) consults this map to figure out which `ConnectionBuffer` to drop a parsed handshake packet into.
 - **Handshake hello queue**: during step 1, the server doesn't yet know the client's `src_conn_id`, so it stores the in-progress accept under `(server_chosen_id, 0)`. After step 3 it removes the placeholder and reinserts under `(server_chosen_id, client_id)`. A shared `HelloState` struct ([`net/mod.rs`](../../bluefin/src/net/mod.rs)) holds both `pending_accept_ids` (FIFO `VecDeque` of accept slots) and a bounded `hello_queue` (`VecDeque` of pre-arrived `ClientHello` packets, capped at 64). The `ReaderTxChannel` and `accept()` coordinate under a single mutex — hellos arriving before an accept slot are queued, and `accept()` drains the queue before blocking.
+- **Close-time deregistration**: [`BluefinConnection::close`](../../bluefin/src/net/connection.rs) removes its `(src, dst)` entry from the `ConnectionManager` once the FIN / FIN-ACK exchange completes (or after the retransmit budget is exhausted). After that point the listener-socket reader drops any stray packets for the connection — but stray packets shouldn't reach the listener anyway, since the per-conn data socket owns the data path (§3) and only the FIN / FIN-ACK exchange itself runs through it.
 
 The per-connection data socket bypasses this table entirely — that's the whole point of §3.
 
@@ -156,9 +157,9 @@ A snapshot of what Bluefin actually guarantees right now (most of these will nee
 | Send-side backpressure | Bounded `flume::bounded(4096)` between user `send_bytes_async` and the writer pump (~6 MiB cap). Sync `send_bytes` returns `WriteError` on full. | Added 2026-05/#10 as `tokio::sync::mpsc`; swapped to `flume` in 2026-05/P to eliminate per-32-message list-block alloc/free churn. Implementation choice; protocol doesn't mandate. |
 | Recv-side backpressure | `OrderedBytes` has `MAX_BUFFER_SIZE` slots; `buffer_in_bytes` returns `BufferFullError` when full. The producer drops the packet on error. | This is **lossy under sustained pressure** — there's no on-wire signal back to the sender. |
 | Retransmission | None. The receiver tracks ack acceptance in a `SlidingWindow`; the sender writes acks but never consumes them for retransmit decisions. | The dead `AckConsumer` is the planned hook. |
-| Congestion control | None. The send loop runs as fast as `socket.try_send` will let it. | Will need its own RFC section. |
-| Connection close | Implicit only — the server's read loop exits on a 2 s idle timeout; `Drop` on `BluefinConnection` closes the socket. | No explicit close packet; no graceful teardown. |
-| Flush | Public `BluefinConnection::flush().await` waits until every previously-enqueued payload has been written by the writer task. Added 2026-05/D after the bench client's exit-sleep workaround proved fragile. | Implementation only — protocol carries no flush packet. |
+| Congestion control | None. The send loop runs as fast as `socket.try_send` will let it. The bench client has an **opt-in CI-only pacing knob** (`BLUEFIN_CLIENT_SEND_THROTTLE_US` / `BLUEFIN_CLIENT_SEND_THROTTLE_EVERY` in [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs)) that inserts a `tokio::time::sleep` every N sends — a coarse stand-in for real CC that stops the client overwhelming the receiver's drain rate on contended hosted CI runners (see bluefin-ci). Production binaries unaffected unless those env vars are set. | Will need its own RFC section. The throttle is a workaround, not the design. |
+| Connection close | Explicit `Fin` / `FinAck` exchange (bluefin-protocol §10bis). [`BluefinConnection::close`](../../bluefin/src/net/connection.rs) flushes, sends a `Fin`, awaits `FinAck` (200 ms × 3 retransmit budget), and deregisters from the `ConnectionManager`. On the receive side, `recv_bytes` returns `Ok(0)` once the peer's `Fin` is observed and the data buffer is drained — the conn_reader auto-emits the `FinAck`. | The bench server's recv-idle timeout is retained as a *safety net* for crashed/SIGKILL'd peers only. |
+| Flush | Public `BluefinConnection::flush().await` waits until every previously-enqueued payload has been written by the writer task. Added 2026-05/D after the bench client's exit-sleep workaround proved fragile. Also called internally as the first step of `close()`. | Implementation only — protocol carries no flush packet. |
 
 ## 9. Known architectural debt
 
@@ -170,7 +171,7 @@ The big load-bearing assumptions that may have to change before / during RFC sta
 | 2 | **Per-connection `connect()`-ed socket** defeats `SO_REUSEPORT` recv-side fan-out. Caps recv parallelism per connection. See §3. | [`net/connection.rs`](../../bluefin/src/net/connection.rs). |
 | 3 | **`AckConsumer` is dead** — wakes constantly, writes a value nobody reads. Retransmission needs to either consume that signal or replace the consumer entirely. | [`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs). |
 | 4 | **`BluefinHost::PackFollower` is reserved but unused.** The protocol name "Bluefin" implies a multi-path / follower-leader topology that has never been built. The RFC has to decide whether to keep it as v1 scope or punt to v2. | [`bluefin-proto/src/context.rs`](../../bluefin-proto/src/context.rs). |
-| 5 | **No flush API.** Means clean shutdown isn't expressible by the user. | [`net/connection.rs`](../../bluefin/src/net/connection.rs). |
+| 5 | ~~**No flush API.**~~ **FIXED** by `BluefinConnection::flush()` (2026-05/D) and `BluefinConnection::close()` (2026-05/§10bis). Clean shutdown is now expressible by the user. | [`net/connection.rs`](../../bluefin/src/net/connection.rs). |
 | 6 | **`bluefin-io` is unused at runtime.** Vectorised `recvmsg_x`/`sendmsg_x` exist but `BluefinSocket` is wired only into tests. The whole crate is currently dead weight. | [`bluefin-io/src/socket/udp_socket.rs`](../../bluefin-io/src/socket/udp_socket.rs). |
 | 7 | **CPU-affinity helper is unused.** See §7. | [`utils/cpu_affinity.rs`](../../bluefin/src/utils/cpu_affinity.rs). |
 
@@ -181,7 +182,7 @@ These are choices an RFC can't punt to "implementation detail" because they leak
 - **Per-connection socket vs single demuxed listener.** §3 picks one; an RFC must mandate or allow both.
 - **Hello queue depth and timeout.** The reference implementation now buffers up to 64 hellos. The RFC should specify whether this bound is mandatory and what the expiry policy is.
 - **Multi-path / pack-follower.** In or out for v1.
-- **Flush semantics.** What does "the application has finished sending" mean on a stream protocol with no graceful close packet?
+- **Flush / close semantics.** What does "the application has finished sending" mean on a stream protocol? The reference implementation answers: `flush()` drains the writer queue, `close()` issues `Fin` + awaits `FinAck`, peer's `recv` returns `Ok(0)` once observed. An RFC has to formalise this state machine — see bluefin-protocol §10bis.
 - **Retransmission location.** Per-connection? Per-stream (if streams ever land)? Driven by ack consumer or by sender-side timer?
 - **Concurrency model expectations.** The RFC SHOULD avoid mandating threads/tasks, but it MAY require that an implementation can sustain N concurrent connections without head-of-line blocking — and that's a structural claim the architecture has to back.
 

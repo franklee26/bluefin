@@ -407,6 +407,20 @@ esac
     echo "## Bluefin throughput bench ($os_label) $verdict_emoji $verdict_overall"
     echo
     echo "**Config:** $N_RUNS run(s) × $N_CONNS conn(s) on \`$uname_s $(uname -m)\`"
+    # Surface the client-side pacing knob. Bluefin has no on-wire
+    # congestion control yet, so CI sets BLUEFIN_CLIENT_SEND_THROTTLE_US
+    # to prevent the client overwhelming the receiver on contended
+    # 3-vCPU hosted runners. Show it in the summary so a reader can tell
+    # at a glance whether throttling was active for this run.
+    throttle_us="${BLUEFIN_CLIENT_SEND_THROTTLE_US:-0}"
+    throttle_every="${BLUEFIN_CLIENT_SEND_THROTTLE_EVERY:-256}"
+    if [[ "$throttle_us" =~ ^[0-9]+$ ]] && (( throttle_us > 0 )); then
+        echo
+        echo "**Client throttle:** ${throttle_us} µs sleep every ${throttle_every} sends"
+    else
+        echo
+        echo "**Client throttle:** off"
+    fi
     # Surface retry summary so a green PR comment still reveals if the
     # gate had to absorb a catastrophic-allocation event. Counts runs that
     # took more than one attempt; the per-run table below shows which.

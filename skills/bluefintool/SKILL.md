@@ -67,7 +67,12 @@ prefixed with the peer's connection ID so you can tell connections apart:
 [4d7d12a6] hello from client 2
 ```
 
-Ctrl-C or Ctrl-D to quit.
+Ctrl-C to quit. The listener calls [`BluefinConnection::close`](../../bluefin/src/net/connection.rs) on
+every active connection so the peer observes a clean `Fin` and exits its
+own `recv` with EOF. Ctrl-D on the listener's own stdin is **not** treated
+as exit — the listener half-closes its send side and keeps recv'ing
+(matches `nc -l`); this also means piping `Stdio::null()` into a listener
+in tests does not collapse the accept loop.
 
 ### Connect mode (client side)
 
@@ -78,6 +83,16 @@ Ctrl-C or Ctrl-D to quit.
 
 After the 3-way handshake completes you can type lines into either terminal and
 see them appear in the other.
+
+#### Exit semantics
+
+| Trigger | Behaviour |
+|---------|-----------|
+| Ctrl-C (SIGINT) | Calls `close()` on the active connection then exits. Peer's `recv` returns EOF. |
+| Ctrl-D on a tty stdin | Half-closes the send side. Keeps recv'ing until peer FINs or Ctrl-C. |
+| Pipe EOF in **connect mode** (`echo … \| bluefintool host port`) | Flushes, calls `close()`, exits — matches `nc -N`. |
+| Pipe EOF in **listen mode** | Treated as Ctrl-D (half-close). |
+| Peer FIN received (`recv` returns `Ok(0)`) | Logs `closing connection (peer closed (EOF))` and exits without re-sending FIN (the peer is already gone). |
 
 ### Diagnostics mode (`-d`)
 

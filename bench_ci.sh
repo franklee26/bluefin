@@ -413,9 +413,10 @@ esac
     # 3-vCPU hosted runners. Show it in the summary so a reader can tell
     # at a glance whether throttling was active for this run.
     throttle_us="${BLUEFIN_CLIENT_SEND_THROTTLE_US:-0}"
+    throttle_every="${BLUEFIN_CLIENT_SEND_THROTTLE_EVERY:-256}"
     if [[ "$throttle_us" =~ ^[0-9]+$ ]] && (( throttle_us > 0 )); then
         echo
-        echo "**Client throttle:** \`BLUEFIN_CLIENT_SEND_THROTTLE_US=${throttle_us}\` (sleep ${throttle_us} µs every 256 sends; stand-in for congestion control while it's being designed)"
+        echo "**Client throttle:** \`BLUEFIN_CLIENT_SEND_THROTTLE_US=${throttle_us}\` µs every \`BLUEFIN_CLIENT_SEND_THROTTLE_EVERY=${throttle_every}\` sends (stand-in for congestion control while it's being designed; tokio's ~1 ms sleep floor means the effective rate cap ≈ \`THROTTLE_EVERY × 1500 B / 1 ms\`)"
     else
         echo
         echo "**Client throttle:** off (\`BLUEFIN_CLIENT_SEND_THROTTLE_US\` unset/0)"

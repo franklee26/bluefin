@@ -206,12 +206,23 @@ jobs:
       # control yet (bluefin-architecture §8), so a tight client send
       # loop on a contended 3-vCPU hosted runner can outrun the
       # receiver's drain rate, overflow the kernel UDP buffer, and
-      # trigger packet loss the protocol can't recover from. A 50 µs
-      # sleep every SENDS_PER_YIELD (256) iterations gives the receiver
-      # a real scheduling window without meaningfully impacting peak
-      # throughput on healthy runners. Production binaries unaffected
-      # unless this env var is set.
+      # trigger packet loss the protocol can't recover from.
+      #
+      # `tokio::time::sleep` has a multi-ms granularity floor in
+      # practice, so the *cadence* (THROTTLE_EVERY) controls the
+      # effective rate cap, not the µs value. Empirical (Apple-silicon
+      # dev box, 25 µs sleep, vs ~1.44 GB/s unthrottled baseline):
+      #   every 256  -> ~250 MB/s   (~17 % of baseline; too aggressive)
+      #   every 1024 -> ~650 MB/s
+      #   every 2048 -> ~1.0 GB/s   (~70 % of baseline)
+      #   every 4096 -> ~1.2 GB/s   (~85 % of baseline)
+      # Hosted-CI absolute numbers will be lower (slower vCPUs) but the
+      # proportional cap is what matters: 2048 keeps the bench measuring
+      # ~70 % of the runner's unconstrained ceiling while still pacing
+      # bursts that would otherwise overflow the kernel UDP buffer.
+      # Production binaries unaffected unless these env vars are set.
       BLUEFIN_CLIENT_SEND_THROTTLE_US:      "25"
+      BLUEFIN_CLIENT_SEND_THROTTLE_EVERY:   "2048"
       # Per-run retry knobs. Hosted macos-latest runners occasionally land
       # on a deeply contended host where both bench peers get starved and
       # the run yields 0 GOOD conns despite no actual code regression.

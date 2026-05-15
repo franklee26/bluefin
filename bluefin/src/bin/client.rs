@@ -44,12 +44,11 @@ fn num_sends() -> usize {
         .unwrap_or(DEFAULT_NUM_SENDS)
 }
 
-/// Optional per-yield-window throttle, in **microseconds**, read from
+/// Optional per-batch throttle, in **microseconds**, read from
 /// `BLUEFIN_CLIENT_SEND_THROTTLE_US`. When set to a positive integer the
 /// client send loop sleeps that many microseconds every
-/// [`SENDS_PER_YIELD`] iterations, on top of the unconditional
-/// `yield_now().await`. Default `0` (no throttle) so production /
-/// dev-box behaviour is unchanged.
+/// `send_throttle_every()` iterations (see below). Default `0` (no
+/// throttle) so production / dev-box behaviour is unchanged.
 ///
 /// **Why this exists.** Bluefin has no on-wire congestion control yet
 /// (see bluefin-architecture §8 "Congestion control: None"). On a healthy
@@ -59,16 +58,38 @@ fn num_sends() -> usize {
 /// tasks are co-scheduled with everything else; a tight client send loop
 /// can overwhelm the receiver's drain rate, overflow the kernel UDP
 /// buffer, and trigger packet loss that bluefin's retransmit-free
-/// pipeline can't recover from. A small inter-batch sleep (10–100 µs)
-/// gives the receiver a scheduling opportunity per ~256 sends without
-/// meaningfully impacting steady-state throughput.
+/// pipeline can't recover from.
+///
+/// **Tuning note.** `tokio::time::sleep` has a multi-millisecond
+/// granularity floor in practice (timer-wheel + scheduling overhead),
+/// so any positive throttle value engages a roughly equivalent
+/// per-batch delay regardless of the requested µs. The *cadence* — how
+/// many sends per sleep — therefore matters far more than the sleep
+/// length itself. Empirical sweep on Apple-silicon dev (25 µs sleep,
+/// ~1.44 GB/s unthrottled baseline): every 256 → ~250 MB/s; every 1024
+/// → ~650 MB/s; every 2048 → ~1.0 GB/s; every 4096 → ~1.2 GB/s.
 const DEFAULT_SEND_THROTTLE_US: u64 = 0;
+
+/// Default cadence for the throttle (number of sends between sleeps).
+/// Only used when [`send_throttle_us`] is > 0. The default matches
+/// [`SENDS_PER_YIELD`] so a small throttle gives a tight rate cap; CI
+/// typically raises this to relax the cap once the basic throttling has
+/// addressed receiver-overrun.
+const DEFAULT_SEND_THROTTLE_EVERY: usize = SENDS_PER_YIELD;
 
 fn send_throttle_us() -> u64 {
     env::var("BLUEFIN_CLIENT_SEND_THROTTLE_US")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
         .unwrap_or(DEFAULT_SEND_THROTTLE_US)
+}
+
+fn send_throttle_every() -> usize {
+    env::var("BLUEFIN_CLIENT_SEND_THROTTLE_EVERY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SEND_THROTTLE_EVERY)
 }
 
 /// CLI:
@@ -199,10 +220,11 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
         );
     }
     let throttle_us = send_throttle_us();
+    let throttle_every = send_throttle_every();
     let throttle = if throttle_us > 0 {
         eprintln!(
             "(client #{}) SEND_THROTTLE_US set: {} us every {} sends",
-            task_ix, throttle_us, SENDS_PER_YIELD,
+            task_ix, throttle_us, throttle_every,
         );
         Some(Duration::from_micros(throttle_us))
     } else {
@@ -215,12 +237,6 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
         // tight `for` loop monopolises the worker thread.
         if i % SENDS_PER_YIELD == 0 {
             yield_now().await;
-            // Optional pacing: sleep gives the peer (and the local
-            // writer/socket) a real scheduling window beyond what
-            // `yield_now()` provides. No-op when the env var is unset.
-            if let Some(d) = throttle {
-                sleep(d).await;
-            }
             // Cheap relaxed check is fine here; we only need to notice
             // shutdown within one yield window. Break out so the rest of
             // the function still runs (flush + close).
@@ -230,6 +246,18 @@ async fn run_connection(task_ix: usize, src_port: u16) -> Result<(), BluefinErro
                     task_ix, i, n_sends,
                 );
                 break;
+            }
+        }
+        // Optional pacing on its OWN cadence (independent of the yield
+        // cadence). Sleep gives the peer + local writer a real
+        // scheduling window beyond what `yield_now()` provides. The
+        // separation matters because `tokio::time::sleep` has a ~1 ms
+        // floor: a tight cadence (e.g. every 256) caps throughput
+        // aggressively (~384 MB/s), while a looser one (e.g. every
+        // 1024–2048) only kicks in on true bursts above ~1.5–3 GB/s.
+        if let Some(d) = throttle {
+            if i % throttle_every == 0 {
+                sleep(d).await;
             }
         }
     }

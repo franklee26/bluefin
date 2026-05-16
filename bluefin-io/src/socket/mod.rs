@@ -2,6 +2,7 @@ use crate::error::{BluefinIoError, BluefinIoResult};
 use libc::{c_int, setsockopt};
 
 mod cmsghdr;
+pub mod factory;
 pub mod udp_socket;
 
 pub(crate) fn set_sock_opt<T>(

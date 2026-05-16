@@ -25,17 +25,20 @@ Don't read this for routine bug fixes or perf tuning of an existing path — the
 Three crates in one workspace; the dependency arrows point one way.
 
 ```
-bluefin            (public API, workers, connection mgmt, ordered-byte buffer)
+bluefin            (public API, async runtime adapter: workers, sockets, wakers)
    │
-   ├── bluefin-proto      (BluefinError, BluefinHost enum, handshake state machine)
+   ├── bluefin-proto      (pure sans-io state machines: wire format, Endpoint,
+   │                       CloseFsm, BluefinError, BluefinHost. No tokio, no I/O.)
    │
    └── bluefin-io         (raw UDP socket abstraction, optional vectorised I/O)
                           [currently NOT wired into the runtime]
 ```
 
+> **Sans-io migration in progress.** Per [`docs/SANS_IO_MIGRATION.md`](../../docs/SANS_IO_MIGRATION.md), `bluefin-proto` is being grown from "a few enums" into a full sans-io protocol crate (à la `quinn-proto`). Slices landed so far: wire types (`BluefinHeader` / `BluefinPacket` / `PacketType` in [`bluefin-proto/src/wire/`](../../bluefin-proto/src/wire/)), `Endpoint` (handshake demux + hello queue, [`bluefin-proto/src/endpoint.rs`](../../bluefin-proto/src/endpoint.rs)), and `CloseFsm` (FIN / FIN-ACK state machine, [`bluefin-proto/src/connection/close.rs`](../../bluefin-proto/src/connection/close.rs)). The data path and per-connection `Connection` FSM are still ahead. A dependency-only guardrail test ([`bluefin-proto/tests/no_io_deps.rs`](../../bluefin-proto/tests/no_io_deps.rs)) fails the build if anyone adds `tokio` / `mio` / `bluefin-io` to `bluefin-proto/Cargo.toml`.
+
 Rationale:
 
-- **`bluefin-proto`** holds protocol-level types that are useful to *anything* speaking Bluefin — including a future alternative implementation, a wireshark dissector, or a fuzzer. Keeping `BluefinError` and `BluefinHost` here means consumers don't need the runtime crate to talk about errors or roles.
+- **`bluefin-proto`** holds protocol-level types that are useful to *anything* speaking Bluefin — including a future alternative implementation, a wireshark dissector, or a fuzzer. Keeping `BluefinError` and `BluefinHost` here means consumers don't need the runtime crate to talk about errors or roles. Post-migration, it will also hold the entire protocol state machine (handshake, ordering, ack, close, retransmit) as pure synchronous code — see [`docs/SANS_IO_MIGRATION.md`](../../docs/SANS_IO_MIGRATION.md).
 - **`bluefin-io`** is a deliberate split for performance work that may break out of `tokio::net::UdpSocket` (vectorised `recvmmsg`/`sendmmsg` on Linux, `recvmsg_x`/`sendmsg_x` on macOS). Today it's unused at runtime — `bluefin/` still goes through `tokio::net::UdpSocket` directly. The split exists so the eventual switch is a dependency change in `bluefin/`, not a rewrite.
 - **`bluefin/`** is everything else: connection management, the worker tasks, the ordered-byte buffer, the public client/server types.
 
@@ -68,7 +71,7 @@ Properties:
 
 - **Lock-free for reads**, sharded mutex for writes (DashMap default). Read-heavy workload: every received handshake datagram does a lookup; every `accept()`/connection-finalise does an insert.
 - **Single source of truth**: the listener-socket reader (`ReaderTxChannel`) consults this map to figure out which `ConnectionBuffer` to drop a parsed handshake packet into.
-- **Handshake hello queue**: during step 1, the server doesn't yet know the client's `src_conn_id`, so it stores the in-progress accept under `(server_chosen_id, 0)`. After step 3 it removes the placeholder and reinserts under `(server_chosen_id, client_id)`. A shared `HelloState` struct ([`net/mod.rs`](../../bluefin/src/net/mod.rs)) holds both `pending_accept_ids` (FIFO `VecDeque` of accept slots) and a bounded `hello_queue` (`VecDeque` of pre-arrived `ClientHello` packets, capped at 64). The `ReaderTxChannel` and `accept()` coordinate under a single mutex — hellos arriving before an accept slot are queued, and `accept()` drains the queue before blocking.
+- **Handshake hello queue**: during step 1, the server doesn't yet know the client's `src_conn_id`, so it stores the in-progress accept under `(server_chosen_id, 0)`. After step 3 it removes the placeholder and reinserts under `(server_chosen_id, client_id)`. The sans-io `Endpoint` ([`bluefin-proto/src/endpoint.rs`](../../bluefin-proto/src/endpoint.rs)) holds both `pending_accept_ids` (FIFO `VecDeque` of accept slots) and a bounded `hello_queue` (`VecDeque` of pre-arrived `ClientHello` packets, capped at 64). The runtime wraps it as `Arc<Mutex<Endpoint>>`; `ReaderTxChannel` calls `classify_hello → HelloOutcome { NotHello, Routed, Queued, Dropped }` and `accept()` calls `take_queued_hello_or_register` to drain the queue or reserve a slot. All cross-task wakes still live in `bluefin/`.
 - **Close-time deregistration**: [`BluefinConnection::close`](../../bluefin/src/net/connection.rs) removes its `(src, dst)` entry from the `ConnectionManager` once the FIN / FIN-ACK exchange completes (or after the retransmit budget is exhausted). After that point the listener-socket reader drops any stray packets for the connection — but stray packets shouldn't reach the listener anyway, since the per-conn data socket owns the data path (§3) and only the FIN / FIN-ACK exchange itself runs through it.
 
 The per-connection data socket bypasses this table entirely — that's the whole point of §3.
@@ -116,6 +119,16 @@ The producer (a worker task that just received a packet):
 - **Single mutex per buffer.** Both producer and consumer go through the same `Mutex<SomeBuffer>`. State and the rendezvous waker are colocated, so there's no second sync primitive (no condvar, no atomic flag, no separate channel).
 - **`set_waker_if_changed` avoids waker clones on hot re-polls.** Tokio re-polls a future on the same task across many wake-ups; comparing with `Waker::will_wake` skips the atomic refcount bump on the inner waker Arc when the same task is re-arming.
 - **Wake-after-drop is mandatory.** Earlier versions of the producer side called `wake_by_ref()` while still holding the buffer's mutex, causing the woken consumer task to immediately try to `lock()` and bounce. This was fixed in 2026-05/#7 — see [bluefin-performance](../bluefin-performance/SKILL.md) historical timeline. Any new buffer type MUST clone the waker out, drop the guard, then wake.
+
+### Sans-io variant: pure-FSM + `Event` return
+
+State machines that have moved into `bluefin-proto` cannot own `Waker` / `Notify` (those are runtime types). The pattern adapts as follows:
+
+- The pure FSM's mutating methods return an `Event` enum describing what cross-task wake is required. Example: [`bluefin-proto::connection::close::CloseFsm`](../../bluefin-proto/src/connection/close.rs) returns `CloseEvent { None, PeerFinObserved { fin_packet_num }, PeerFinAckObserved { fin_packet_num } }` from `buffer_in_fin` / `buffer_in_fin_ack`.
+- A thin runtime adapter in `bluefin/` (e.g. [`bluefin/src/net/close_handler.rs::CloseBuffer`](../../bluefin/src/net/close_handler.rs)) holds the FSM **plus** the runtime surfaces (`Arc<AtomicBool>`, `Arc<Notify>`, `Option<Waker>`). After it mutates the FSM, it matches on the returned `Event` and performs the wake — still under the §5 wake-after-drop contract.
+- Adapter methods preserve the original public surface so call sites (here: `conn_reader`, `BluefinConnection::close`, `client`, `server`) don't change shape across the lift.
+
+Use this variant whenever lifting a stateful buffer into `bluefin-proto`; do **not** smuggle `tokio` types behind a feature flag.
 
 ### When NOT to use this pattern
 
@@ -167,7 +180,7 @@ The big load-bearing assumptions that may have to change before / during RFC sta
 
 | # | Issue | Where |
 |---|-------|-------|
-| 1 | ~~**Hello-buffering race**~~ — **FIXED.** `ClientHello` packets arriving before `accept()` are now queued in a bounded `HelloState.hello_queue` (cap 64) and drained by `accept()`. Client-side stagger workarounds removed. | [`net/mod.rs`](../../bluefin/src/net/mod.rs), [`net/server.rs`](../../bluefin/src/net/server.rs), [`worker/reader.rs`](../../bluefin/src/worker/reader.rs). |
+| 1 | ~~**Hello-buffering race**~~ — **FIXED.** `ClientHello` packets arriving before `accept()` are queued in the sans-io `Endpoint`'s bounded `hello_queue` (cap 64) and drained by `accept()`. Client-side stagger workarounds removed. | [`bluefin-proto/src/endpoint.rs`](../../bluefin-proto/src/endpoint.rs), [`net/server.rs`](../../bluefin/src/net/server.rs), [`worker/reader.rs`](../../bluefin/src/worker/reader.rs). |
 | 2 | **Per-connection `connect()`-ed socket** defeats `SO_REUSEPORT` recv-side fan-out. Caps recv parallelism per connection. See §3. | [`net/connection.rs`](../../bluefin/src/net/connection.rs). |
 | 3 | **`AckConsumer` is dead** — wakes constantly, writes a value nobody reads. Retransmission needs to either consume that signal or replace the consumer entirely. | [`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs). |
 | 4 | **`BluefinHost::PackFollower` is reserved but unused.** The protocol name "Bluefin" implies a multi-path / follower-leader topology that has never been built. The RFC has to decide whether to keep it as v1 scope or punt to v2. | [`bluefin-proto/src/context.rs`](../../bluefin-proto/src/context.rs). |

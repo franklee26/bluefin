@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -14,6 +13,10 @@ use crate::{
 };
 use ack_handler::{AckBuffer, AckConsumer};
 use bluefin_proto::context::BluefinHost;
+use bluefin_proto::endpoint::Endpoint;
+pub(crate) use bluefin_proto::endpoint::{
+    is_client_ack_packet, is_hello_packet, MAX_QUEUED_HELLOS,
+};
 use bluefin_proto::BluefinResult;
 use close_handler::CloseBuffer;
 use connection::{ConnectionBuffer, ConnectionManager};
@@ -26,28 +29,11 @@ pub mod connection;
 pub mod ordered_bytes;
 pub mod server;
 
-/// Maximum number of `ClientHello` packets to buffer when no `accept()` slot
-/// is ready yet. Prevents unbounded memory growth from a flood of hellos.
-pub(crate) const MAX_QUEUED_HELLOS: usize = 64;
-
-/// Shared state between the server's `accept()` and the `ReaderTxChannel`
-/// workers. Protected by a single mutex so that checking `pending_accept_ids`
-/// and pushing to / popping from `hello_queue` is atomic — no TOCTOU race.
-pub(crate) struct HelloState {
-    /// Accept slots that are ready for incoming hellos (FIFO).
-    pub(crate) pending_accept_ids: VecDeque<u32>,
-    /// `ClientHello` packets that arrived before their `accept()` slot existed.
-    pub(crate) hello_queue: VecDeque<(BluefinPacket, SocketAddr)>,
-}
-
-impl HelloState {
-    pub(crate) fn new() -> Self {
-        Self {
-            pending_accept_ids: VecDeque::new(),
-            hello_queue: VecDeque::new(),
-        }
-    }
-}
+// `HelloState` lifted into `bluefin-proto::endpoint::Endpoint` in slice 1b
+// of the sans-io migration. The accept-slot FIFO and the bounded hello
+// queue now live behind `Endpoint`; the runtime adapter just wraps it in
+// an `Arc<Mutex<...>>` and calls `take_queued_hello_or_register` /
+// `classify_hello`. See `docs/SANS_IO_MIGRATION.md` §5 slice 1b.
 
 pub(crate) const BLUEFIN_HEADER_SIZE_BYTES: usize = 20;
 pub(crate) const MAX_BLUEFIN_PAYLOAD_SIZE_BYTES: usize = 1500;
@@ -177,10 +163,10 @@ fn build_and_start_tx(
     num_tx_workers: u16,
     socket: Arc<UdpSocket>,
     conn_manager: Arc<ConnectionManager>,
-    hello_state: Arc<Mutex<HelloState>>,
+    endpoint: Arc<Mutex<Endpoint>>,
     host_type: BluefinHost,
 ) {
-    let tx = ReaderTxChannel::new(socket, conn_manager, hello_state, host_type);
+    let tx = ReaderTxChannel::new(socket, conn_manager, endpoint, host_type);
 
     for id in 0..num_tx_workers {
         let mut tx_clone = tx.clone();
@@ -217,58 +203,9 @@ fn build_and_start_ack_consumer_workers(
 }
 
 /// Helper to determine whether a given `packet` is a valid hello packet eg. client-hello or pack-leader-hello
-#[inline]
-pub(crate) fn is_hello_packet(host_type: BluefinHost, packet: &BluefinPacket) -> bool {
-    let other_id = packet.header.source_connection_id;
-    let this_id = packet.header.destination_connection_id;
-
-    // For a server, the handshake must be initiated by an client hello
-    if host_type == BluefinHost::PackLeader
-        && packet.header.type_field != PacketType::UnencryptedClientHello
-    {
-        return false;
-    }
-
-    // For a client, the handshake must be followed up by an server hello
-    if host_type == BluefinHost::Client
-        && packet.header.type_field != PacketType::UnencryptedServerHello
-    {
-        return false;
-    }
-
-    // For a client receiving a server hello, both ids MUST be set
-    if host_type == BluefinHost::Client && (other_id == 0x0 || this_id == 0x0) {
-        return false;
-    }
-
-    // if handshake, must have a non-zero source id
-    if host_type == BluefinHost::PackLeader && other_id == 0x0 {
-        return false;
-    }
-
-    // if handshake, the destination id must be 0x0
-    if host_type == BluefinHost::PackLeader && this_id != 0x0 {
-        return false;
-    }
-
-    true
-}
-
-#[inline]
-pub(crate) fn is_client_ack_packet(host_type: BluefinHost, packet: &BluefinPacket) -> bool {
-    let other_id = packet.header.source_connection_id;
-    let this_id = packet.header.destination_connection_id;
-
-    if host_type == BluefinHost::PackLeader
-        && packet.header.type_field == PacketType::ClientAck
-        && other_id != 0x0
-        && this_id != 0x0
-    {
-        return true;
-    }
-    false
-}
-
+///
+/// Now a thin alias around [`bluefin_proto::endpoint::is_hello_packet`];
+/// re-exported above for callers that already imported it via `net::`.
 #[inline]
 pub(crate) fn build_empty_encrypted_packet(
     src_conn_id: u32,

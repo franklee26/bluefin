@@ -14,12 +14,12 @@ use crate::{
     net::{
         ack_handler::AckBuffer,
         connection::{ConnectionBuffer, ConnectionManager},
-        diag_try_send, is_client_ack_packet, is_hello_packet, ConnectionManagedBuffers,
-        DiagSender, DiagnosticEvent, HelloState, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
-        MAX_QUEUED_HELLOS,
+        diag_try_send, ConnectionManagedBuffers,
+        DiagSender, DiagnosticEvent, MAX_BLUEFIN_BYTES_IN_UDP_DATAGRAM,
     },
 };
 use bluefin_proto::context::BluefinHost;
+use bluefin_proto::endpoint::{is_client_ack_packet, Endpoint, HelloOutcome};
 use bluefin_proto::error::BluefinError;
 use bluefin_proto::BluefinResult;
 use bytes::BytesMut;
@@ -36,7 +36,7 @@ pub(crate) struct ReaderTxChannel {
     pub(crate) id: u16,
     socket: Arc<UdpSocket>,
     conn_manager: Arc<ConnectionManager>,
-    hello_state: Arc<Mutex<HelloState>>,
+    endpoint: Arc<Mutex<Endpoint>>,
     host_type: BluefinHost,
 }
 
@@ -258,57 +258,35 @@ impl ReaderTxChannel {
     pub(crate) fn new(
         socket: Arc<UdpSocket>,
         conn_manager: Arc<ConnectionManager>,
-        hello_state: Arc<Mutex<HelloState>>,
+        endpoint: Arc<Mutex<Endpoint>>,
         host_type: BluefinHost,
     ) -> Self {
         Self {
             id: 0,
             socket,
             conn_manager,
-            hello_state,
+            endpoint,
             host_type,
         }
     }
 
     /// Checks whether the single packet in `packets` is a hello and, if
     /// so, either routes it to a pending `accept()` slot or queues it for
-    /// a future `accept()` — all under a single `HelloState` lock.
+    /// a future `accept()` — all by delegating to the sans-io
+    /// [`Endpoint::classify_hello`]. The mapping from `HelloOutcome` to
+    /// the runtime's `HelloAction` is mechanical; the runtime just
+    /// collapses `Queued`/`Dropped` (both "caller discards the packet")
+    /// into a single `Queued` variant.
     #[inline]
     fn handle_hello_single(
         &self,
         packets: &mut Vec<BluefinPacket>,
         addr: SocketAddr,
     ) -> HelloAction {
-        debug_assert_eq!(packets.len(), 1);
-
-        // is_hello_packet only inspects the header (a Copy struct), so
-        // an immutable borrow of packets[0] is fine here.
-        if !is_hello_packet(self.host_type, &packets[0]) {
-            return HelloAction::NotHello;
-        }
-
-        match self.host_type {
-            BluefinHost::PackLeader => {
-                // Take ownership BEFORE locking so that the queue push
-                // (if needed) happens inside the same critical section
-                // as the pending-slot check.
-                let pkt = packets.drain(..).next().unwrap();
-                let mut state = self.hello_state.lock().unwrap();
-                if let Some(id) = state.pending_accept_ids.pop_front() {
-                    // Put the packet back so the caller's normal
-                    // buffer_in_data loop processes it.
-                    packets.push(pkt);
-                    HelloAction::Routed(id)
-                } else if state.hello_queue.len() < MAX_QUEUED_HELLOS {
-                    state.hello_queue.push_back((pkt, addr));
-                    HelloAction::Queued
-                } else {
-                    // Queue full — drop the packet.
-                    HelloAction::Queued
-                }
-            }
-            BluefinHost::Client => HelloAction::Routed(0),
-            _ => unimplemented!(),
+        match self.endpoint.lock().unwrap().classify_hello(packets, addr) {
+            HelloOutcome::NotHello => HelloAction::NotHello,
+            HelloOutcome::Routed { our_id } => HelloAction::Routed(our_id),
+            HelloOutcome::Queued | HelloOutcome::Dropped => HelloAction::Queued,
         }
     }
 

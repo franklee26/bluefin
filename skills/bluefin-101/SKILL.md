@@ -15,13 +15,13 @@ Three crates in a Cargo workspace (`Cargo.toml` at root):
 |-------|---------|
 | `bluefin/` | Public library + the `client`/`server` benchmark binaries. Owns connection management, worker tasks, ordered byte buffers. |
 | `bluefin-io/` | Lower-level UDP socket abstraction. Optional `recvmsg_x`/`sendmsg_x` (macOS) and `recvmmsg`/`sendmmsg` (Linux) wrappers behind the `macos-fast` feature. **Currently NOT wired into the runtime path** (only used by tests). |
-| `bluefin-proto/` | Protocol-level error types, `BluefinHost` enum (Client/PackLeader), handshake state machine. |
+| `bluefin-proto/` | Pure sans-io protocol crate. Wire format (`wire::{header, packet}`), `Endpoint` (handshake demux + hello queue), `connection::close::CloseFsm` (FIN / FIN-ACK FSM), `BluefinError`, `BluefinHost` enum (Client/PackLeader). No tokio, no I/O — guarded by [`bluefin-proto/tests/no_io_deps.rs`](../../bluefin-proto/tests/no_io_deps.rs). See [`docs/SANS_IO_MIGRATION.md`](../../docs/SANS_IO_MIGRATION.md). |
 
 Benchmark binaries: [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs), [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs).
 
 ## Wire format
 
-`BluefinHeader` is exactly 20 bytes ([`bluefin/src/core/header.rs`](../../bluefin/src/core/header.rs)):
+`BluefinHeader` is exactly 20 bytes ([`bluefin-proto/src/wire/header.rs`](../../bluefin-proto/src/wire/header.rs); re-exported as `bluefin::core::header` for source-compat):
 
 ```
 0               1               2               3
@@ -52,19 +52,19 @@ One UDP datagram carries 1..N Bluefin packets, **all for the same connection** a
 
 ## Connection lifecycle
 
-Three-way handshake driven by `bluefin-proto/src/handshake/state_machine.rs`:
+Three-way handshake. Hello-side demux + queueing lives in the sans-io [`bluefin-proto::endpoint::Endpoint`](../../bluefin-proto/src/endpoint.rs); the rest of the handshake is still driven by the runtime workers (slice 1 of the sans-io migration). Flow:
 
 1. Client → Server: `UnencryptedClientHello` (src_conn_id chosen by client, dst=0)
 2. Server → Client: `UnencryptedServerHello` (src=server's chosen id, dst=client's id)
 3. Client → Server: `ClientAck`
 4. Both sides instantiate a `BluefinConnection` and the bidirectional data path is open.
-5. Either side may initiate graceful close by sending `Fin`; the peer auto-replies with `FinAck`. After both sides have closed (or one side observes the peer's `Fin` and calls `close()` itself), the connection is removed from the host's `ConnectionManager`. See [bluefin-protocol §10bis](../bluefin-protocol/SKILL.md) and [`net/close_handler.rs`](../../bluefin/src/net/close_handler.rs).
+5. Either side may initiate graceful close by sending `Fin`; the peer auto-replies with `FinAck`. After both sides have closed (or one side observes the peer's `Fin` and calls `close()` itself), the connection is removed from the host's `ConnectionManager`. The close-side state machine is sans-io ([`bluefin-proto/src/connection/close.rs::CloseFsm`](../../bluefin-proto/src/connection/close.rs)); the runtime wraps it in [`net/close_handler.rs::CloseBuffer`](../../bluefin/src/net/close_handler.rs) to attach the cross-task wakes. See also [bluefin-protocol §10bis](../bluefin-protocol/SKILL.md).
 
 Server entry: [`BluefinServer::accept`](../../bluefin/src/net/server.rs).
 Client entry: [`BluefinClient::connect`](../../bluefin/src/net/client.rs).
 Graceful close: [`BluefinConnection::close`](../../bluefin/src/net/connection.rs).
 
-> **Handshake hello queue**: when a `ClientHello` arrives before the server has called `accept()`, it is buffered in a shared `HelloState` queue (cap 64, [`net/mod.rs`](../../bluefin/src/net/mod.rs)) rather than dropped. `accept()` drains this queue before blocking on the `HandshakeConnectionBuffer`. This eliminates the previous race that required client-side stagger workarounds. See [bluefin-architecture §4](../bluefin-architecture/SKILL.md) and historical context in [`docs/archive/BINARY_RACE_CONDITIONS.md`](../../docs/archive/BINARY_RACE_CONDITIONS.md).
+> **Handshake hello queue**: when a `ClientHello` arrives before the server has called `accept()`, it is buffered in the sans-io `Endpoint`'s bounded `hello_queue` (cap 64, [`bluefin-proto/src/endpoint.rs`](../../bluefin-proto/src/endpoint.rs)) rather than dropped. The runtime owns the `Endpoint` as `Arc<Mutex<Endpoint>>`; `accept()` calls `take_queued_hello_or_register` to drain the queue or reserve a slot before blocking on the `HandshakeConnectionBuffer`. This eliminates the previous race that required client-side stagger workarounds. See [bluefin-architecture §4](../bluefin-architecture/SKILL.md) and historical context in [`docs/archive/BINARY_RACE_CONDITIONS.md`](../../docs/archive/BINARY_RACE_CONDITIONS.md).
 
 ## The buffer types
 
@@ -74,7 +74,7 @@ Per connection, there are three shared buffers, all `Arc<Mutex<...>>`, bundled a
 |--------|----------|----------|----------|
 | `ConnectionBuffer` ([`net/connection.rs`](../../bluefin/src/net/connection.rs)) | Ordered data bytes (via inner `OrderedBytes`) + handshake packet slot + addr + waker | `ConnReaderHandler` (data) / `ReaderTxChannel` (handshake) | `ReaderRxChannel::read` (data) / `HandshakeConnectionBuffer` (handshake) |
 | `AckBuffer` ([`net/ack_handler.rs`](../../bluefin/src/net/ack_handler.rs)) | A `SlidingWindow` of received ack packet numbers + waker | `ConnReaderHandler` (ack packets) | `AckConsumer` (currently a no-op consumer) |
-| `CloseBuffer` ([`net/close_handler.rs`](../../bluefin/src/net/close_handler.rs)) | Close-side state machine (`Active` / `PeerFinReceived` / `LocalFinSent` / `Closed`), the pn we owe a `FinAck` for, the pn the peer `FinAck`'d, a `Notify` for waking `close()`, and a waker | `ConnReaderHandler` (Fin / FinAck) | `BluefinConnection::close` + `ReaderRxChannel` (EOF) |
+| `CloseBuffer` ([`net/close_handler.rs`](../../bluefin/src/net/close_handler.rs)) | Runtime wrapper over the pure [`CloseFsm`](../../bluefin-proto/src/connection/close.rs) (`Active` / `PeerFinReceived` / `LocalFinSent` / `Closed`, the pn we owe a `FinAck` for, the pn the peer `FinAck`'d). The wrapper adds the `Arc<AtomicBool>` EOF mirror, the `Arc<Notify>` that wakes `close()`, and the data-buffer `Waker`; it applies the `CloseEvent` returned by the FSM outside the lock | `ConnReaderHandler` (Fin / FinAck) | `BluefinConnection::close` + `ReaderRxChannel` (EOF) |
 
 `ConnectionManagedBuffers` also carries two lock-free side-channels: an `Arc<AtomicBool> peer_fin_observed` (so `recv` can return `Ok(0)` EOF without taking the close lock) and an `Option<flume::Sender<u64> fin_ack_tx>` that the conn_reader uses to dispatch "please emit `FinAck(N)`" to a small drainer task that owns a `WriterHandler` clone.
 
@@ -158,7 +158,7 @@ The producer side (the worker task that buffers in a packet) wakes the consumer 
 ## Reading order for new contributors
 
 1. [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs) + [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs) — what the public API looks like in use.
-2. [`bluefin/src/core/header.rs`](../../bluefin/src/core/header.rs) + [`bluefin/src/core/packet.rs`](../../bluefin/src/core/packet.rs) — the wire format.
+2. [`bluefin-proto/src/wire/header.rs`](../../bluefin-proto/src/wire/header.rs) + [`bluefin-proto/src/wire/packet.rs`](../../bluefin-proto/src/wire/packet.rs) — the wire format (re-exported under `bluefin::core::*`).
 3. [`bluefin/src/net/connection.rs`](../../bluefin/src/net/connection.rs) — what a connection actually owns.
 4. [`bluefin/src/net/ordered_bytes.rs`](../../bluefin/src/net/ordered_bytes.rs) — receive-side ordering.
 5. [`bluefin/src/worker/reader.rs`](../../bluefin/src/worker/reader.rs) — handshake/demux read path.

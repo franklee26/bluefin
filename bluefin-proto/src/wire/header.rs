@@ -1,5 +1,5 @@
-use bluefin_proto::error::BluefinError;
-use bluefin_proto::BluefinResult;
+use crate::error::BluefinError;
+use crate::BluefinResult;
 
 use super::Serialisable;
 
@@ -226,7 +226,7 @@ impl Serialisable for BluefinHeader {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{
+    use crate::wire::{
         header::{BluefinSecurityFields, PacketType},
         Serialisable,
     };

@@ -1,6 +1,6 @@
-use crate::core::header::BluefinHeader;
-use bluefin_proto::error::BluefinError;
-use bluefin_proto::BluefinResult;
+use crate::wire::header::BluefinHeader;
+use crate::error::BluefinError;
+use crate::BluefinResult;
 use bytes::Bytes;
 
 use super::{header::PacketType, Serialisable};
@@ -21,7 +21,7 @@ pub struct BluefinPacket {
     ///
     /// `Bytes` derefs to `&[u8]` so reads (slicing, `len`, `extend_from_slice`)
     /// are unchanged. `mem::take(&mut payload)` returns an empty `Bytes`
-    /// (no alloc), preserving the [`crate::core::Extract`] semantics used in
+    /// (no alloc), preserving the [`crate::wire::Extract`] semantics used in
     /// `OrderedBytes::consume`.
     pub payload: Bytes,
 }
@@ -269,11 +269,11 @@ impl BluefinPacketBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{
+    use crate::wire::{
         header::{BluefinHeader, BluefinSecurityFields, PacketType},
         Serialisable,
     };
-    use bluefin_proto::error::BluefinError;
+    use crate::error::BluefinError;
 
     use super::BluefinPacket;
 

@@ -6,7 +6,7 @@ use std::{
 
 use super::{
     connection::{BluefinConnection, ConnectionBuffer, ConnectionManager},
-    AckBuffer, ConnectionManagedBuffers, DiagSender, HelloState,
+    AckBuffer, ConnectionManagedBuffers, DiagSender,
 };
 use crate::utils::get_udp_socket;
 use crate::{
@@ -16,8 +16,8 @@ use crate::{
     },
 };
 use bluefin_proto::context::BluefinHost;
+use bluefin_proto::endpoint::Endpoint;
 use bluefin_proto::error::BluefinError;
-use bluefin_proto::handshake::state_machine::HandshakeHandler;
 use bluefin_proto::BluefinResult;
 use rand::Rng;
 use tokio::net::UdpSocket;
@@ -30,7 +30,6 @@ pub struct BluefinClient {
     dst_addr: Option<SocketAddr>,
     conn_manager: Arc<ConnectionManager>,
     num_reader_workers: u16,
-    handshake_handler: HandshakeHandler,
     diag_tx: Option<DiagSender>,
 }
 
@@ -42,7 +41,6 @@ impl BluefinClient {
             conn_manager: Arc::new(dashmap::DashMap::new()),
             src_addr,
             num_reader_workers: NUM_TX_WORKERS_FOR_CLIENT_DEFAULT,
-            handshake_handler: HandshakeHandler::new(BluefinHost::Client),
             diag_tx: None,
         }
     }
@@ -71,13 +69,11 @@ impl BluefinClient {
         self.socket = Some(Arc::clone(&socket));
         self.dst_addr = Some(dst_addr);
 
-        self.handshake_handler.begin()?;
-
         build_and_start_tx(
             self.num_reader_workers,
             Arc::clone(self.socket.as_ref().unwrap()),
             Arc::clone(&self.conn_manager),
-            Arc::new(Mutex::new(HelloState::new())),
+            Arc::new(Mutex::new(Endpoint::new(BluefinHost::Client))),
             BluefinHost::Client,
         );
 

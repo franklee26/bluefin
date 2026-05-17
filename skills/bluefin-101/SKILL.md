@@ -15,7 +15,7 @@ Three crates in a Cargo workspace (`Cargo.toml` at root):
 |-------|---------|
 | `bluefin/` | Public library + the `client`/`server` benchmark binaries. Owns connection management, worker tasks, ordered byte buffers. |
 | `bluefin-io/` | Lower-level UDP socket abstraction. Optional `recvmsg_x`/`sendmsg_x` (macOS) and `recvmmsg`/`sendmmsg` (Linux) wrappers behind the `macos-fast` feature. **Currently NOT wired into the runtime path** (only used by tests). |
-| `bluefin-proto/` | Pure sans-io protocol crate. Wire format (`wire::{header, packet}`), `Endpoint` (handshake demux + hello queue), `connection::close::CloseFsm` (FIN / FIN-ACK FSM), `BluefinError`, `BluefinHost` enum (Client/PackLeader). No tokio, no I/O — guarded by [`bluefin-proto/tests/no_io_deps.rs`](../../bluefin-proto/tests/no_io_deps.rs). See [`docs/SANS_IO_MIGRATION.md`](../../docs/SANS_IO_MIGRATION.md). |
+| `bluefin-proto/` | Pure sans-io protocol crate. Wire format (`wire::{header, packet}`), `Endpoint` (handshake demux + hello queue), `connection::close::CloseFsm` (FIN / FIN-ACK FSM), `BluefinError`, `BluefinHost` enum (Client/PackLeader). No tokio, no I/O — guarded by [`bluefin-proto/tests/no_io_deps.rs`](../../bluefin-proto/tests/no_io_deps.rs). The data-path FSMs were attempted and reverted; see [`docs/SANS_IO_EXPERIMENT.md`](../../docs/SANS_IO_EXPERIMENT.md). |
 
 Benchmark binaries: [`bluefin/src/bin/client.rs`](../../bluefin/src/bin/client.rs), [`bluefin/src/bin/server.rs`](../../bluefin/src/bin/server.rs).
 
@@ -52,7 +52,7 @@ One UDP datagram carries 1..N Bluefin packets, **all for the same connection** a
 
 ## Connection lifecycle
 
-Three-way handshake. Hello-side demux + queueing lives in the sans-io [`bluefin-proto::endpoint::Endpoint`](../../bluefin-proto/src/endpoint.rs); the rest of the handshake is still driven by the runtime workers (slice 1 of the sans-io migration). Flow:
+Three-way handshake. Hello-side demux + queueing lives in the sans-io [`bluefin-proto::endpoint::Endpoint`](../../bluefin-proto/src/endpoint.rs); the rest of the handshake is still driven by the runtime workers (this is what landed of the sans-io migration — see [`docs/SANS_IO_EXPERIMENT.md`](../../docs/SANS_IO_EXPERIMENT.md)). Flow:
 
 1. Client → Server: `UnencryptedClientHello` (src_conn_id chosen by client, dst=0)
 2. Server → Client: `UnencryptedServerHello` (src=server's chosen id, dst=client's id)
